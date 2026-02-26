@@ -1,12 +1,11 @@
 """
 Unified LLM client for ApplyPilot.
-
-Auto-detects provider from environment:
-  GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
+Auto-detects provider from environment (checked in this order):
+  LLM_URL         -> Gateway / OpenAI-compatible endpoint (9router, Ollama, etc.)
+  GEMINI_API_KEY   -> Google Gemini (default: gemini-2.0-flash)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
-  LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
-
-LLM_MODEL env var overrides the model name for any provider.
+LLM_URL takes precedence: when set, Gemini/OpenAI keys are ignored for
+provider selection.  LLM_MODEL env var overrides the model name for any provider.
 """
 
 import logging
@@ -23,39 +22,43 @@ log = logging.getLogger(__name__)
 
 def _detect_provider() -> tuple[str, str, str]:
     """Return (base_url, model, api_key) based on environment variables.
-
+    Priority order (router-first):
+      1. LLM_URL  – gateway / OpenAI-compatible endpoint
+      2. GEMINI_API_KEY – Google Gemini
+      3. OPENAI_API_KEY – OpenAI
     Reads env at call time (not module import time) so that load_env() called
     in _bootstrap() is always visible here.
     """
+    llm_url = os.environ.get("LLM_URL", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     openai_key = os.environ.get("OPENAI_API_KEY", "")
-    local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
+    # 1. Gateway / OpenAI-compatible (highest priority)
+    if llm_url:
+        return (
+            llm_url.rstrip("/"),
+            model_override or "local-model",
+            os.environ.get("LLM_API_KEY", ""),
+        )
 
-    if gemini_key and not local_url:
+    # 2. Gemini fallback
+    if gemini_key:
         return (
             "https://generativelanguage.googleapis.com/v1beta/openai",
             model_override or "gemini-2.0-flash",
             gemini_key,
         )
 
-    if openai_key and not local_url:
+    # 3. OpenAI fallback
+    if openai_key:
         return (
             "https://api.openai.com/v1",
             model_override or "gpt-4o-mini",
             openai_key,
         )
-
-    if local_url:
-        return (
-            local_url.rstrip("/"),
-            model_override or "local-model",
-            os.environ.get("LLM_API_KEY", ""),
-        )
-
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set LLM_URL, GEMINI_API_KEY, or OPENAI_API_KEY in your environment."
     )
 
 
@@ -162,6 +165,7 @@ class LLMClient:
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "stream": False,
         }
 
         resp = self._client.post(

@@ -30,11 +30,218 @@ from applypilot.scoring.validator import (
 log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
+# ── Role Parsing from Resume Text ────────────────────────────────────────
+
+
+def _parse_roles_from_resume(resume_text: str) -> list[dict]:
+    """Parse all work history roles from resume text.
+
+    Extracts company, position, and dates from the experience section.
+    Handles various date formats and company/position ordering.
+
+    Args:
+        resume_text: The full resume text.
+
+    Returns:
+        List of role dicts with keys: company, position, dates, start_year, end_year.
+    """
+    roles = []
+    lines = resume_text.split('\n')
+    in_experience = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Detect EXPERIENCE section
+        if line.upper() in ('EXPERIENCE', 'WORK EXPERIENCE', 'PROFESSIONAL EXPERIENCE'):
+            in_experience = True
+            continue
+
+        # Stop at next major section
+        if in_experience and line.upper() in ('EDUCATION', 'PROJECTS', 'SKILLS', 'SUMMARY', 'CERTIFICATIONS'):
+            break
+
+        if not in_experience:
+            continue
+
+        # Look for role lines - typically contain company and/or position
+        has_date = bool(re.search(r'\d{4}|present|current|–|-', line, re.IGNORECASE))
+        has_company = bool(re.search(r'\|', line)) or any(
+            kw in line.lower() for kw in ['inc', 'corp', 'llc', 'ltd', 'co.', 'company', 'agency', 'systems']
+        )
+
+        if has_date or has_company:
+            role_info = _extract_role_info(line)
+            if role_info:
+                roles.append(role_info)
+
+    return roles
+
+
+def _extract_role_info(line: str) -> dict | None:
+    """Extract role information from a single line."""
+    parts = [p.strip() for p in line.split('|')]
+
+    company = ''
+    position = ''
+    dates = ''
+
+    if len(parts) >= 3:
+        if re.search(r'\d{4}|present', parts[2], re.IGNORECASE):
+            company = parts[0]
+            position = parts[1]
+            dates = parts[2]
+        elif re.search(r'\d{4}|present', parts[0], re.IGNORECASE):
+            dates = parts[0]
+            position = parts[1]
+            company = parts[2]
+        else:
+            company = parts[0]
+            position = parts[1]
+            dates = parts[2]
+    elif len(parts) == 2:
+        if re.search(r'\d{4}|present', parts[1], re.IGNORECASE):
+            if re.search(r'–|-', parts[1]):
+                company = parts[0]
+                dates = parts[1]
+            else:
+                company = parts[1]
+                position = parts[0]
+        else:
+            company = parts[1]
+            position = parts[0]
+    else:
+        date_match = re.search(r'(\d{4})\s*[–-]\s*(\d{4}|present|current)', line, re.IGNORECASE)
+        if date_match:
+            dates = date_match.group(0)
+            remaining = line[:date_match.start()].strip() + line[date_match.end():].strip()
+            remaining = re.sub(r'^[–|\-,\s]+|[–|\-,\s]+$', '', remaining).strip()
+            if remaining:
+                if any(kw in remaining.lower() for kw in ['engineer', 'manager', 'analyst', 'developer', 'director', 'lead', 'architect', 'consultant', 'specialist']):
+                    position = remaining
+                else:
+                    company = remaining
+
+    start_year = _extract_start_year(dates)
+    end_year = _extract_end_year(dates)
+
+    if company or position:
+        return {
+            'company': company,
+            'position': position,
+            'dates': dates,
+            'start_year': start_year,
+            'end_year': end_year,
+        }
+
+    return None
+
+
+def _extract_start_year(dates: str) -> int | None:
+    """Extract the start year from a date string."""
+    if not dates:
+        return None
+    match = re.search(r'(?:^|\D)(\d{4})\s*[–-]', dates)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'(\d{4})', dates)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_end_year(dates: str) -> int | None:
+    """Extract the end year from a date string."""
+    if not dates:
+        return None
+    if re.search(r'present|current|now', dates, re.IGNORECASE):
+        return datetime.now().year
+    match = re.search(r'[–-]\s*(\d{4})', dates)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _is_recent_role(role: dict, cutoff_year: int) -> bool:
+    """Determine if a role is recent (after cutoff year)."""
+    if role.get('end_year'):
+        return role['end_year'] >= cutoff_year
+    if role.get('start_year'):
+        return role['start_year'] >= cutoff_year
+    return True
+
+
+
+def _build_education_block(education_list: list[dict]) -> str:
+    """Build the education block from profile education data (JSON Resume schema)."""
+    if not education_list:
+        return "N/A"
+    lines = []
+    for edu in education_list:
+        institution = edu.get('institution', 'Unknown')
+        # Support both JSON Resume schema (studyType/area/endDate) and legacy format (degree/field/graduation_date)
+        degree = edu.get('studyType', '') or edu.get('degree', '')
+        field = edu.get('area', '') or edu.get('field', '')
+        end_date = edu.get('endDate', '') or edu.get('graduation_date', '')
+        # Extract year from date string (YYYY-MM-DD -> YYYY)
+        year = end_date[:4] if end_date and len(end_date) >= 4 else end_date
+        parts = [p for p in [degree, field, year] if p]
+        line = f"{institution} | {' | '.join(parts)}"
+        lines.append(line)
+    return "\n".join(lines)
+def _build_work_history_block(roles: list[dict], recent_cutoff_year: int = 2015) -> str:
+    """Build the work history block with merge instructions."""
+    if not roles:
+        return "N/A"
+
+    lines = [f"TOTAL ROLES: {len(roles)} (ALL must be included)"]
+    lines.append("")
+
+    recent_roles = []
+    older_roles = []
+
+    for role in roles:
+        if _is_recent_role(role, recent_cutoff_year):
+            recent_roles.append(role)
+        else:
+            older_roles.append(role)
+
+    if recent_roles:
+        lines.append("## RECENT ROLES (DO NOT MERGE - Include as separate entries):")
+        for i, role in enumerate(recent_roles, 1):
+            company = role.get('company', 'Unknown')
+            position = role.get('position', 'Unknown')
+            dates = role.get('dates', '')
+            lines.append(f"{i}. {company} | {position} | {dates} [DO NOT MERGE - Recent]")
+        lines.append("")
+
+    if older_roles:
+        lines.append("## OLDER ROLES (Can merge if needed for space):")
+        for i, role in enumerate(older_roles, len(recent_roles) + 1):
+            company = role.get('company', 'Unknown')
+            position = role.get('position', 'Unknown')
+            dates = role.get('dates', '')
+            lines.append(f"{i}. {company} | {position} | {dates} [Can merge if needed - Older]")
+        lines.append("")
+
+    lines.append("## MERGE RULES:")
+    lines.append("- Recent roles (2015+) = NEVER merge, always separate entries with full bullets")
+    lines.append("- Older roles (>10 years) = CAN merge into single entry if bullet limit exceeded")
+    lines.append("- Only merge older roles if exceeding max_bullets per role limit")
+    lines.append("- Maximum 5 bullets per recent role")
+    lines.append("- Maximum 3 bullets total for merged older positions")
+    lines.append("- Maintain continuous employment timeline - no gaps")
+    lines.append("- When merging older roles: combine company names, use 'Various' as title, summarize key achievements")
+
+    return "\n".join(lines)
+
 
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
 
-def _build_tailor_prompt(profile: dict) -> str:
+def _build_tailor_prompt(profile: dict, resume_text: str | None = None) -> str:
     """Build the resume tailoring system prompt from the user's profile.
 
     All skills boundaries, preserved entities, and formatting rules are
@@ -65,8 +272,18 @@ def _build_tailor_prompt(profile: dict) -> str:
     # what will be rejected — the validator checks for these automatically.
     banned_str = ", ".join(BANNED_WORDS)
 
-    education = profile.get("experience", {})
-    education_level = education.get("education_level", "")
+    # Build education block from profile.education array
+    education_list = profile.get("education", [])
+    education_block = _build_education_block(education_list)
+
+    # Use profile work_history directly - this has ALL roles (7 total)
+    # Do NOT parse from resume_text - that's fragile and misses roles
+    work_history_roles = profile.get("work_history", [])
+    if not work_history_roles:
+        # Fallback to parsing from resume only if profile has no work_history
+        work_history_roles = _parse_roles_from_resume(resume_text) if resume_text else []
+    
+    work_history_block = _build_work_history_block(work_history_roles)
 
     return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
 
@@ -81,13 +298,18 @@ Take the base resume and job description. Return a tailored resume as a JSON obj
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
 
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
+You MAY add 2-3 closely related tools
+
+## WORK HISTORY (ALL ROLES MUST BE INCLUDED - SEE MERGE RULES BELOW):
+{work_history_block}
+
+Important: Include ALL roles from the work history above. Do not omit any positions. (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
 
 ## TAILORING RULES:
 
 TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
 
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
+SUMMARY: Write 3-4 compelling sentences that sell the candidate for THIS specific role. Lead with years of experience (14 years), key credentials (Georgia Tech MS), and 1-2 must-have skills from the job description. Include 1-2 quantified achievements that prove capability. Make it persuasive and specific to the target role.
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
@@ -95,7 +317,7 @@ Reframe EVERY bullet for this role. Same real work, different angle. Every bulle
 
 PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
 
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
+BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section. CRITICAL: Each bullet must be a single string in the array. NO nested bullets, NO sub-bullets, NO indentation levels.
 
 ## VOICE:
 - Write like a real engineer. Short, direct.
@@ -114,7 +336,7 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{education_block}"}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -292,7 +514,11 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 
     # Education
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    education_text = str(data.get("education", ""))
+    # Handle multi-line education (e.g., multiple degrees)
+    for line in education_text.split('\n'):
+        if line.strip():
+            lines.append(sanitize_text(line))
 
     return "\n".join(lines)
 
@@ -383,7 +609,7 @@ def tailor_resume(
     avoid_notes: list[str] = []
     tailored = ""
     client = get_client()
-    tailor_prompt_base = _build_tailor_prompt(profile)
+    tailor_prompt_base = _build_tailor_prompt(profile, resume_text)
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1

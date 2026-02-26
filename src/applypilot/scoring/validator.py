@@ -13,6 +13,12 @@ lenient -- banned words ignored; only fabrication and required structure checked
 
 import re
 import logging
+from typing import Optional
+
+from applypilot.scoring.tailoring_config import (
+    check_banned_phrases,
+    check_required_patterns,
+)
 
 log = logging.getLogger(__name__)
 
@@ -20,58 +26,157 @@ log = logging.getLogger(__name__)
 # ── Universal Constants (not personal data) ───────────────────────────────
 
 BANNED_WORDS: list[str] = [
-    "passionate", "dedicated", "committed to",
-    "utilizing", "utilize", "harnessing",
-    "spearheaded", "spearhead", "orchestrated", "championed", "pioneered",
-    "robust", "scalable solutions", "cutting-edge", "state-of-the-art", "best-in-class",
-    "proven track record", "track record of success", "demonstrated ability",
-    "strong communicator", "team player", "fast learner", "self-starter", "go-getter",
-    "synergy", "cross-functional collaboration", "holistic",
-    "transformative", "innovative solutions", "paradigm", "ecosystem",
-    "proactive", "detail-oriented", "highly motivated",
-    "seamless", "full lifecycle",
-    "deep understanding", "extensive experience", "comprehensive knowledge",
-    "thrives in", "excels at", "adept at", "well-versed in",
-    "i am confident", "i believe", "i am excited",
-    "plays a critical role", "instrumental in", "integral part of",
-    "strong track record", "eager to", "eager",
+    "passionate",
+    "dedicated",
+    "committed to",
+    "utilizing",
+    "utilize",
+    "harnessing",
+    "spearheaded",
+    "spearhead",
+    "orchestrated",
+    "championed",
+    "pioneered",
+    "robust",
+    "scalable solutions",
+    "cutting-edge",
+    "state-of-the-art",
+    "best-in-class",
+    "proven track record",
+    "track record of success",
+    "demonstrated ability",
+    "strong communicator",
+    "team player",
+    "fast learner",
+    "self-starter",
+    "go-getter",
+    "synergy",
+    "cross-functional collaboration",
+    "holistic",
+    "transformative",
+    "innovative solutions",
+    "paradigm",
+    "ecosystem",
+    "proactive",
+    "detail-oriented",
+    "highly motivated",
+    "seamless",
+    "full lifecycle",
+    "deep understanding",
+    "extensive experience",
+    "comprehensive knowledge",
+    "thrives in",
+    "excels at",
+    "adept at",
+    "well-versed in",
+    "i am confident",
+    "i believe",
+    "i am excited",
+    "plays a critical role",
+    "instrumental in",
+    "integral part of",
+    "strong track record",
+    "eager to",
+    "eager",
     # Cover-letter-specific additions
-    "this demonstrates", "this reflects", "i have experience with",
-    "furthermore", "additionally", "moreover",
+    "this demonstrates",
+    "this reflects",
+    "i have experience with",
+    "furthermore",
+    "additionally",
+    "moreover",
 ]
 
 LLM_LEAK_PHRASES: list[str] = [
-    "i am sorry", "i apologize", "i will try", "let me try",
-    "i am at a loss", "i am truly sorry", "apologies for",
-    "i keep fabricating", "i will have to admit", "one final attempt",
-    "one last time", "if it fails again", "persistent errors",
-    "i am having difficulty", "i made an error", "my mistake",
-    "here is the corrected", "here is the revised", "here is the updated",
-    "here is my", "below is the", "as requested",
-    "note:", "disclaimer:", "important:",
-    "i have rewritten", "i have removed", "i have fixed",
-    "i have replaced", "i have updated", "i have corrected",
-    "per your feedback", "based on your feedback", "as per the instructions",
-    "the following resume", "the resume below",
-    "the following cover letter", "the letter below",
+    "i am sorry",
+    "i apologize",
+    "i will try",
+    "let me try",
+    "i am at a loss",
+    "i am truly sorry",
+    "apologies for",
+    "i keep fabricating",
+    "i will have to admit",
+    "one final attempt",
+    "one last time",
+    "if it fails again",
+    "persistent errors",
+    "i am having difficulty",
+    "i made an error",
+    "my mistake",
+    "here is the corrected",
+    "here is the revised",
+    "here is the updated",
+    "here is my",
+    "below is the",
+    "as requested",
+    "note:",
+    "disclaimer:",
+    "important:",
+    "i have rewritten",
+    "i have removed",
+    "i have fixed",
+    "i have replaced",
+    "i have updated",
+    "i have corrected",
+    "per your feedback",
+    "based on your feedback",
+    "as per the instructions",
+    "the following resume",
+    "the resume below",
+    "the following cover letter",
+    "the letter below",
 ]
 
 # Known fabrication markers: completely unrelated tools/languages.
 # Reasonable stretches (K8s, Terraform, Redis, Kafka etc.) are ALLOWED.
 FABRICATION_WATCHLIST: set[str] = {
     # Languages with zero relation to the candidate's stack
-    "c#", "c++", "golang", "rust", "ruby",
-    "kotlin", "swift", "scala", "matlab",
+    "c#",
+    "c++",
+    "golang",
+    "rust",
+    "ruby",
+    "kotlin",
+    "swift",
+    "scala",
+    "matlab",
     # Frameworks for wrong languages
-    "spring", "django", "rails", "angular", "vue", "svelte",
+    "spring",
+    "django",
+    "rails",
+    "angular",
+    "vue",
+    "svelte",
     # Hard lies: certifications can't be stretched
-    "certif", "certified", "pmp", "scrum master", "aws certified",
+    "certif",
+    "certified",
+    "pmp",
+    "scrum master",
+    "aws certified",
 }
 
 REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
 
+# Mechanism verbs to check for role-based validation
+MECHANISM_VERBS: set[str] = {
+    "built",
+    "designed",
+    "implemented",
+    "architected",
+    "developed",
+    "created",
+    "engineered",
+    "constructed",
+    "automated",
+    "optimized",
+    "improved",
+    "reduced",
+}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────
+
 
 def _build_skills_set(profile: dict) -> set[str]:
     """Build the set of allowed skills from the profile's skills_boundary."""
@@ -87,16 +192,101 @@ def _build_skills_set(profile: dict) -> set[str]:
 
 def sanitize_text(text: str) -> str:
     """Auto-fix common LLM output issues instead of rejecting."""
-    text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")   # em dash -> comma
-    text = text.replace("\u2013", "-")    # en dash -> hyphen
-    text = text.replace("\u201c", '"').replace("\u201d", '"')   # smart double quotes
-    text = text.replace("\u2018", "'").replace("\u2019", "'")   # smart single quotes
+    text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")  # em dash -> comma
+    text = text.replace("\u2013", "-")  # en dash -> hyphen
+    text = text.replace("\u201c", '"').replace("\u201d", '"')  # smart double quotes
+    text = text.replace("\u2018", "'").replace("\u2019", "'")  # smart single quotes
     return text.strip()
+
+
+def _get_role_constraints(role_type: str, config: dict) -> dict:
+    """Get constraints for a specific role type from tailoring config.
+
+    Args:
+        role_type: Role type key (e.g., "software_engineer").
+        config: Tailoring configuration dict.
+
+    Returns:
+        Constraints dict with keys:
+            - banned_phrases: List of banned phrases
+            - required_patterns: List of required patterns
+            - mechanism_required: Boolean indicating if mechanism verbs are required
+    """
+    if not config or not role_type:
+        return {}
+
+    role_config = config.get("role_types", {}).get(role_type, {})
+    return role_config.get("constraints", {})
+
+
+def _check_banned_phrases(text: str, role_type: str, config: dict) -> list[str]:
+    """Check text for role-specific banned phrases from config.
+
+    Args:
+        text: Text to check.
+        role_type: Role type key.
+        config: Tailoring configuration dict.
+
+    Returns:
+        List of banned phrases found in text.
+    """
+    if not config or not role_type:
+        return []
+
+    return check_banned_phrases(text, role_type, config)
+
+
+def _check_required_patterns(text: str, role_type: str, config: dict) -> tuple[list[str], list[str]]:
+    """Check text for role-specific required patterns from config.
+
+    Args:
+        text: Text to check.
+        role_type: Role type key.
+        config: Tailoring configuration dict.
+
+    Returns:
+        Tuple of (found_patterns, missing_patterns).
+    """
+    if not config or not role_type:
+        return [], []
+
+    return check_required_patterns(text, role_type, config)
+
+
+def _check_mechanism_required(text: str, role_type: str, config: dict) -> bool:
+    """Check if text contains at least one mechanism verb (for technical roles).
+
+    Args:
+        text: Text to check.
+        role_type: Role type key.
+        config: Tailoring configuration dict.
+
+    Returns:
+        True if mechanism verb found or mechanism not required, False otherwise.
+    """
+    if not config or not role_type:
+        return True
+
+    constraints = _get_role_constraints(role_type, config)
+    if not constraints.get("mechanism_required", False):
+        return True
+
+    text_lower = text.lower()
+    # Use word-boundary regex to avoid false positives (e.g., 'built' matching 'rebuilding')
+    pattern = r"\b(" + "|".join(map(re.escape, MECHANISM_VERBS)) + r")\b"
+    return bool(re.search(pattern, text_lower))
 
 
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
-def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
+
+def validate_json_fields(
+    data: dict,
+    profile: dict,
+    mode: str = "normal",
+    role_type: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
@@ -106,6 +296,8 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
                  strict  → banned words are errors (trigger retries)
                  normal  → banned words are warnings (no retry)
                  lenient → banned words ignored entirely
+        role_type: Optional role type for role-based constraint validation (e.g., "software_engineer").
+        config:    Optional tailoring configuration dict for role-based validation.
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -114,14 +306,73 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     warnings: list[str] = []
 
     # Required keys — always checked regardless of mode
+    # Note: projects can be empty array [] if no projects apply
     for key in ("title", "summary", "skills", "experience", "projects", "education"):
-        if key not in data or not data[key]:
+        if key not in data:
+            errors.append(f"Missing required field: {key}")
+        elif key != "projects" and not data[key]:  # projects can be empty, others cannot
             errors.append(f"Missing required field: {key}")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
-    # Collect all text for bulk checks
-    all_text_parts: list[str] = [data["summary"]]
+    # Collect and sanitize all text for bulk checks
+    # Sanitize summary and other string fields to avoid false positives from smart quotes/em-dashes
+    sanitized_title = sanitize_text(str(data.get("title", "")))
+    sanitized_summary = sanitize_text(str(data.get("summary", "")))
+
+    # Normalize skills field (dict/list/string) into a single string
+    skills_val = data.get("skills", "")
+    if isinstance(skills_val, dict):
+        skills_joined = " ".join(str(v) for v in skills_val.values())
+    elif isinstance(skills_val, list):
+        skills_joined = " ".join(str(v) for v in skills_val)
+    else:
+        skills_joined = str(skills_val)
+    sanitized_skills = sanitize_text(skills_joined)
+
+    # Normalize education field
+    edu_val = data.get("education", "")
+    if isinstance(edu_val, list):
+        edu_joined = " ".join(str(e) for e in edu_val)
+    elif isinstance(edu_val, dict):
+        edu_joined = " ".join(str(v) for v in edu_val.values())
+    else:
+        edu_joined = str(edu_val)
+    sanitized_education = sanitize_text(edu_joined)
+
+    all_text_parts: list[str] = [sanitized_title, sanitized_summary, sanitized_skills, sanitized_education]
+
+    # Title validation: ensure the generated title stays aligned with target
+    # job title when provided via a special key in profile (job_context.title).
+    # We accept close matches (same core role and seniority) but reject
+    # overly-niche or unrelated titles like "Alliances Partner Engineer".
+    # The tailoring pipeline may pass job title context by setting:
+    # profile['job_context'] = {'title': '<Target Job Title>'}
+    job_context = profile.get("job_context", {}) or {}
+    target_title = str(job_context.get("title", "")).strip()
+    generated_title = str(data.get("title", "")).strip()
+    if target_title and generated_title:
+        # Normalize simple tokens for comparison
+        def _norm(t: str) -> str:
+            return re.sub(r"[^a-z0-9 ]", "", t.lower())
+
+        nt = _norm(target_title)
+        gt = _norm(generated_title)
+
+        # Too short titles are suspicious if they don't share core words
+        target_words = [w for w in nt.split() if len(w) > 2]
+        gen_words = [w for w in gt.split() if len(w) > 2]
+
+        # If generated title contains none of the target's meaningful words,
+        # or introduces odd role modifiers (Partner, Alliances, Evangelist) that
+        # are not in the target, flag as fabrication.
+        shared = set(target_words) & set(gen_words)
+        odd_modifiers = {"partner", "alliances", "evangelist", "advocate", "champion", "ambassador", "specialist"}
+        # If generated title has an odd modifier not present in target, treat as fabricated
+        gen_has_odd = any(m in gen_words for m in odd_modifiers)
+
+        if not shared or (gen_has_odd and not any(m in target_words for m in odd_modifiers)):
+            errors.append(f"Generated title '{generated_title}' is not aligned with target '{target_title}'")
 
     # Skills: check for fabrication (always enforced)
     if isinstance(data["skills"], dict):
@@ -132,33 +383,42 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
             if fake in skills_text:
                 errors.append(f"Fabricated skill: '{fake}'")
 
-    # Experience: preserved companies must be present (always enforced)
-    resume_facts = profile.get("resume_facts", {})
-    preserved_companies = resume_facts.get("preserved_companies", [])
+    # Experience: companies from work_history must be present (always enforced)
+    # Use work_history companies (more accurate than preserved_companies)
+    work_history = profile.get("work_history", [])
+    work_companies = set()
+    for wh in work_history:
+        company = wh.get("company", "")
+        if company:
+            work_companies.add(company)
 
     if isinstance(data["experience"], list):
-        for company in preserved_companies:
+        for company in work_companies:
+            # Check both 'header' (legacy format) and 'company' (new format) fields
             has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
+                company.lower() in str(e.get("header", "")).lower() or 
+                company.lower() in str(e.get("company", "")).lower()
                 for e in data["experience"]
             )
             if not has_company:
                 errors.append(f"Company '{company}' missing from experience")
         for entry in data["experience"]:
             for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+                all_text_parts.append(sanitize_text(str(b)))
 
     # Projects: collect bullets
     if isinstance(data["projects"], list):
         for entry in data["projects"]:
             for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+                all_text_parts.append(sanitize_text(str(b)))
+    # Get resume_facts for education check
+    resume_facts = profile.get("resume_facts", {})
 
     # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")
     if preserved_school:
-        edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
+        # Use the sanitized education text for matching
+        if preserved_school.lower() not in sanitized_education.lower():
             errors.append(f"Education '{preserved_school}' missing")
 
     # Bulk text checks
@@ -179,10 +439,50 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
             else:  # normal
                 warnings.append(msg)
 
+    # Role-based constraint validation (only when config and role_type are provided)
+    if config and role_type:
+        # Check role-specific banned phrases (after existing banned words check)
+        if mode != "lenient":
+            try:
+                found_role_banned = _check_banned_phrases(all_text, role_type, config)
+            except Exception as e:
+                log.warning("Role-specific banned phrase check failed: %s", e)
+                found_role_banned = []
+
+            if found_role_banned:
+                msg = f"Role-specific banned phrases: {', '.join(found_role_banned[:5])}"
+                if mode == "strict":
+                    errors.append(msg)
+                else:  # normal
+                    warnings.append(msg)
+
+        # Check required patterns (after skills validation)
+        try:
+            found_patterns, missing_patterns = _check_required_patterns(all_text, role_type, config)
+        except Exception as e:
+            log.warning("Required pattern check failed: %s", e)
+            found_patterns, missing_patterns = [], []
+
+        if missing_patterns:
+            msg = f"Missing required patterns: {', '.join(missing_patterns[:5])}"
+            if mode == "strict":
+                errors.append(msg)
+            else:  # normal
+                warnings.append(msg)
+
+        # Check mechanism verbs for technical roles
+        if not _check_mechanism_required(all_text, role_type, config):
+            msg = "Missing mechanism verb (e.g., built, designed, implemented, architected)"
+            if mode == "strict":
+                errors.append(msg)
+            else:  # normal
+                warnings.append(msg)
+
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}
 
 
 # ── Full Resume Text Validation ───────────────────────────────────────────
+
 
 def validate_tailored_resume(text: str, profile: dict, original_text: str = "") -> dict:
     """Programmatic validation of a tailored resume against the user's profile.
@@ -292,6 +592,7 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
 
 # ── Cover Letter Validation ──────────────────────────────────────────────
+
 
 def validate_cover_letter(text: str, mode: str = "normal") -> dict:
     """Programmatic validation of a cover letter.

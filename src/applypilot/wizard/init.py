@@ -136,6 +136,12 @@ def _setup_profile() -> dict:
         "target_role": target_role,
     }
 
+    # -- Education Array --
+    profile["education"] = _collect_education()
+
+    # -- Tailoring Config --
+    profile["tailoring_config"] = _setup_tailoring_config(target_role)
+
     # -- Skills Boundary --
     console.print("\n[bold cyan]Skills[/bold cyan] (comma-separated)")
     langs = Prompt.ask("Programming languages", default="")
@@ -391,3 +397,183 @@ def run_wizard() -> None:
             border_style="green",
         )
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Education collection
+# ---------------------------------------------------------------------------
+
+def _collect_education() -> list:
+    """Collect education entries as an array."""
+    console.print("\n[bold cyan]Education Details[/bold cyan]")
+    education = []
+    
+    while True:
+        if education:
+            if not Confirm.ask("Add another education entry?", default=False):
+                break
+        else:
+            if not Confirm.ask("Would you like to add education details?", default=True):
+                break
+        
+        console.print(f"\n[dim]Education entry {len(education) + 1}[/dim]")
+        entry = {
+            "institution": Prompt.ask("Institution name (e.g. 'Georgia Institute of Technology')", default=""),
+            "degree": Prompt.ask("Degree (e.g. 'Bachelor of Science', 'Master of Arts')", default=""),
+            "field": Prompt.ask("Field of study (e.g. 'Computer Science', 'Business Administration')", default=""),
+            "dates": Prompt.ask("Dates attended (e.g. '2010-2014', '2015-2017')", default=""),
+        }
+        
+        # Optional GPA
+        gpa = Prompt.ask("GPA (optional, leave blank to skip)", default="")
+        if gpa.strip():
+            entry["gpa"] = gpa.strip()
+        
+        education.append(entry)
+        console.print(f"[green]Added education entry for {entry['institution']}[/green]")
+    
+    return education
+
+
+# ---------------------------------------------------------------------------
+# Tailoring config setup
+# ---------------------------------------------------------------------------
+
+def _setup_tailoring_config(target_role: str) -> dict:
+    """Set up basic tailoring configuration for config-driven system."""
+    console.print("\n[bold cyan]Tailoring Configuration[/bold cyan]")
+    console.print("[dim]ApplyPilot can tailor your resume per job type using a config-driven approach.[/dim]")
+    
+    if not Confirm.ask("Enable config-driven tailoring?", default=True):
+        return {}
+    
+    tailoring_config = {
+        "enabled": True,
+        "role_types": {
+            "general": {
+                "label": "General",
+                "detection_keywords": [],
+                "positioning_frame": "Professional",
+                "title_variants": [],
+                "example_resumes": [],
+                "instructions": {
+                    "bullet_template": "CAR",
+                    "skills_order": [],
+                    "max_bullets_per_role": 6,
+                    "emphasis": []
+                },
+                "constraints": {
+                    "banned_phrases": ["expert", "ninja", "guru"],
+                    "required_patterns": [],
+                    "mechanism_required": False
+                },
+                "guidelines": {
+                    "summary": "3-4 lines. Focus on relevant experience and skills.",
+                    "bullets": "CAR format: Action + Context + Result",
+                    "skills": "Group by relevance to role"
+                }
+            }
+        },
+        "global_rules": {
+            "max_summary_lines": 4,
+            "selected_impact_metrics": 5,
+            "role_compression": {
+                "enabled": True,
+                "older_than_years": 10,
+                "max_bullets_per_old_role": 3
+            },
+            "formatting": {
+                "date_format": "YYYY-MM",
+                "bullet_style": "sentence_case",
+                "skills_separator": " | "
+            }
+        },
+        "quality_gates": {
+            "step_1_normalize": {
+                "enabled": True,
+                "min_confidence": 0.8,
+                "required_fields": ["role_type", "core_outcomes", "hard_requirements"]
+            },
+            "step_2_frame": {
+                "enabled": True,
+                "min_confidence": 0.9
+            },
+            "step_6_bullets": {
+                "enabled": True,
+                "template_compliance": 0.85,
+                "banned_phrases_check": True,
+                "mechanism_required_for": ["ai", "system", "platform", "architecture"]
+            },
+            "step_9_credibility": {
+                "enabled": True,
+                "min_evidence_coverage": 0.9
+            }
+        },
+        "evidence_ledger": {
+            "enabled": True,
+            "track_metrics": True,
+            "track_sources": True,
+            "output_format": "markdown"
+        }
+    }
+    
+    # Ask if user wants to add a specific role type based on their target
+    target_lower = target_role.lower()
+    if any(kw in target_lower for kw in ["engineer", "developer", "programmer", "software"]):
+        console.print("\n[dim]Detected software engineering role. Adding Software Engineer role type.[/dim]")
+        tailoring_config["role_types"]["software_engineer"] = {
+            "label": "Software Engineer",
+            "detection_keywords": ["engineer", "developer", "programmer", "software"],
+            "positioning_frame": "Technical Builder",
+            "title_variants": ["Software Engineer", "Full-Stack Engineer", "Backend Engineer"],
+            "example_resumes": [],
+            "instructions": {
+                "summary_focus": "Lead with systems built and technical depth",
+                "bullet_template": "CAR",
+                "skills_order": ["languages", "systems", "databases", "tools"],
+                "max_bullets_per_role": 6,
+                "emphasis": ["architecture", "reliability", "scale"]
+            },
+            "constraints": {
+                "banned_phrases": ["expert", "ninja", "guru"],
+                "required_patterns": ["built", "designed", "implemented", "architected"],
+                "mechanism_required": True
+            },
+            "guidelines": {
+                "summary": "3-4 lines. Mechanism + Outcome. No adjective stacks.",
+                "bullets": "CAR format: Action + System/Method + Measurable Result",
+                "skills": "Group by theme. No proficiency labels. Lead with role-relevant."
+            }
+        }
+    elif any(kw in target_lower for kw in ["product manager", "product owner", "pm"]):
+        console.print("\n[dim]Detected product management role. Adding Product Manager role type.[/dim]")
+        tailoring_config["role_types"]["product_manager"] = {
+            "label": "Product Manager",
+            "detection_keywords": ["product manager", "product owner", "pm"],
+            "positioning_frame": "Product Leader",
+            "title_variants": ["Product Manager", "Senior PM", "Director of Product"],
+            "example_resumes": [],
+            "instructions": {
+                "summary_focus": "Lead with outcomes and decision-making",
+                "bullet_template": "WHO",
+                "skills_order": ["product", "growth", "technical", "leadership"],
+                "max_bullets_per_role": 6,
+                "emphasis": ["strategy", "execution", "stakeholder_management"]
+            },
+            "constraints": {
+                "banned_phrases": ["visionary", "thought leader", "rockstar"],
+                "required_patterns": ["led", "drove", "delivered", "achieved"],
+                "mechanism_required": False
+            },
+            "guidelines": {
+                "summary": "3-4 lines. Scope + Decision + Business Outcome.",
+                "bullets": "WHO format: Action + Scope/Decision + Result",
+                "skills": "Lead with product competencies. Technical as credibility."
+            }
+        }
+    
+    console.print(f"[green]Tailoring configuration created with {len(tailoring_config['role_types'])} role type(s)[/green]")
+    console.print("[dim]You can customize this further by editing profile.json[/dim]")
+    
+    return tailoring_config
