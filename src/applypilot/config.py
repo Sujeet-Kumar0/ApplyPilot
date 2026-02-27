@@ -25,6 +25,10 @@ LOG_DIR = APP_DIR / "logs"
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 
+# OpenCode configuration directory
+OPENCODE_DIR = APP_DIR / ".opencode"
+OPENCODE_CONFIG_PATH = OPENCODE_DIR / "opencode.jsonc"
+
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
@@ -86,7 +90,7 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR, OPENCODE_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -207,7 +211,14 @@ def get_tier() -> int:
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_provider_source = any(
+        os.environ.get(k)
+        for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LLM_URL")
+    )
+    has_model_and_generic_key = bool((os.environ.get("LLM_MODEL") or "").strip()) and bool(
+        (os.environ.get("LLM_API_KEY") or "").strip()
+    )
+    has_llm = has_provider_source or has_model_and_generic_key
     if not has_llm:
         return 1
 
@@ -242,8 +253,19 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
-        missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
+    has_provider_source = any(
+        os.environ.get(k)
+        for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "LLM_URL")
+    )
+    has_model_and_generic_key = bool((os.environ.get("LLM_MODEL") or "").strip()) and bool(
+        (os.environ.get("LLM_API_KEY") or "").strip()
+    )
+    if required >= 2 and not (has_provider_source or has_model_and_generic_key):
+        missing.append(
+            "LLM config — run [bold]applypilot init[/bold] or set one of "
+            "GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / LLM_URL "
+            "(or set LLM_MODEL with LLM_API_KEY)"
+        )
     if required >= 3:
         # Check backends: OpenCode preferred, Claude as fallback.
         opencode_bin = shutil.which("opencode")

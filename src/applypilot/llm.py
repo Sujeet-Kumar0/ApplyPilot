@@ -1,372 +1,213 @@
-"""
-Unified LLM client for ApplyPilot.
-Auto-detects provider from environment (checked in this order):
-  LLM_URL         -> Gateway / OpenAI-compatible endpoint (9router, Ollama, etc.)
-  GEMINI_API_KEY   -> Google Gemini (default: gemini-2.0-flash)
-  OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
-LLM_URL takes precedence: when set, Gemini/OpenAI keys are ignored for
-provider selection.  LLM_MODEL env var overrides the model name for any provider.
+"""Unified LLM client for ApplyPilot using LiteLLM.
+
+Runtime contract:
+  - If set, LLM_MODEL must be a fully-qualified LiteLLM model string
+    (for example: openai/gpt-4o-mini, anthropic/claude-3-5-haiku-latest,
+    gemini/gemini-3.0-flash).
+  - If LLM_MODEL is unset, provider is inferred by first configured source:
+    GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, then LLM_URL.
+  - Credentials come from provider env vars or generic LLM_API_KEY.
+  - LLM_URL is optional for custom OpenAI-compatible endpoints.
 """
 
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
 import logging
 import os
-import time
+from typing import Any, Literal, TypedDict, Unpack
+import warnings
 
-import httpx
+import litellm
 
 log = logging.getLogger(__name__)
 
-# Default model constants
-DEFAULT_FLASH_MODEL = "gemini-2.0-flash"  # Fast, cheap for most tasks
-DEFAULT_PRO_MODEL = "gemini-2.5-pro"      # High quality for creative tasks
-
-# Task-specific model environment variables with their defaults
-# Each task can override the generic LLM_MODEL via TASK_MODEL env var
-# Priority: TASK_MODEL > LLM_MODEL > provider_default
-TASK_MODEL_DEFAULTS = {
-    "scoring": DEFAULT_FLASH_MODEL,       # Fast, cheap for job scoring
-    "tailoring": DEFAULT_PRO_MODEL,       # High quality for resume writing
-    "cover_letter": DEFAULT_FLASH_MODEL,  # Standard for cover letters
-    "jd_parse": DEFAULT_FLASH_MODEL,      # Fast for JD extraction
-    "resume_match": DEFAULT_FLASH_MODEL,  # Fast for gap analysis
-    "validation": DEFAULT_FLASH_MODEL,    # Fast for validation checks
-    "enrichment": DEFAULT_FLASH_MODEL,    # Fast for job enrichment
-    "smart_extract": DEFAULT_FLASH_MODEL, # Fast for smart extraction
+_MAX_RETRIES = 5
+_TIMEOUT = 120  # seconds
+_INFERRED_SOURCE_ORDER: tuple[tuple[str, str], ...] = (
+    ("gemini", "GEMINI_API_KEY"),
+    ("openai", "OPENAI_API_KEY"),
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("openai", "LLM_URL"),
+)
+_DEFAULT_MODEL_BY_PROVIDER = {
+    "gemini": "gemini/gemini-3.0-flash",
+    "openai": "openai/gpt-5-mini",
+    "anthropic": "anthropic/claude-haiku-4-5",
 }
-
-# Task to environment variable mapping
-TASK_MODEL_ENV_VARS = {
-    "scoring": "SCORING_MODEL",
-    "tailoring": "TAILORING_MODEL",
-    "cover_letter": "COVER_LETTER_MODEL",
-    "jd_parse": "JD_PARSE_MODEL",
-    "resume_match": "RESUME_MATCH_MODEL",
-    "validation": "VALIDATION_MODEL",
-    "enrichment": "ENRICHMENT_MODEL",
-    "smart_extract": "SMART_EXTRACT_MODEL",
-}
+_DEFAULT_LOCAL_MODEL = "openai/local-model"
 
 
-def _get_task_model(task: str | None, provider: str) -> str | None:
-    """Get model name for a specific task.
-    
-    Priority order:
-    1. TASK_MODEL env var (e.g., TAILORING_MODEL)
-    2. LLM_MODEL env var (generic override)
-    3. Task default from TASK_MODEL_DEFAULTS
-    4. Provider default (handled by _detect_provider)
-    
-    Args:
-        task: Task name (e.g., 'scoring', 'tailoring') or None for generic
-        provider: Provider identifier ('gemini', 'openai', 'gateway')
-        
-    Returns:
-        Model name or None to use provider default
-    """
-    if not task:
-        return None
-    
-    # 1. Check task-specific env var
-    env_var = TASK_MODEL_ENV_VARS.get(task)
-    if env_var:
-        task_model = os.environ.get(env_var)
-        if task_model:
-            return task_model
-    
-    # 2. Check generic LLM_MODEL override
-    generic_model = os.environ.get("LLM_MODEL")
-    if generic_model:
-        return generic_model
-    
-    # 3. Use task default (with provider-specific adjustments)
-    default_model = TASK_MODEL_DEFAULTS.get(task)
-    if default_model and provider == "openai":
-        # Map Gemini defaults to OpenAI equivalents
-        model_mapping = {
-            "gemini-2.0-flash": "gpt-5-mini",
-            "gemini-2.5-pro": "gpt-5",
-        }
-        return model_mapping.get(default_model, "gpt-5-mini")
-    
-    return default_model
+@dataclass(frozen=True)
+class LLMConfig:
+    """LLM configuration consumed by LLMClient."""
 
-# ---------------------------------------------------------------------------
-# Provider detection
-# ---------------------------------------------------------------------------
+    provider: str
+    api_base: str | None
+    model: str
+    api_key: str
 
-def _detect_provider(task: str | None = None) -> tuple[str, str, str]:
-    """Return (base_url, model, api_key) based on environment variables.
-    Priority order (router-first):
-      1. LLM_URL  – gateway / OpenAI-compatible endpoint
-      2. GEMINI_API_KEY – Google Gemini
-      3. OPENAI_API_KEY – OpenAI
-    Reads env at call time (not module import time) so that load_env() called
-    in _bootstrap() is always visible here.
-    
-    Args:
-        task: Optional task name for task-specific model selection
-    """
-    llm_url = os.environ.get("LLM_URL", "")
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
-    model_override = os.environ.get("LLM_MODEL", "")
-    
-    # 1. Gateway / OpenAI-compatible (highest priority)
-    if llm_url:
-        task_model = _get_task_model(task, "gateway")
-        return (
-            llm_url.rstrip("/"),
-            task_model or model_override or "local-model",
-            os.environ.get("LLM_API_KEY", ""),
+
+class ChatMessage(TypedDict):
+    role: Literal["system", "user", "assistant", "tool"]
+    content: str
+
+
+class LiteLLMExtra(TypedDict, total=False):
+    stop: str | list[str]
+    top_p: float
+    seed: int
+    stream: bool
+    response_format: dict[str, Any]
+    tools: list[dict[str, Any]]
+    tool_choice: str | dict[str, Any]
+    fallbacks: list[str]
+
+
+def _env_get(env: Mapping[str, str], key: str) -> str:
+    value = env.get(key, "")
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _provider_from_model(model: str) -> str:
+    provider, _, model_name = model.partition("/")
+    if not provider or not model_name:
+        raise RuntimeError(
+            "LLM_MODEL must include a provider prefix (for example 'openai/gpt-4o-mini')."
+        )
+    return provider
+
+
+def _infer_provider_and_source(env: Mapping[str, str]) -> tuple[str, str] | None:
+    for provider, env_key in _INFERRED_SOURCE_ORDER:
+        if _env_get(env, env_key):
+            return provider, env_key
+    return None
+
+
+def resolve_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
+    """Resolve LLM configuration from environment."""
+    env_map = env if env is not None else os.environ
+
+    model = _env_get(env_map, "LLM_MODEL")
+    local_url = _env_get(env_map, "LLM_URL")
+    inferred = _infer_provider_and_source(env_map)
+    if model:
+        if "/" in model:
+            provider = _provider_from_model(model)
+        elif inferred:
+            provider, _ = inferred
+            model = f"{provider}/{model}"
+        else:
+            raise RuntimeError(
+                "LLM_MODEL must include a provider prefix (for example 'openai/gpt-4o-mini')."
+            )
+    else:
+        if not inferred:
+            raise RuntimeError(
+                "No LLM provider configured. Set one of GEMINI_API_KEY, OPENAI_API_KEY, "
+                "ANTHROPIC_API_KEY, LLM_URL, or LLM_MODEL."
+            )
+        provider, source = inferred
+        if source == "LLM_URL":
+            model = _DEFAULT_LOCAL_MODEL
+        else:
+            model = _DEFAULT_MODEL_BY_PROVIDER[provider]
+
+    provider_api_key_env = {
+        "gemini": "GEMINI_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }
+    api_key_env = provider_api_key_env.get(provider, "LLM_API_KEY")
+    api_key = _env_get(env_map, api_key_env) or _env_get(env_map, "LLM_API_KEY")
+
+    if not api_key and not local_url:
+        key_help = (
+            f"{api_key_env} or LLM_API_KEY"
+            if provider in provider_api_key_env
+            else "LLM_API_KEY"
+        )
+        raise RuntimeError(
+            f"Missing credentials for LLM_MODEL '{model}'. Set {key_help}, or set LLM_URL for "
+            "a local OpenAI-compatible endpoint."
         )
 
-    # 2. Gemini fallback
-    if gemini_key:
-        task_model = _get_task_model(task, "gemini")
-        return (
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            task_model or model_override or "gemini-2.0-flash",
-            gemini_key,
-        )
-
-    # 3. OpenAI fallback
-    if openai_key:
-        return (
-            "https://api.openai.com/v1",
-            model_override or "gpt-4o-mini",
-            openai_key,
-        )
-    raise RuntimeError(
-        "No LLM provider configured. "
-        "Set LLM_URL, GEMINI_API_KEY, or OPENAI_API_KEY in your environment."
+    return LLMConfig(
+        provider=provider,
+        api_base=local_url.rstrip("/") if local_url else None,
+        model=model,
+        api_key=api_key,
     )
 
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
-
-_MAX_RETRIES = 5
-_TIMEOUT = 120  # seconds
-
-# Base wait on first 429/503 (doubles each retry, caps at 60s).
-# Gemini free tier is 15 RPM = 4s minimum between requests; 10s gives headroom.
-_RATE_LIMIT_BASE_WAIT = 10
-
-
-_GEMINI_COMPAT_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
-_GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
-
-
 class LLMClient:
-    """Thin LLM client supporting OpenAI-compatible and native Gemini endpoints.
+    """Thin wrapper around LiteLLM completion()."""
 
-    For Gemini keys, starts on the OpenAI-compat layer. On a 403 (which
-    happens with preview/experimental models not exposed via compat), it
-    automatically switches to the native generateContent API and stays there
-    for the lifetime of the process.
-    """
-
-    def __init__(self, base_url: str, model: str, api_key: str) -> None:
-        self.base_url = base_url
-        self.model = model
-        self.api_key = api_key
-        self._client = httpx.Client(timeout=_TIMEOUT)
-        # True once we've confirmed the native Gemini API works for this model
-        self._use_native_gemini: bool = False
-        self._is_gemini: bool = base_url.startswith(_GEMINI_COMPAT_BASE)
-
-    # -- Native Gemini API --------------------------------------------------
-
-    def _chat_native_gemini(
-        self,
-        messages: list[dict],
-        temperature: float,
-        max_tokens: int,
-    ) -> str:
-        """Call the native Gemini generateContent API.
-
-        Used automatically when the OpenAI-compat endpoint returns 403,
-        which happens for preview/experimental models not exposed via compat.
-
-        Converts OpenAI-style messages to Gemini's contents/systemInstruction
-        format transparently.
-        """
-        contents: list[dict] = []
-        system_parts: list[dict] = []
-
-        for msg in messages:
-            role = msg["role"]
-            text = msg.get("content", "")
-            if role == "system":
-                system_parts.append({"text": text})
-            elif role == "user":
-                contents.append({"role": "user", "parts": [{"text": text}]})
-            elif role == "assistant":
-                # Gemini uses "model" instead of "assistant"
-                contents.append({"role": "model", "parts": [{"text": text}]})
-
-        payload: dict = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-            },
-        }
-        if system_parts:
-            payload["systemInstruction"] = {"parts": system_parts}
-
-        url = f"{_GEMINI_NATIVE_BASE}/models/{self.model}:generateContent"
-        resp = self._client.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            params={"key": self.api_key},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
-
-    # -- OpenAI-compat API --------------------------------------------------
-
-    def _chat_compat(
-        self,
-        messages: list[dict],
-        temperature: float,
-        max_tokens: int,
-    ) -> str:
-        """Call the OpenAI-compatible endpoint."""
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-
-        resp = self._client.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-        )
-
-        # 403 on Gemini compat = model not available on compat layer.
-        # Raise a specific sentinel so chat() can switch to native API.
-        if resp.status_code == 403 and self._is_gemini:
-            raise _GeminiCompatForbidden(resp)
-
-        return self._handle_compat_response(resp)
-
-    @staticmethod
-    def _handle_compat_response(resp: httpx.Response) -> str:
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"]
-
-    # -- public API ---------------------------------------------------------
+    def __init__(self, config: LLMConfig) -> None:
+        self.config = config
+        self.provider = config.provider
+        self.model = config.model
+        litellm.suppress_debug_info = True
 
     def chat(
         self,
-        messages: list[dict],
-        temperature: float = 0.0,
-        max_tokens: int = 4096,
+        messages: list[ChatMessage],
+        *,
+        max_output_tokens: int = 10000,
+        temperature: float | None = None,
+        timeout: int = _TIMEOUT,
+        num_retries: int = _MAX_RETRIES,
+        drop_params: bool = True,
+        **extra: Unpack[LiteLLMExtra],
     ) -> str:
-        """Send a chat completion request and return the assistant message text."""
-        # Qwen3 optimization: prepend /no_think to skip chain-of-thought
-        # reasoning, saving tokens on structured extraction tasks.
-        if "qwen" in self.model.lower() and messages:
-            first = messages[0]
-            if first.get("role") == "user" and not first["content"].startswith("/no_think"):
-                messages = [{"role": first["role"], "content": f"/no_think\n{first['content']}"}] + messages[1:]
-
-        for attempt in range(_MAX_RETRIES):
-            try:
-                # Route to native Gemini if we've already confirmed it's needed
-                if self._use_native_gemini:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
-
-                return self._chat_compat(messages, temperature, max_tokens)
-
-            except _GeminiCompatForbidden as exc:
-                # Model not available on OpenAI-compat layer — switch to native.
-                log.warning(
-                    "Gemini compat endpoint returned 403 for model '%s'. "
-                    "Switching to native generateContent API. "
-                    "(Preview/experimental models are often compat-only on native.)",
-                    self.model,
+        """Send a completion request and return plain text content."""
+        try:
+            if temperature is None:
+                response = litellm.completion(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_output_tokens,
+                    timeout=timeout,
+                    num_retries=num_retries,
+                    drop_params=drop_params,
+                    api_key=self.config.api_key or None,
+                    api_base=self.config.api_base or None,
+                    **extra,
                 )
-                self._use_native_gemini = True
-                # Retry immediately with native — don't count as a rate-limit wait
-                try:
-                    return self._chat_native_gemini(messages, temperature, max_tokens)
-                except httpx.HTTPStatusError as native_exc:
-                    raise RuntimeError(
-                        f"Both Gemini endpoints failed. Compat: 403 Forbidden. "
-                        f"Native: {native_exc.response.status_code} — "
-                        f"{native_exc.response.text[:200]}"
-                    ) from native_exc
+            else:
+                response = litellm.completion(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_output_tokens,
+                    temperature=temperature,
+                    timeout=timeout,
+                    num_retries=num_retries,
+                    drop_params=drop_params,
+                    api_key=self.config.api_key or None,
+                    api_base=self.config.api_base or None,
+                    **extra,
+                )
 
-            except httpx.HTTPStatusError as exc:
-                resp = exc.response
-                if resp.status_code in (429, 503) and attempt < _MAX_RETRIES - 1:
-                    # Respect Retry-After header if provided (Gemini sends this).
-                    retry_after = (
-                        resp.headers.get("Retry-After")
-                        or resp.headers.get("X-RateLimit-Reset-Requests")
-                    )
-                    if retry_after:
-                        try:
-                            wait = float(retry_after)
-                        except (ValueError, TypeError):
-                            wait = _RATE_LIMIT_BASE_WAIT * (2 ** attempt)
-                    else:
-                        wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
+            choices = getattr(response, "choices", None)
+            if not choices:
+                raise RuntimeError("LLM response contained no choices.")
+            content = response.choices[0].message.content
+            text = content.strip() if isinstance(content, str) else str(content).strip()
 
-                    log.warning(
-                        "LLM rate limited (HTTP %s). Waiting %ds before retry %d/%d. "
-                        "Tip: Gemini free tier = 15 RPM. Consider a paid account "
-                        "or switching to a local model.",
-                        resp.status_code, wait, attempt + 1, _MAX_RETRIES,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise
-
-            except httpx.TimeoutException:
-                if attempt < _MAX_RETRIES - 1:
-                    wait = min(_RATE_LIMIT_BASE_WAIT * (2 ** attempt), 60)
-                    log.warning(
-                        "LLM request timed out, retrying in %ds (attempt %d/%d)",
-                        wait, attempt + 1, _MAX_RETRIES,
-                    )
-                    time.sleep(wait)
-                    continue
-                raise
-
-        raise RuntimeError("LLM request failed after all retries")
-
-    def ask(self, prompt: str, **kwargs) -> str:
-        """Convenience: single user prompt -> assistant response."""
-        return self.chat([{"role": "user", "content": prompt}], **kwargs)
+            if not text:
+                raise RuntimeError("LLM response contained no text content.")
+            return text
+        except Exception as exc:  # pragma: no cover - provider SDK exception types vary by backend/version.
+            raise RuntimeError(f"LLM request failed ({self.provider}/{self.model}): {exc}") from exc
 
     def close(self) -> None:
-        self._client.close()
+        """No-op. LiteLLM completion() is stateless per call."""
+        return None
 
-
-class _GeminiCompatForbidden(Exception):
-    """Sentinel: Gemini OpenAI-compat returned 403. Switch to native API."""
-    def __init__(self, response: httpx.Response) -> None:
-        self.response = response
-        super().__init__(f"Gemini compat 403: {response.text[:200]}")
-
-
-# ---------------------------------------------------------------------------
-# Singleton
-# ---------------------------------------------------------------------------
 
 _instance: LLMClient | None = None
 
@@ -375,63 +216,13 @@ def get_client() -> LLMClient:
     """Return (or create) the module-level LLMClient singleton."""
     global _instance
     if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
-    return _instance
+        try:
+            from applypilot.config import load_env
 
-
-# Task-specific client cache to avoid recreating clients for same task
-_task_clients: dict[str, LLMClient] = {}
-
-
-def get_client_for_task(task: str) -> LLMClient:
-    """Return (or create) an LLMClient for a specific task.
-    
-    This allows different tasks to use different models based on their
-    requirements (e.g., fast/cheap for scoring, high-quality for tailoring).
-    
-    Priority for model selection:
-    1. TASK_MODEL env var (e.g., TAILORING_MODEL=gpt-4)
-    2. LLM_MODEL env var (generic override)
-    3. Task default from TASK_MODEL_DEFAULTS
-    4. Provider default
-    
-    Args:
-        task: Task name (e.g., 'scoring', 'tailoring', 'cover_letter')
-        
-    Returns:
-        LLMClient configured for the specific task
-        
-    Example:
-        client = get_client_for_task('tailoring')
-        response = client.ask(prompt)
-    """
-    global _task_clients
-    
-    # Return cached client for this task if exists
-    if task in _task_clients:
-        return _task_clients[task]
-    
-    # Create new client with task-specific model
-    base_url, model, api_key = _detect_provider(task)
-    log.info("LLM provider for %s: %s  model: %s", task, base_url, model)
-    client = LLMClient(base_url, model, api_key)
-    
-    # Cache it
-    _task_clients[task] = client
-    return client
-
-
-def get_client() -> LLMClient:
-    """Return (or create) the module-level LLMClient singleton.
-    
-    Note: This uses the generic model selection (no task-specific overrides).
-    For task-specific model selection, use get_client_for_task(task).
-    """
-    global _instance
-    if _instance is None:
-        base_url, model, api_key = _detect_provider()
-        log.info("LLM provider: %s  model: %s", base_url, model)
-        _instance = LLMClient(base_url, model, api_key)
+            load_env()
+        except ModuleNotFoundError:
+            log.debug("python-dotenv not installed; skipping .env auto-load in llm.get_client().")
+        config = resolve_llm_config()
+        log.info("LLM provider: %s  model: %s", config.provider, config.model)
+        _instance = LLMClient(config)
     return _instance

@@ -14,17 +14,14 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
@@ -440,6 +437,62 @@ def extract_json(raw: str) -> dict:
     raise ValueError("No valid JSON found in LLM response")
 
 
+def _normalize_bullet(bullet: Any) -> str:
+    """Normalize a bullet to plain text, stripping any JSON metadata.
+    
+    Handles cases where LLM returns bullets with embedded JSON or dict objects.
+    
+    Args:
+        bullet: Bullet data (str, dict, or other).
+        
+    Returns:
+        Clean bullet text string.
+    """
+    import json
+    
+    # Handle dict bullets - extract text field if present
+    if isinstance(bullet, dict):
+        # Try common text field names
+        for key in ("text", "bullet", "content", "description"):
+            if key in bullet and isinstance(bullet[key], str):
+                return bullet[key].strip()
+        # Fallback: convert dict to readable string (without internal fields)
+        if "text" in bullet:
+            return str(bullet["text"]).strip()
+        # Last resort: serialize but this shouldn't happen
+        return json.dumps(bullet, ensure_ascii=False)
+    
+    # Convert to string
+    bullet_str = str(bullet).strip()
+    
+    # If entire bullet is JSON, try to extract text field
+    if bullet_str.startswith("{") or bullet_str.startswith("["):
+        try:
+            parsed = json.loads(bullet_str)
+            if isinstance(parsed, dict):
+                for key in ("text", "bullet", "content"):
+                    if key in parsed and isinstance(parsed[key], str):
+                        return parsed[key].strip()
+            # If no text field found, serialize back (unlikely case)
+            return json.dumps(parsed, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pass  # Not valid JSON, treat as regular string
+    
+    # Check for trailing JSON metadata (e.g., 'Built X {"variants": {...}}')
+    json_start = bullet_str.find(" {")
+    if json_start == -1:
+        json_start = bullet_str.find("\t{")
+    if json_start != -1:
+        candidate = bullet_str[:json_start].rstrip()
+        # Only strip if what follows looks like JSON
+        remainder = bullet_str[json_start:].strip()
+        if remainder.startswith("{") and ("variants" in remainder or "tags" in remainder):
+            if candidate:
+                return candidate
+    
+    return bullet_str
+
+
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
 def assemble_resume_text(data: dict, profile: dict) -> str:
@@ -499,7 +552,8 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         if entry.get("subtitle"):
             lines.append(sanitize_text(entry["subtitle"]))
         for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+            bullet_text = _normalize_bullet(b)
+            lines.append(f"- {sanitize_text(bullet_text)}")
         lines.append("")
 
     # Projects
@@ -509,7 +563,8 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         if entry.get("subtitle"):
             lines.append(sanitize_text(entry["subtitle"]))
         for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+            bullet_text = _normalize_bullet(b)
+            lines.append(f"- {sanitize_text(bullet_text)}")
         lines.append("")
 
     # Education
@@ -552,7 +607,7 @@ def judge_tailored_resume(
     ]
 
     client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
+    response = client.chat(messages, max_output_tokens=512)
 
     passed = "VERDICT: PASS" in response.upper()
     issues = "none"
@@ -626,7 +681,7 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        raw = client.chat(messages, max_output_tokens=2048)
 
         # Parse JSON from response
         try:

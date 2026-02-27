@@ -4,7 +4,7 @@ Interactive flow that creates ~/.applypilot/ with:
   - resume.txt (and optionally resume.pdf)
   - profile.json
   - searches.yaml
-  - .env (LLM API key)
+  - .env (LLM API keys and runtime settings)
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -26,6 +25,12 @@ from applypilot.config import (
     RESUME_PDF_PATH,
     SEARCH_CONFIG_PATH,
     ensure_dirs,
+)
+from applypilot.apply.backends import (
+    AgentBackendError,
+    get_backend,
+    detect_backends,
+    get_preferred_backend,
 )
 
 console = Console()
@@ -251,33 +256,60 @@ def _setup_ai_features() -> None:
         console.print("[dim]Discovery-only mode. You can configure AI later with [bold]applypilot init[/bold].[/dim]")
         return
 
-    console.print("Supported providers: [bold]Gemini[/bold] (recommended, free tier), OpenAI, local (Ollama/llama.cpp)")
-    provider = Prompt.ask(
-        "Provider",
-        choices=["gemini", "openai", "local"],
-        default="gemini",
+    console.print(
+        "Supported providers: [bold]Gemini[/bold] (recommended, free tier), "
+        "OpenAI, Claude, local (Ollama/llama.cpp)."
     )
+    console.print("[dim]Enter any credentials you want to save now. Leave blank to skip each field.[/dim]")
 
     env_lines = ["# ApplyPilot configuration", ""]
+    configured_sources: list[str] = []
 
-    if provider == "gemini":
-        api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
-        model = Prompt.ask("Model", default="gemini-2.0-flash")
-        env_lines.append(f"GEMINI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "openai":
-        api_key = Prompt.ask("OpenAI API key")
-        model = Prompt.ask("Model", default="gpt-4o-mini")
-        env_lines.append(f"OPENAI_API_KEY={api_key}")
-        env_lines.append(f"LLM_MODEL={model}")
-    elif provider == "local":
-        url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
-        model = Prompt.ask("Model name", default="local-model")
-        env_lines.append(f"LLM_URL={url}")
-        env_lines.append(f"LLM_MODEL={model}")
+    gemini_key = Prompt.ask("Gemini API key (optional, from aistudio.google.com)", default="").strip()
+    if gemini_key:
+        env_lines.append(f"GEMINI_API_KEY={gemini_key}")
+        configured_sources.append("gemini")
+
+    openai_key = Prompt.ask("OpenAI API key (optional)", default="").strip()
+    if openai_key:
+        env_lines.append(f"OPENAI_API_KEY={openai_key}")
+        configured_sources.append("openai")
+
+    anthropic_key = Prompt.ask("Anthropic API key (optional)", default="").strip()
+    if anthropic_key:
+        env_lines.append(f"ANTHROPIC_API_KEY={anthropic_key}")
+        configured_sources.append("anthropic")
+
+    local_url = Prompt.ask("Local LLM endpoint URL (optional)", default="").strip()
+    if local_url:
+        env_lines.append(f"LLM_URL={local_url}")
+        configured_sources.append("local")
+
+    if not configured_sources:
+        console.print("[dim]No AI provider configured. You can add one later with [bold]applypilot init[/bold].[/dim]")
+        return
+
+    default_model_by_source = {
+        "gemini": "gemini/gemini-3.0-flash",
+        "openai": "openai/gpt-4o-mini",
+        "anthropic": "anthropic/claude-3-5-haiku-latest",
+        "local": "openai/local-model",
+    }
+    default_model = default_model_by_source.get(configured_sources[0], "openai/gpt-4o-mini")
+    model = Prompt.ask(
+        "LLM model (required, include provider prefix)",
+        default=default_model,
+    ).strip()
+    env_lines.append(f"LLM_MODEL={model}")
 
     env_lines.append("")
     ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
+    if len(configured_sources) > 1:
+        configured = ", ".join(configured_sources)
+        console.print(
+            f"[yellow]Multiple LLM providers saved ({configured}). "
+            "Runtime routing follows LLM_MODEL's provider prefix.[/yellow]"
+        )
     console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
 
 
@@ -327,6 +359,92 @@ def _setup_auto_apply() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Agent Configuration
+# ---------------------------------------------------------------------------
+
+def _setup_agents() -> None:
+    """Configure AI agent backends using the unified AgentBackend abstraction."""
+    console.print(Panel(
+        "[bold]Step 6: Agent Configuration (optional)[/bold]\n"
+        "ApplyPilot can use multiple AI agent backends for auto-apply.\n"
+        "OpenCode is the preferred backend with MCP server support."
+    ))
+
+    # Detect available backends
+    available_backends = detect_backends()
+    
+    if not available_backends:
+        console.print("[yellow]No agent backends found on PATH.[/yellow]")
+        console.print(
+            "Install OpenCode from: [bold]https://opencode.ai[/bold]\n"
+            "Or Claude Code from: [bold]https://claude.ai/code[/bold]\n"
+            "Then re-run [bold]applypilot init[/bold] to configure MCP servers."
+        )
+        return
+
+    # Get preferred backend (opencode > claude)
+    preferred = get_preferred_backend()
+    console.print(f"[green]Detected backends: {', '.join(available_backends)}[/green]")
+    console.print(f"[green]Preferred backend: {preferred}[/green]")
+
+    # Get the backend instance
+    try:
+        backend = get_backend(preferred)
+    except AgentBackendError as e:
+        console.print(f"[red]Failed to initialize backend: {e}[/red]")
+        return
+
+    # Setup the backend (configures MCP servers)
+    console.print(f"[dim]Setting up {preferred} backend...[/dim]")
+    
+    # For OpenCode, offer to import from Claude
+    import_from = None
+    if preferred == "opencode" and "claude" in available_backends:
+        if Confirm.ask(
+            "Import MCP servers from Claude Code config?",
+            default=True,
+        ):
+            import_from = "claude"
+    
+    result = backend.setup(import_from=import_from)
+    
+    if result["success"]:
+        console.print(
+            f"[green]{preferred.title()} backend configured successfully![/green]"
+        )
+        if result["servers_added"]:
+            console.print(
+                f"[green]Added {len(result['servers_added'])} MCP server(s):[/green] {', '.join(result['servers_added'])}"
+            )
+        if result["servers_existing"]:
+            console.print(
+                f"[dim]Already registered:[/dim] {', '.join(result['servers_existing'])}"
+            )
+    else:
+        console.print("[yellow]Some issues occurred during setup:[/yellow]")
+        for error in result["errors"]:
+            console.print(f"  [red]-[/red] {error}")
+    
+    # Verify required servers
+    try:
+        existing = set(backend.list_mcp_servers())
+        required_servers = ["playwright", "gmail"]
+        missing = [s for s in required_servers if s not in existing]
+        
+        if not missing:
+            console.print("[green]✓ All required MCP servers are ready![/green]")
+        else:
+            console.print(
+                f"[yellow]⚠ Missing MCP servers:[/yellow] {', '.join(missing)}"
+            )
+            console.print(
+                "[dim]Run manually: opencode mcp add <name> -- <command>[/dim]"
+            )
+    except AgentBackendError as e:
+        console.print(f"[yellow]Could not verify MCP servers: {e}[/yellow]")
+
+
+# ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------
 
@@ -364,6 +482,10 @@ def run_wizard() -> None:
 
     # Step 5: Auto-apply (Claude Code detection)
     _setup_auto_apply()
+    console.print()
+
+    # Step 6: Agent Configuration (OpenCode MCP setup)
+    _setup_agents()
     console.print()
 
     # Done — show tier status

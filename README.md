@@ -43,12 +43,12 @@ applypilot apply --dry-run  # fill forms without submitting
 ## Two Paths
 
 ### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI (default) or OpenCode CLI (alternative), Chrome
+**Requires:** Python 3.11+, Node.js (for npx), an LLM key (Gemini/OpenAI/Claude) or `LLM_URL`, Claude Code CLI, Chrome
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
 
 ### Discovery + Tailoring Only
-**Requires:** Python 3.11+, Gemini API key (free)
+**Requires:** Python 3.11+, an LLM key (Gemini/OpenAI/Claude) or `LLM_URL`
 
 Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cover letters. You submit applications manually with the AI-prepared materials.
 
@@ -63,7 +63,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
 | **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | Orchestrates browser-driven submission using an external backend (Claude Code default, or OpenCode as alternative). The backend launches a browser, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. |
+| **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
 
 Each stage is independent. Run them all or pick what you need.
 
@@ -88,17 +88,24 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
-| Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
+| LLM credentials or local endpoint | Scoring, tailoring, cover letters | Set one of `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `LLM_URL`. Optional: set `LLM_MODEL` (for example `gemini/gemini-3.0-flash`) to override the default model. |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Claude Code CLI or OpenCode CLI | Auto-apply | Claude: install from https://claude.ai/code (default); OpenCode: install from https://opencode.ai and register MCPs (alternative) |
+| Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
 
-**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
+**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI, Claude, and local models (Ollama/llama.cpp/vLLM) are also supported.
+ApplyPilot uses Gemini through LiteLLM's native Gemini provider path, and Gemini API version routing is owned by LiteLLM.
 
 ### Optional
 
 | Component | What It Does |
 |-----------|-------------|
 | CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
+
+### Gemini Smoke Check (optional)
+
+```bash
+GEMINI_API_KEY=your_key_here pytest -m smoke -q tests/test_gemini_smoke.py
+```
 
 > **Note:** python-jobspy is installed separately with `--no-deps` because it pins an exact numpy version in its metadata that conflicts with pip's resolver. It works fine with modern numpy at runtime.
 
@@ -115,73 +122,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional). See Backend and Gateway configuration for details on multi-backend selection and gateway compatibility.
-
----
-
-## Backend and Gateway configuration (Gemini first, OpenCode backend)
-
-ApplyPilot supports multiple LLM backends. The baseline-first approach for LLMs is Gemini. For the auto-apply orchestration, Claude Code is the default backend (APPLY_BACKEND unset or set to "claude"). OpenCode is supported as an alternative backend; set APPLY_BACKEND=opencode to use it. OpenAI-compatible endpoints (for self-hosted gateways, LiteLLM, Ollama, or AI routers) are supported via LLM_URL environment variable. Configure your environment carefully and never commit real keys.
-
-1) Baseline LLM (Gemini)
-- Set GEMINI_API_KEY to use Google Gemini for scoring, tailoring, and cover letters. This is the recommended default and is used automatically when present.
-
-2) OpenAI-Compatible Gateway Support
-- For self-hosted gateways, LiteLLM, Ollama, or AI routers that provide OpenAI-compatible APIs, set these env vars in your `.env` or runtime environment:
-
-  - LLM_URL: Base URL of your gateway, for example `https://my-gateway.example.com/v1`
-  - LLM_API_KEY: API key for that gateway (keep secret)
-  - LLM_MODEL: Model name exposed by the gateway, for example `gpt-4o-mini`
-
-- Example (do not paste real keys):
-
-  export LLM_URL="https://my-gateway.example.com/v1"
-  export LLM_API_KEY="sk-xxxxxxxx"
-  export LLM_MODEL="gpt-4o-mini"
-
-3) Backend selection for auto-apply and orchestration
-- Use APPLY_BACKEND to select which orchestration backend the system will auto-apply with. Supported values:
-  - claude: Use Claude Code CLI for auto-apply (default when APPLY_BACKEND is unset or set to "claude")
-  - opencode: Use the OpenCode backend and its MCP integrations (alternative)
-
-- Backend defaults are configurable:
-  - `APPLY_CLAUDE_MODEL` (default: `haiku`)
-  - `APPLY_OPENCODE_MODEL` (fallback: `LLM_MODEL`, then `gpt-4o-mini`)
-  - `APPLY_OPENCODE_AGENT` (passed as `--agent` to `opencode run`)
-
-  Example (use OpenCode):
-
-  export APPLY_BACKEND=opencode
-  export APPLY_OPENCODE_MODEL="gh/claude-sonnet-4.5"
-  export APPLY_OPENCODE_AGENT="coder"
-
-4) OpenCode MCP prerequisite
-- When using the opencode backend you must register the OpenCode MCP provider before first run. Run:
-
-  opencode mcp add my-mcp --provider=openai --url "$LLM_URL" --api-key "$LLM_API_KEY" --model "$LLM_MODEL"
-
-- Replace the provider and flags according to your MCP. This registers the gateway so OpenCode can reach it at runtime. Note: OpenCode manages MCP servers globally in its own config; you cannot pass an MCP config file per invocation.
-- For parity with Claude apply flow, ensure `opencode mcp list` contains both MCP server names:
-  - `playwright`
-  - `gmail`
-  ApplyPilot validates this baseline before running the OpenCode backend.
-
-5) Claude fallback / code default
-- The code default backend when APPLY_BACKEND is not set is `claude`. If you plan to rely on the default behavior or explicitly set APPLY_BACKEND=claude, ensure Claude Code CLI is installed and configured. Claude remains supported as a fallback orchestration backend.
-
-6) Security and secret handling
-- Never add API keys to git. Use a local file outside the repo (for example `~/.applypilot/.env`) or a secret manager.
-- Add `.env` or `~/.applypilot/.env` to your `.gitignore`.
-- Rotate keys regularly and treat gateway keys like production secrets.
-- When sharing examples, replace any keys with `sk-xxxxxxxx` or `GEMINI_API_KEY=xxxxx` placeholders.
-
-7) OpenAI-Compatible Endpoint Variables
-- Gateways and routers providing OpenAI-compatible endpoints should set: `LLM_URL`, `LLM_API_KEY`, `LLM_MODEL`. Ensure the gateway exposes an OpenAI-compatible v1 completions/chat endpoint. Note: Anthropic API-compatible endpoints would require different environment variables.
-
-8) Verification
-- After setting env vars and optionally registering MCPs for opencode, run `applypilot doctor`. It will report configured providers and flag missing MCP registration or missing CLI binaries. If doctor reports issues, follow its guidance.
-
----
+API keys and runtime config: `GEMINI_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_URL`, optional `LLM_MODEL`, optional `LLM_API_KEY`, and `CAPSOLVER_API_KEY`.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -208,15 +149,9 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-Auto-apply is implemented via a pluggable backend. Two supported backends are available:
+Claude Code launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
 
-- Claude (default): uses the Claude Code CLI to spawn a browser and run the agent. This is the default backend when APPLY_BACKEND is unset or set to "claude".
-
-- OpenCode (alternative): runs via the OpenCode CLI and uses pre-configured MCP servers for Playwright and other tools. Set APPLY_BACKEND=opencode to use. You must register MCP servers (opencode mcp add ...) before use.
-
-Both backends perform the same high-level tasks: launch a browser, detect form types, fill personal details, upload tailored documents, answer screening questions, and submit applications. A live dashboard shows progress in real-time.
-
-Note: OpenCode manages MCP servers via its own config; when using opencode you must register MCPs ahead of time. When using the claude backend ensure the Claude Code CLI is installed and available on PATH.
+The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 
 ```bash
 # Utility modes (no Chrome/Claude needed)
