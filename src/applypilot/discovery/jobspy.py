@@ -14,6 +14,42 @@ from datetime import datetime, timezone
 
 from jobspy import scrape_jobs
 
+# Patch TLSRotating to always specify a client_identifier.
+# Without one, the tls-client Go binary receives a nil JA3 string and panics
+# (SIGABRT), killing the process. A named profile avoids the crash.
+try:
+    import tls_client
+    import jobspy.util as _jobspy_util
+
+    _orig_tls_init = tls_client.Session.__init__
+
+    def _safe_tls_init(self, *args, **kwargs):
+        if not kwargs.get("client_identifier") and not kwargs.get("ja3_string"):
+            kwargs["client_identifier"] = "chrome_120"
+        _orig_tls_init(self, *args, **kwargs)
+
+    tls_client.Session.__init__ = _safe_tls_init
+except Exception:
+    pass  # If tls_client isn't available, jobspy will use regular requests
+
+# Patch Country.from_string to return WORLDWIDE for unsupported country strings
+# (e.g. "sri lanka") instead of raising ValueError that kills the entire scrape.
+try:
+    from jobspy.model import Country as _Country
+
+    _orig_country_from_string = _Country.from_string.__func__
+
+    @classmethod  # type: ignore[misc]
+    def _safe_country_from_string(cls, country_str: str):
+        try:
+            return _orig_country_from_string(cls, country_str)
+        except ValueError:
+            return cls.WORLDWIDE
+
+    _Country.from_string = _safe_country_from_string
+except Exception:
+    pass  # If patching fails, fall back to original behavior
+
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
 
@@ -205,7 +241,12 @@ def _run_one_search(
     # Split sites: Glassdoor needs simplified location, others use original
     gd_location = glassdoor_map.get(s["location"], s["location"].split(",")[0])
     has_glassdoor = "glassdoor" in sites
-    other_sites = [si for si in sites if si != "glassdoor"]
+    # Indeed auto-detects country from IP for remote searches, causing failures
+    # when the network exits through a non-USA IP. Skip Indeed for remote-only.
+    effective_sites = [si for si in sites if si != "glassdoor"]
+    if s.get("remote") and "indeed" in effective_sites:
+        effective_sites = [si for si in effective_sites if si != "indeed"]
+    other_sites = effective_sites
 
     all_dfs = []
 
@@ -218,9 +259,13 @@ def _run_one_search(
             "results_wanted": results_per_site,
             "hours_old": hours_old,
             "description_format": "markdown",
-            "country_indeed": defaults.get("country_indeed", "usa"),
             "verbose": 0,
         }
+        # Only pass country_indeed when Indeed is actually in the site list;
+        # jobspy validates this param even if Indeed isn't being used, and
+        # may auto-detect a non-US country from the exit IP causing failures.
+        if "indeed" in other_sites:
+            kwargs["country_indeed"] = defaults.get("country_indeed", "usa")
         if s.get("remote"):
             kwargs["is_remote"] = True
         if proxy_config:

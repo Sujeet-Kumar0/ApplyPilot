@@ -7,6 +7,7 @@ worker profile setup/cloning, and cross-platform process cleanup.
 import json
 import logging
 import platform
+import random
 import shutil
 import subprocess
 import threading
@@ -20,9 +21,117 @@ logger = logging.getLogger(__name__)
 # CDP port base — each worker uses BASE_CDP_PORT + worker_id
 BASE_CDP_PORT = 9222
 
+# HITL (Human-in-the-Loop) Chrome uses a fixed port and worker ID
+# that don't conflict with apply workers (9222–9230+)
+HITL_CDP_PORT = 9300
+HITL_WORKER_ID = 99
+
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
+
+# Persistent ATS session storage
+SESSIONS_DIR = config.APP_DIR / "chrome-sessions"
+
+# ATS domain → slug mapping for persistent session management
+ATS_DOMAINS: dict[str, str] = {
+    "myworkdayjobs.com": "workday",
+    "greenhouse.io": "greenhouse",
+    "lever.co": "lever",
+    "icims.com": "icims",
+    "jobvite.com": "jobvite",
+    "oraclecloud.com": "oracle",
+    "smartrecruiters.com": "smartrecruiters",
+    "ultipro.com": "ultipro",
+    "taleo.net": "taleo",
+}
+
+
+def detect_ats(url: str | None) -> str | None:
+    """Detect the ATS platform from a job or application URL.
+
+    Returns:
+        ATS slug (e.g., 'workday') or None if no known ATS detected.
+    """
+    if not url:
+        return None
+    from urllib.parse import urlparse
+    try:
+        host = urlparse(url).hostname or ""
+        host = host.lower()
+        for domain, slug in ATS_DOMAINS.items():
+            if domain in host:
+                return slug
+    except Exception:
+        pass
+    return None
+
+
+def get_ats_session_path(ats_slug: str) -> Path:
+    """Get the persistent session directory for an ATS platform."""
+    return SESSIONS_DIR / ats_slug
+
+
+def save_ats_session(worker_profile_dir: Path, ats_slug: str) -> int:
+    """Save auth-essential files from a worker profile to the ATS session dir.
+
+    Called after a successful HITL login or apply on an ATS. Persists
+    cookies, login data, and local storage so future workers can reuse
+    the authenticated session.
+
+    Args:
+        worker_profile_dir: Path to the worker's Chrome user-data dir.
+        ats_slug: ATS platform slug (e.g., 'workday').
+
+    Returns:
+        Number of files copied.
+    """
+    session_dir = get_ats_session_path(ats_slug)
+    count = _copy_auth_files(worker_profile_dir, session_dir)
+    if count:
+        logger.info("Saved %d auth files to ATS session: %s", count, ats_slug)
+    return count
+
+
+def clear_ats_session(ats_slug: str) -> bool:
+    """Remove a stale ATS session (e.g., expired cookies).
+
+    Returns:
+        True if a session was removed.
+    """
+    session_dir = get_ats_session_path(ats_slug)
+    if session_dir.exists():
+        shutil.rmtree(str(session_dir), ignore_errors=True)
+        logger.info("Cleared stale ATS session: %s", ats_slug)
+        return True
+    return False
+
+
+def list_ats_sessions() -> list[dict]:
+    """List all saved ATS sessions with their age.
+
+    Returns:
+        List of dicts with keys: slug, path, age_hours, has_cookies.
+    """
+    sessions = []
+    if not SESSIONS_DIR.exists():
+        return sessions
+    for entry in sorted(SESSIONS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        cookies = entry / "Default" / "Cookies"
+        age_hours = None
+        if cookies.exists():
+            import os
+            mtime = os.path.getmtime(cookies)
+            age_hours = (time.time() - mtime) / 3600
+        sessions.append({
+            "slug": entry.name,
+            "path": str(entry),
+            "age_hours": age_hours,
+            "has_cookies": cookies.exists(),
+        })
+    return sessions
 
 
 # ---------------------------------------------------------------------------
@@ -97,73 +206,223 @@ def _kill_on_port(port: int) -> None:
 # Worker profile management
 # ---------------------------------------------------------------------------
 
-def setup_worker_profile(worker_id: int) -> Path:
+# ---------------------------------------------------------------------------
+# Whitelist-based profile cloning — only copy what's needed for auth
+# ---------------------------------------------------------------------------
+
+# Top-level files needed (outside Default/)
+_TOP_LEVEL_FILES = ("Local State",)
+
+# Files inside Default/ needed for sessions and auth
+_DEFAULT_FILES = (
+    "Cookies", "Cookies-journal",
+    "Login Data", "Login Data-journal",
+    "Web Data", "Web Data-journal",
+    "Preferences", "Secure Preferences",
+    "Affiliation Database", "Affiliation Database-journal",
+    "Network Action Predictor", "Network Action Predictor-journal",
+)
+
+# Directories inside Default/ needed for auth (some sites store tokens here)
+_DEFAULT_DIRS = (
+    "Local Storage",
+    "Session Storage",
+    "IndexedDB",
+    "Extension State",
+    "Local Extension Settings",
+)
+
+# Session/tab files to NEVER copy (these are huge with many tabs open)
+_NEVER_COPY = {
+    "Current Session", "Current Tabs", "Last Session", "Last Tabs",
+    "Sessions", "SingletonLock", "SingletonSocket", "SingletonCookie",
+}
+
+
+def _copy_auth_files(source: Path, dest: Path) -> int:
+    """Copy only auth-essential files from a Chrome profile.
+
+    Uses a whitelist approach: only copies cookies, login data, local storage,
+    and preferences. Skips session/tab state, history, caches, and everything
+    else that makes profiles huge.
+
+    Returns:
+        Number of files/dirs successfully copied.
+    """
+    copied = 0
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Top-level files
+    for fname in _TOP_LEVEL_FILES:
+        src = source / fname
+        if src.exists():
+            try:
+                shutil.copy2(str(src), str(dest / fname))
+                copied += 1
+            except (PermissionError, OSError):
+                pass
+
+    # Default/ directory
+    src_default = source / "Default"
+    dst_default = dest / "Default"
+    if not src_default.exists():
+        return copied
+    dst_default.mkdir(parents=True, exist_ok=True)
+
+    # Individual files in Default/
+    for fname in _DEFAULT_FILES:
+        src = src_default / fname
+        if src.exists():
+            try:
+                shutil.copy2(str(src), str(dst_default / fname))
+                copied += 1
+            except (PermissionError, OSError):
+                pass
+
+    # Directories in Default/ (local storage, IndexedDB, etc.)
+    for dname in _DEFAULT_DIRS:
+        src = src_default / dname
+        if src.is_dir():
+            try:
+                shutil.copytree(
+                    str(src), str(dst_default / dname),
+                    dirs_exist_ok=True,
+                )
+                copied += 1
+            except (PermissionError, OSError):
+                pass
+
+    return copied
+
+
+def _refresh_session_files(profile_dir: Path) -> None:
+    """Re-copy auth files from the user's real Chrome profile.
+
+    Updates Cookies, Login Data, Web Data, and Local Storage in the
+    worker's profile so that expired sessions get refreshed without
+    wiping the entire worker profile.
+    """
+    source = config.get_chrome_user_data()
+    count = _copy_auth_files(source, profile_dir)
+    if count:
+        logger.info("Refreshed %d auth files in worker profile", count)
+
+
+def _init_clean_profile(profile_dir: Path) -> None:
+    """Create a minimal, clean Chrome profile with no real-browser data.
+
+    Writes only the bare Preferences needed for Chrome to start without a
+    restore-nag. No cookies, no login data, no sync tokens — nothing copied
+    from the user's real browser.
+    """
+    default_dir = profile_dir / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+
+    minimal_prefs: dict = {}
+    prefs_file = default_dir / "Preferences"
+    prefs_file.write_text(json.dumps(minimal_prefs), encoding="utf-8")
+
+
+def setup_worker_profile(worker_id: int, refresh_cookies: bool = False,
+                         ats_slug: str | None = None) -> Path:
     """Create an isolated Chrome profile for a worker.
 
-    On first run, clones from an existing worker profile (preferred, since
-    it already has session cookies) or from the user's real Chrome profile.
-    Subsequent runs reuse the existing worker profile.
+    Profiles are completely clean — no data is copied from the user's real
+    Chrome browser. This prevents Google sync, extension contamination, and
+    unwanted password autofill triggered by real-browser sessions.
+
+    ATS sessions saved by a previous successful apply (via save_ats_session)
+    are overlaid on top so the worker can reuse prior authentication.
 
     Args:
         worker_id: Numeric worker identifier.
+        refresh_cookies: Ignored (kept for API compatibility). Workers never
+            copy from the real browser, so there is nothing to refresh.
+        ats_slug: Optional ATS platform slug for session overlay.
 
     Returns:
         Path to the worker's Chrome user-data directory.
     """
     profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
-    if (profile_dir / "Default").exists():
-        return profile_dir  # Already initialized
+    prefs_file = profile_dir / "Default" / "Preferences"
+    if not prefs_file.exists():
+        logger.info("[worker-%d] Creating clean isolated profile", worker_id)
+        _init_clean_profile(profile_dir)
 
-    # Find a source: prefer existing worker (has session cookies), else user profile
-    source: Path | None = None
-    for wid in range(10):
-        if wid == worker_id:
-            continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
-            source = candidate
-            break
-    if source is None:
-        source = config.get_chrome_user_data()
+    # Wipe the entire in-profile Extensions directory.
+    # Our extension is loaded via --load-extension (outside the user-data-dir),
+    # so nothing in Extensions/ is needed.  Wiping it prevents Chrome from
+    # re-loading or re-downloading legacy extensions (Momentum, Tampermonkey,
+    # etc.) that may have accumulated before the clean-profile code was added.
+    ext_in_profile = profile_dir / "Default" / "Extensions"
+    if ext_in_profile.is_dir():
+        shutil.rmtree(str(ext_in_profile), ignore_errors=True)
+        ext_in_profile.mkdir(parents=True, exist_ok=True)
+        logger.debug("[worker-%d] Wiped in-profile Extensions directory", worker_id)
 
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
-    profile_dir.mkdir(parents=True, exist_ok=True)
+    # Overlay ATS session if available
+    if ats_slug:
+        session_dir = get_ats_session_path(ats_slug)
+        if (session_dir / "Default").exists():
+            overlay_count = _copy_auth_files(session_dir, profile_dir)
+            logger.info("[worker-%d] Overlaid %d auth files from %s session",
+                        worker_id, overlay_count, ats_slug)
 
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
-
-    for item in source.iterdir():
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
+    # Deploy per-worker extension (copy source + inject per-worker config)
+    # NOTE: Extension must live OUTSIDE the user-data-dir — Chrome 75+ ignores
+    # --load-extension paths that are inside the user-data-dir.
+    ext_src = Path(__file__).parent / "extension"
+    if ext_src.exists():
+        ext_dst = config.CHROME_WORKER_DIR / "extensions" / f"worker-{worker_id}"
         try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
+            shutil.copytree(str(ext_src), str(ext_dst), dirs_exist_ok=True)
+            server_port = 7380 + worker_id
+            config_js = (
+                f"// Per-worker config — generated by setup_worker_profile()\n"
+                f"// DO NOT EDIT — regenerated each time the worker profile is set up\n"
+                f"globalThis.WORKER_CONFIG = {{workerId: {worker_id}, serverPort: {server_port}}};\n"
+            )
+            # config.js: used by popup.html (loaded as a regular <script> tag)
+            (ext_dst / "config.js").write_text(config_js, encoding="utf-8")
+            # Prepend config inline to background.js (classic SW — no module import needed)
+            bg_src = (ext_dst / "background.js").read_text(encoding="utf-8")
+            (ext_dst / "background.js").write_text(config_js + bg_src, encoding="utf-8")
+            logger.debug("[worker-%d] Extension deployed to %s", worker_id, ext_dst)
+        except (OSError, shutil.Error) as e:
+            logger.warning("[worker-%d] Extension deploy failed (non-fatal): %s", worker_id, e)
 
     return profile_dir
 
 
-def _suppress_restore_nag(profile_dir: Path) -> None:
-    """Clear Chrome's 'restore pages' nag by fixing Preferences.
+def _remove_singleton_locks(profile_dir: Path) -> None:
+    """Delete Chrome singleton lock files so Chrome can start cleanly.
 
-    Chrome writes exit_type=Crashed when killed, which triggers a
-    'Restore pages?' prompt on next launch. This patches it out.
+    When a Chrome profile is copied from another machine (or left over from
+    a crashed session), it contains SingletonLock/SingletonSocket/SingletonCookie
+    files. Chrome sees these and refuses to open the debug port, showing a
+    "profile in use by another computer" dialog instead.
+    """
+    _LOCKS = ("SingletonLock", "SingletonSocket", "SingletonCookie")
+    for fname in _LOCKS:
+        lock = profile_dir / fname
+        if lock.exists():
+            try:
+                lock.unlink()
+                logger.debug("Removed stale lock: %s", lock)
+            except OSError:
+                pass
+
+
+def _suppress_restore_nag(profile_dir: Path, worker_id: int | None = None) -> None:
+    """Patch Chrome Preferences before launch.
+
+    Handles three things:
+    1. Suppress the 'restore pages?' nag (Chrome marks exit_type=Crashed on kill).
+    2. Disable Google account sync and sign-in so the worker profile stays isolated —
+       without this, Chrome re-authenticates from copied session cookies and starts
+       pulling in synced extensions, passwords, and settings from the user's real profile.
+    3. Disable all password saving and autofill so Chrome doesn't interfere with
+       the agent's form-filling (wrong saved credentials, unwanted popups).
     """
     prefs_file = profile_dir / "Default" / "Preferences"
     if not prefs_file.exists():
@@ -171,29 +430,372 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 
     try:
         prefs = json.loads(prefs_file.read_text(encoding="utf-8"))
+
+        # --- 1. Suppress restore nag ---
         prefs.setdefault("profile", {})["exit_type"] = "Normal"
-        prefs.setdefault("session", {})["restore_on_startup"] = 4  # 4 = open blank
-        prefs.setdefault("session", {}).pop("startup_urls", None)
+        if worker_id is not None:
+            # Open the worker's status homepage on startup (served by the always-on
+            # HTTP server at port 7380+worker_id, which starts before Chrome launches).
+            server_port = 7380 + worker_id
+            prefs.setdefault("session", {})["restore_on_startup"] = 4  # 4 = open specific URLs
+            prefs.setdefault("session", {})["startup_urls"] = [f"http://localhost:{server_port}/"]
+        else:
+            prefs.setdefault("session", {})["restore_on_startup"] = 5  # 5 = New Tab page
+            prefs.setdefault("session", {}).pop("startup_urls", None)
+
+        # --- 2. Disable Google sync and sign-in ---
+        # Prevents Chrome from re-syncing extensions/passwords from the user's
+        # real Google profile when the copied session cookies re-authenticate.
+        prefs.setdefault("sync", {}).update({
+            "requested": False,
+            "has_setup_completed": False,
+            "suppress_start": True,
+            "keep_everything_synced": False,
+        })
+        prefs.setdefault("signin", {}).update({
+            "allowed": False,
+            "allowed_on_next_startup": False,
+        })
+
+        # --- 3. Disable password manager and all autofill ---
         prefs["credentials_enable_service"] = False
-        prefs.setdefault("password_manager", {})["saving_enabled"] = False
-        prefs.setdefault("autofill", {})["profile_enabled"] = False
+        prefs["credentials_enable_autosign"] = False
+        prefs.setdefault("profile", {})["password_manager_enabled"] = False
+        prefs.setdefault("password_manager", {}).update({
+            "saving_enabled": False,
+            "autosignin_enabled": False,
+        })
+        prefs.setdefault("autofill", {}).update({
+            "enabled": False,
+            "credit_card_enabled": False,
+            "profile_enabled": False,
+        })
+
+        # Enable developer mode so --load-extension can load unpacked extensions
+        prefs.setdefault("extensions", {}).setdefault("ui", {})["developer_mode"] = True
+        # Remove web-store extension entries whose files live inside the profile's
+        # Default/Extensions/ dir.  Chrome re-downloads any extension still listed
+        # in extensions.settings even after we wipe its files — so we remove those
+        # entries here.  We keep entries whose path is OUTSIDE the profile dir
+        # (our --load-extension extension, Chrome built-ins) so their pin state
+        # and toolbar position survive restarts.
+        ext_settings = prefs.get("extensions", {}).get("settings")
+        if ext_settings:
+            profile_ext_prefix = str(prefs_file.parent / "Extensions")
+            stale = [k for k, v in ext_settings.items()
+                     if str(v.get("path", "")).startswith(profile_ext_prefix)]
+            for k in stale:
+                del ext_settings[k]
+
         prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
     except Exception:
         logger.debug("Could not patch Chrome preferences", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
+# Anti-detection helpers
+# ---------------------------------------------------------------------------
+
+def _get_real_user_agent() -> str:
+    """Build a realistic Chrome user agent string for macOS.
+
+    Reads the actual Chrome version to stay current. Falls back to a
+    reasonable default if detection fails.
+    """
+    try:
+        chrome_exe = config.get_chrome_path()
+        result = subprocess.run(
+            [chrome_exe, "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # "Google Chrome 145.0.7632.76" -> "145.0.7632.76"
+        version = result.stdout.strip().split()[-1]
+    except Exception:
+        version = "133.0.6943.141"
+
+    system = platform.system()
+    if system == "Darwin":
+        os_part = "Macintosh; Intel Mac OS X 10_15_7"
+    elif system == "Windows":
+        os_part = "Windows NT 10.0; Win64; x64"
+    else:
+        os_part = "X11; Linux x86_64"
+
+    return (
+        f"Mozilla/5.0 ({os_part}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Viewport randomization — each worker picks a random common resolution
+# ---------------------------------------------------------------------------
+
+_VIEWPORT_POOL = [
+    (1920, 1080), (1440, 900), (1536, 864), (1366, 768),
+    (1600, 900), (1280, 800), (1280, 720),
+]
+
+_worker_viewports: dict[int, tuple[int, int]] = {}
+
+
+def _pick_viewport() -> tuple[int, int]:
+    """Pick a random viewport from the pool."""
+    return random.choice(_VIEWPORT_POOL)
+
+
+def get_worker_viewport(worker_id: int) -> tuple[int, int]:
+    """Return the stored viewport for a worker, or (1280, 800) fallback."""
+    return _worker_viewports.get(worker_id, (1280, 800))
+
+
+# ---------------------------------------------------------------------------
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
+def bring_to_foreground() -> None:
+    """Attempt to bring Chrome to the foreground (best-effort).
+
+    Tries wmctrl then xdotool on Linux; AppleScript on macOS.
+    Fails silently — this is UI polish, not critical.
+    """
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "Google Chrome" to activate'],
+                timeout=3, capture_output=True,
+            )
+        else:
+            # Try wmctrl first (more reliable for window managers)
+            result = subprocess.run(
+                ["wmctrl", "-a", "Chrome"],
+                timeout=3, capture_output=True,
+            )
+            if result.returncode != 0:
+                subprocess.run(
+                    ["xdotool", "search", "--name", "Chrome",
+                     "windowactivate", "--sync"],
+                    timeout=3, capture_output=True,
+                )
+    except Exception:
+        pass  # Best-effort only
+
+
+def bring_to_foreground_cdp(cdp_port: int) -> bool:
+    """Bring a Chrome window to the foreground via CDP Page.bringToFront.
+
+    Uses websocket-client to send a CDP command directly to Chrome.
+    Works on Wayland, X11, and macOS — no external tools required.
+
+    Returns True on success, False if Chrome isn't reachable.
+    """
+    import json
+    from urllib.request import urlopen
+    from urllib.error import URLError
+
+    try:
+        with urlopen(f"http://localhost:{cdp_port}/json", timeout=2) as r:
+            targets = json.loads(r.read())
+    except (URLError, OSError, Exception):
+        return False
+
+    ws_url = next(
+        (t.get("webSocketDebuggerUrl") for t in targets if t.get("type") == "page"),
+        None,
+    )
+    if not ws_url:
+        return False
+
+    try:
+        import websocket  # websocket-client
+        ws = websocket.WebSocket()
+        ws.connect(ws_url, timeout=3, origin="http://localhost")
+        ws.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
+        ws.recv()
+        ws.close()
+        return True
+    except Exception:
+        return False
+
+
+def _raise_x11_window(pid: int) -> bool:
+    """Raise an X11/XWayland window belonging to a PID via libX11 ctypes.
+
+    Sends a _NET_ACTIVE_WINDOW ClientMessage to the root window, which asks
+    the compositor (Mutter, KWin, etc.) to raise and focus the window.
+    Works without xdotool or wmctrl installed.
+
+    Returns True on success, False if libX11 is unavailable or the window
+    can't be found.
+    """
+    if not pid:
+        return False
+    try:
+        import ctypes
+        X11 = ctypes.CDLL("libX11.so.6")
+        X11.XOpenDisplay.restype = ctypes.c_void_p
+        X11.XDefaultRootWindow.restype = ctypes.c_ulong
+        X11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        X11.XInternAtom.restype = ctypes.c_ulong
+        X11.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_long, ctypes.c_long, ctypes.c_int,
+            ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p),
+        ]
+        X11.XFree.argtypes = [ctypes.c_void_p]
+        X11.XSendEvent.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+            ctypes.c_long, ctypes.c_void_p,
+        ]
+        X11.XFlush.argtypes = [ctypes.c_void_p]
+        X11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+        dpy = X11.XOpenDisplay(None)
+        if not dpy:
+            return False
+        try:
+            root = X11.XDefaultRootWindow(dpy)
+            XA_WINDOW   = ctypes.c_ulong(33)
+            XA_CARDINAL = ctypes.c_ulong(6)
+            NET_CLIENT_LIST = X11.XInternAtom(dpy, b"_NET_CLIENT_LIST", 0)
+            NET_WM_PID      = X11.XInternAtom(dpy, b"_NET_WM_PID", 0)
+            NET_ACTIVE_WIN  = X11.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", 0)
+
+            atype = ctypes.c_ulong(); afmt = ctypes.c_int()
+            nitems = ctypes.c_ulong(); bafter = ctypes.c_ulong()
+            data = ctypes.c_void_p()
+
+            # Fetch all managed windows
+            X11.XGetWindowProperty(
+                dpy, root, NET_CLIENT_LIST,
+                0, 0x7FFFFFFF, 0, XA_WINDOW,
+                ctypes.byref(atype), ctypes.byref(afmt),
+                ctypes.byref(nitems), ctypes.byref(bafter), ctypes.byref(data),
+            )
+            wins = list(ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[:nitems.value])
+            X11.XFree(data)
+
+            # Find the first window belonging to this PID
+            target = None
+            for win in wins:
+                X11.XGetWindowProperty(
+                    dpy, win, NET_WM_PID,
+                    0, 1, 0, XA_CARDINAL,
+                    ctypes.byref(atype), ctypes.byref(afmt),
+                    ctypes.byref(nitems), ctypes.byref(bafter), ctypes.byref(data),
+                )
+                if atype.value == XA_CARDINAL.value and nitems.value:
+                    win_pid = ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[0]
+                    X11.XFree(data)
+                    if win_pid == pid:
+                        target = win
+                        break
+                else:
+                    X11.XFree(data)
+
+            if not target:
+                return False
+
+            # Send _NET_ACTIVE_WINDOW ClientMessage to root
+            class _EvData(ctypes.Union):
+                _fields_ = [("l", ctypes.c_long * 5), ("b", ctypes.c_char * 20)]
+            class _XClientMsg(ctypes.Structure):
+                _fields_ = [
+                    ("type",         ctypes.c_int),
+                    ("serial",       ctypes.c_ulong),
+                    ("send_event",   ctypes.c_int),
+                    ("display",      ctypes.c_void_p),
+                    ("window",       ctypes.c_ulong),
+                    ("message_type", ctypes.c_ulong),
+                    ("format",       ctypes.c_int),
+                    ("data",         _EvData),
+                ]
+            ev = _XClientMsg()
+            ev.type = 33           # ClientMessage
+            ev.window = target
+            ev.message_type = NET_ACTIVE_WIN
+            ev.format = 32
+            ev.data.l[0] = 2       # source = application
+            ev.data.l[1] = 0       # timestamp (0 = current)
+            ev.data.l[2] = 0       # currently active window
+
+            # SubstructureRedirectMask | SubstructureNotifyMask
+            X11.XSendEvent(dpy, root, 0, (1 << 20) | (1 << 19), ctypes.byref(ev))
+            X11.XFlush(dpy)
+            return True
+        finally:
+            X11.XCloseDisplay(dpy)
+    except Exception:
+        logger.debug("X11 window raise failed", exc_info=True)
+        return False
+
+
+def bring_to_foreground_pid(pid: int) -> None:
+    """Bring a Chrome window to the foreground by PID.
+
+    Tries (in order): xdotool, wmctrl, X11 ctypes (_NET_ACTIVE_WINDOW),
+    generic bring_to_foreground(). Best-effort — fails silently.
+    """
+    if not pid:
+        bring_to_foreground()
+        return
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(
+                ["osascript", "-e",
+                 f'tell application "System Events" to set frontmost of '
+                 f'(first process whose unix id is {pid}) to true'],
+                timeout=3, capture_output=True,
+            )
+            return
+        # xdotool
+        result = subprocess.run(
+            ["xdotool", "search", "--pid", str(pid), "windowactivate", "--sync"],
+            timeout=3, capture_output=True,
+        )
+        if result.returncode == 0:
+            return
+        # wmctrl
+        lp = subprocess.run(
+            ["wmctrl", "-l", "-p"], timeout=3, capture_output=True, text=True,
+        )
+        if lp.returncode == 0:
+            for line in lp.stdout.splitlines():
+                parts = line.split(None, 4)
+                if len(parts) >= 3 and parts[2] == str(pid):
+                    subprocess.run(
+                        ["wmctrl", "-i", "-a", parts[0]],
+                        timeout=3, capture_output=True,
+                    )
+                    return
+        # X11 ctypes — works on X11/XWayland without external tools
+        if _raise_x11_window(pid):
+            return
+        bring_to_foreground()
+    except Exception:
+        pass  # Best-effort only
+
+
 def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
+                  headless: bool = False,
+                  refresh_cookies: bool = False,
+                  minimized: bool = True,
+                  ats_slug: str | None = None) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
+        refresh_cookies: Re-copy session files from user's Chrome profile.
+        minimized: Start Chrome minimized (default True). When False,
+            positions the window at 0,0 for HITL (human-review) use.
+        ats_slug: Optional ATS platform slug. If a persistent session
+            exists for this ATS, its auth files are overlaid on the
+            worker profile.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -201,39 +803,62 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
-    profile_dir = setup_worker_profile(worker_id)
+    profile_dir = setup_worker_profile(worker_id, refresh_cookies=refresh_cookies,
+                                       ats_slug=ats_slug)
 
     # Kill any zombie Chrome from a previous run on this port
     _kill_on_port(port)
 
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
+    # Remove stale singleton locks (left from copied/crashed profiles)
+    _remove_singleton_locks(profile_dir)
+
+    # Patch preferences to suppress restore nag and set startup homepage
+    _suppress_restore_nag(profile_dir, worker_id=worker_id)
 
     chrome_exe = config.get_chrome_path()
+
+    vp = _pick_viewport()
+    _worker_viewports[worker_id] = vp
 
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
+        "--remote-allow-origins=http://localhost",
         f"--user-data-dir={profile_dir}",
         "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
-        "--window-size=1024,768",
+        f"--window-size={vp[0]},{vp[1]}",
         "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding,"
+        "SyncDisabledWithNoNetwork,ChromeSignin,Sync",
         "--hide-crash-restore-bubble",
         "--noerrdialogs",
         "--password-store=basic",
         "--disable-save-password-bubble",
+        "--disable-sync",
         "--disable-popup-blocking",
+        # Use XWayland instead of native Wayland to avoid NVIDIA EGL black rendering
+        "--ozone-platform=x11",
         # Block dangerous permissions at browser level
-        "--use-fake-device-for-media-stream",
-        "--use-fake-ui-for-media-stream",
         "--deny-permission-prompts",
         "--disable-notifications",
+        f"--user-agent={_get_real_user_agent()}",
+        "--disable-infobars",
     ]
+
+    # Load the per-worker ApplyPilot extension if it exists
+    # Extension lives outside the user-data-dir (Chrome 75+ requirement)
+    ext_path = config.CHROME_WORKER_DIR / "extensions" / f"worker-{worker_id}"
+    if ext_path.exists() and not headless:
+        cmd.append(f"--load-extension={ext_path}")
+
     if headless:
         cmd.append("--headless=new")
+    elif minimized:
+        cmd.append("--start-minimized")
+    else:
+        cmd.append("--window-position=0,0")
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
