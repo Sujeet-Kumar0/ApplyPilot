@@ -130,6 +130,13 @@ def test_check_tier_missing_message_mentions_all_supported_llm_envs(
 
     captured = capsys.readouterr()
     combined = f"{captured.out}\n{captured.err}"
-    assert llm_config_hint() in combined
+    for snippet in (
+        "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "LLM_URL",
+        "applypilot init",
+    ):
+        assert snippet in combined
     assert "OPENROUTER_API_KEY" in combined
     assert "LLM_URL" in combined

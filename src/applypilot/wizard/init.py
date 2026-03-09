@@ -20,6 +20,8 @@ from rich.prompt import Confirm, Prompt
 
 from applypilot.config import (
     APP_DIR,
+    AUTO_APPLY_AGENT_CHOICES,
+    DEFAULT_AUTO_APPLY_AGENT,
     ENV_PATH,
     PROFILE_PATH,
     RESUME_PATH,
@@ -262,6 +264,57 @@ def _build_ai_env_lines(provider: str, credential: str, model: str) -> list[str]
     ]
 
 
+def _parse_env_lines(text: str) -> tuple[list[str], dict[str, int]]:
+    lines = text.splitlines()
+    positions: dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key:
+            positions[key] = idx
+    return lines, positions
+
+
+def _upsert_env_vars(updates: dict[str, str]) -> None:
+    """Merge selected env vars into ~/.applypilot/.env without dropping others."""
+
+    if ENV_PATH.exists():
+        lines, positions = _parse_env_lines(ENV_PATH.read_text(encoding="utf-8"))
+    else:
+        lines = ["# ApplyPilot configuration", ""]
+        positions = {}
+
+    for key, value in updates.items():
+        rendered = f"{key}={value}"
+        if key in positions:
+            lines[positions[key]] = rendered
+        else:
+            if lines and lines[-1] != "":
+                lines.append("")
+            positions[key] = len(lines)
+            lines.append(rendered)
+
+    content = "\n".join(lines).rstrip() + "\n"
+    ENV_PATH.write_text(content, encoding="utf-8")
+
+
+def _delete_env_vars(keys: list[str]) -> None:
+    """Remove env vars from ~/.applypilot/.env if they exist."""
+
+    if not ENV_PATH.exists():
+        return
+
+    lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
+    filtered = [
+        line for line in lines
+        if "=" not in line
+        or line.lstrip().startswith("#")
+        or line.split("=", 1)[0].strip() not in keys
+    ]
+    ENV_PATH.write_text("\n".join(filtered).rstrip() + "\n", encoding="utf-8")
+
+
 def _setup_ai_features() -> None:
     """Ask about AI scoring/tailoring — optional LLM configuration."""
     console.print(Panel(
@@ -289,8 +342,13 @@ def _setup_ai_features() -> None:
     else:
         credential = Prompt.ask(_PROVIDER_CREDENTIAL_PROMPTS[provider])
     model = Prompt.ask(_PROVIDER_MODEL_PROMPTS[provider], default=LLM_PROVIDER_SPECS[provider].default_model)
-    env_lines = _build_ai_env_lines(provider, credential, model)
-    ENV_PATH.write_text("\n".join(env_lines), encoding="utf-8")
+    spec = LLM_PROVIDER_SPECS[provider]
+    other_provider_keys = [entry.env_key for entry in LLM_PROVIDER_SPECS.values() if entry.key != provider]
+    _delete_env_vars(other_provider_keys)
+    _upsert_env_vars({
+        spec.env_key: credential,
+        "LLM_MODEL": model,
+    })
     console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
 
 
@@ -299,41 +357,61 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (separate from the built-in LLM)."""
+    from applypilot.config import get_auto_apply_agent_statuses
+
     console.print(Panel(
-        "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
+        "[bold]Step 5: Auto-Apply Agent (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using a browser agent. This is separate from the Gemini/OpenRouter/OpenAI/local\n"
+        "LLM you configure for scoring, tailoring, and cover letters."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
-    if shutil.which("claude"):
+    statuses = get_auto_apply_agent_statuses()
+    if statuses["codex"].available:
+        console.print(f"[green]Codex CLI ready.[/green] {statuses['codex'].note}")
+    elif statuses["codex"].binary_path:
+        console.print(f"[yellow]Codex CLI found but not ready.[/yellow] {statuses['codex'].note}")
+    else:
+        console.print(f"[yellow]Codex CLI not found.[/yellow] {statuses['codex'].note}")
+
+    if statuses["claude"].available:
         console.print("[green]Claude Code CLI detected.[/green]")
     else:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "[dim]Claude Code CLI optional fallback.[/dim]\n"
+            "Install it from: [bold]https://claude.ai/code[/bold] if you want Claude compatibility."
         )
+
+    default_agent = DEFAULT_AUTO_APPLY_AGENT
+    if statuses["codex"].available and not statuses["claude"].available:
+        default_agent = "codex"
+    elif statuses["claude"].available and not statuses["codex"].available:
+        default_agent = "claude"
+
+    selected_agent = Prompt.ask(
+        "Browser agent",
+        choices=list(AUTO_APPLY_AGENT_CHOICES),
+        default=default_agent,
+    )
+    model_override = Prompt.ask("Browser agent model override (optional)", default="")
+    updates = {"AUTO_APPLY_AGENT": selected_agent}
+    if model_override.strip():
+        updates["AUTO_APPLY_MODEL"] = model_override.strip()
+    else:
+        _delete_env_vars(["AUTO_APPLY_MODEL"])
+    _upsert_env_vars(updates)
+    console.print(f"[green]Auto-apply agent saved to {ENV_PATH}[/green]")
 
     # Optional: CapSolver for CAPTCHAs
     console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
     if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
         capsolver_key = Prompt.ask("CapSolver API key")
-        # Append to existing .env or create
-        if ENV_PATH.exists():
-            existing = ENV_PATH.read_text(encoding="utf-8")
-            if "CAPSOLVER_API_KEY" not in existing:
-                ENV_PATH.write_text(
-                    existing.rstrip() + f"\nCAPSOLVER_API_KEY={capsolver_key}\n",
-                    encoding="utf-8",
-                )
-        else:
-            ENV_PATH.write_text(f"# ApplyPilot configuration\nCAPSOLVER_API_KEY={capsolver_key}\n", encoding="utf-8")
+        _upsert_env_vars({"CAPSOLVER_API_KEY": capsolver_key})
         console.print("[green]CapSolver key saved.[/green]")
     else:
         console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env later if needed.[/dim]")
@@ -375,7 +453,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 5: Auto-apply agent
     _setup_auto_apply()
     console.print()
 
@@ -399,7 +477,10 @@ def run_wizard() -> None:
     if tier == 1:
         unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM provider (re-run [bold]applypilot init[/bold]).[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = (
+            "\n[dim]To unlock Tier 3: install Codex CLI and run `codex login`, or install Claude Code CLI, "
+            "plus Chrome and Node.js.[/dim]"
+        )
 
     console.print(
         Panel.fit(
