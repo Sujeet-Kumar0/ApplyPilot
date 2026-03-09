@@ -117,7 +117,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_AGENT_PRIORITY`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional).
 
 ## Two AI Layers
 
@@ -125,6 +125,7 @@ ApplyPilot intentionally separates its AI work into two different layers:
 
 1. The built-in LLM layer handles text-heavy tasks like scoring jobs, tailoring resumes, writing cover letters, and some enrichment. Gemini is the default here.
 2. The auto-apply agent layer drives the browser through MCP tools. Codex CLI is the default browser agent. Claude Code CLI remains supported as a compatibility backend.
+   If you keep `AUTO_APPLY_AGENT=auto`, you can override the fallback order with `AUTO_APPLY_AGENT_PRIORITY=codex,claude` or `claude,codex`.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)

@@ -59,6 +59,32 @@ def test_resolve_auto_apply_agent_prefers_codex_then_claude(monkeypatch) -> None
     assert selection.model == config.DEFAULT_CLAUDE_AUTO_APPLY_MODEL
 
 
+def test_resolve_auto_apply_agent_honors_priority_env(monkeypatch) -> None:
+    monkeypatch.setattr(
+        config,
+        "get_auto_apply_agent_statuses",
+        lambda: {
+            "codex": _agent_status("codex", available=True, binary="/opt/homebrew/bin/codex", note="Logged in"),
+            "claude": _agent_status("claude", available=True, binary="/usr/local/bin/claude"),
+        },
+    )
+
+    selection = config.resolve_auto_apply_agent(
+        environ={
+            "AUTO_APPLY_AGENT": "auto",
+            "AUTO_APPLY_AGENT_PRIORITY": "claude,codex",
+        }
+    )
+
+    assert selection.resolved == "claude"
+
+
+def test_get_auto_apply_agent_priority_falls_back_on_invalid_values() -> None:
+    assert config.get_auto_apply_agent_priority(
+        {"AUTO_APPLY_AGENT_PRIORITY": "invalid,claude,claude"}
+    ) == ("claude", "codex")
+
+
 def test_auto_apply_model_setting_is_separate_from_llm_model() -> None:
     env = {
         "AUTO_APPLY_MODEL": "gpt-5.4",

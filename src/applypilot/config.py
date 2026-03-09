@@ -35,12 +35,14 @@ PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
 
 AUTO_APPLY_AGENT_CHOICES = ("auto", "codex", "claude")
+AUTO_APPLY_AGENT_PRIORITY_CHOICES = ("codex", "claude")
 AUTO_APPLY_AGENT_LABELS = {
     "auto": "Auto-detect",
     "codex": "Codex CLI",
     "claude": "Claude Code CLI",
 }
 DEFAULT_AUTO_APPLY_AGENT = "auto"
+DEFAULT_AUTO_APPLY_AGENT_PRIORITY = ("codex", "claude")
 DEFAULT_CLAUDE_AUTO_APPLY_MODEL = "haiku"
 
 
@@ -229,6 +231,27 @@ def get_auto_apply_agent_setting(environ: Mapping[str, str] | None = None) -> st
     return value
 
 
+def get_auto_apply_agent_priority(environ: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Return the fallback order used when AUTO_APPLY_AGENT=auto."""
+
+    env = _env(environ)
+    configured = env.get("AUTO_APPLY_AGENT_PRIORITY", "").strip()
+    if not configured:
+        return DEFAULT_AUTO_APPLY_AGENT_PRIORITY
+
+    ordered: list[str] = []
+    for raw_part in configured.split(","):
+        part = raw_part.strip().lower()
+        if part in AUTO_APPLY_AGENT_PRIORITY_CHOICES and part not in ordered:
+            ordered.append(part)
+
+    for part in DEFAULT_AUTO_APPLY_AGENT_PRIORITY:
+        if part not in ordered:
+            ordered.append(part)
+
+    return tuple(ordered)
+
+
 def get_auto_apply_model_setting(
     agent: str | None = None,
     environ: Mapping[str, str] | None = None,
@@ -320,10 +343,10 @@ def resolve_auto_apply_agent(
     statuses = get_auto_apply_agent_statuses()
     resolved: str | None = None
     if requested == "auto":
-        if statuses["codex"].available:
-            resolved = "codex"
-        elif statuses["claude"].available:
-            resolved = "claude"
+        for candidate in get_auto_apply_agent_priority(environ):
+            if statuses[candidate].available:
+                resolved = candidate
+                break
     elif statuses[requested].available:
         resolved = requested
 
