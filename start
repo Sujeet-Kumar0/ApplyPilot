@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+clear
+printf 'Datetime: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  printf 'Run this script with: source ./start\n' >&2
+  exit 1
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ ! -f "$script_dir/.venv/bin/activate" ]]; then
+  printf 'Missing virtualenv activate script at %s\n' "$script_dir/.venv/bin/activate" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+source "$script_dir/.venv/bin/activate"
