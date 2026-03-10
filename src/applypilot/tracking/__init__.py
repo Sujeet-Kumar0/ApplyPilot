@@ -166,7 +166,6 @@ def remap_stubs(conn=None) -> dict:
         get_applied_jobs,
         create_stub_job,
         update_tracking_status,
-        update_job_tracking_fields,
     )
 
     if conn is None:
@@ -352,7 +351,7 @@ def run_tracking(
     conn = get_connection()
     applied_jobs = get_applied_jobs(conn)
 
-    console.print(f"\n[bold blue]Tracking Responses[/bold blue]")
+    console.print("\n[bold blue]Tracking Responses[/bold blue]")
     console.print(f"  Applied jobs: {len(applied_jobs)}")
     console.print(f"  Look-back:   {days} days")
     console.print(f"  Dry run:     {dry_run}\n")
@@ -467,7 +466,7 @@ def run_tracking(
             console.print(f"  Generated {doc_count} tracking documents")
 
     # 10. Summary
-    console.print(f"\n[bold]Tracking Summary[/bold]")
+    console.print("\n[bold]Tracking Summary[/bold]")
     console.print(f"  Emails fetched:   {len(emails)}")
     console.print(f"  New emails:       {len(new_emails)}")
     console.print(f"  Matched to jobs:  {matched_count}")
@@ -483,7 +482,7 @@ def run_tracking(
     # Show tracking stats
     tracking_stats = get_tracking_stats(conn)
     if tracking_stats:
-        console.print(f"\n[bold]Status Breakdown[/bold]")
+        console.print("\n[bold]Status Breakdown[/bold]")
         for status, count in sorted(tracking_stats.items(), key=lambda x: -x[1]):
             emoji = {
                 "confirmation": "[green]",
