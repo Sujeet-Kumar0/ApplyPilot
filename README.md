@@ -419,25 +419,25 @@ applypilot apply --dry-run --url <job_url>
 
 ## A Note from Alex
 
-If you're using this tool — thank you. Genuinely. It means a lot to know something I built during one of the harder chapters of my career is useful to someone else going through the same grind.
+I forked this project during my own job search and ended up going pretty deep on it — adding multi-provider LLM fallback, human-in-the-loop review, Gmail tracking, a Q&A knowledge base, ATS session persistence, and a lot of pipeline hardening along the way. Credit to [Pickle-Pixel](https://github.com/Pickle-Pixel) for the solid foundation.
 
-This pipeline helped me apply to hundreds of jobs I would never have reached manually, get my materials in front of companies I cared about, and stay sane while doing it. I hope it does the same for you.
+If you're using this fork — I hope it helps. This pipeline got me in front of companies I genuinely cared about, at a pace I never could have managed manually.
 
-If it's been useful, the best way to say thanks is simple: [follow me on GitHub](https://github.com/ibarrajo) and star this repo — or any of my other projects while you're there. It signals to me that this work matters and gives me motivation to keep improving it.
+If it's been useful, the best way to say thanks: [follow me on GitHub](https://github.com/ibarrajo) and star the repo. It signals that the work matters.
 
 ---
 
-**But here's the thing I want to be honest about:** running an automation that blasts every ATS and every job board shouldn't be the goal of your job search — and I say that as someone who built this tool and used it himself.
+**One thing I want to be honest about:** blasting every ATS and every job board shouldn't be the goal — and I say that as someone who built this and used it himself.
 
-The signal-to-noise problem in hiring is already catastrophic. ATS inboxes are flooded. Recruiters are overwhelmed. Candidates are invisible. There's an entire industry that exists just to help people game a system that was never designed for humans in the first place. Adding more volume doesn't fix that — it makes it worse for everyone, including you.
+The signal-to-noise problem in hiring is already catastrophic. ATS inboxes are flooded. Recruiters are overwhelmed. Candidates are invisible. Adding more volume doesn't fix that — it makes it worse for everyone, including you.
 
-I built ApplyPilot as a force multiplier for a *focused* search: high-fit jobs, properly tailored materials, applied efficiently. Not a firehose.
+I used ApplyPilot as a force multiplier for a *focused* search: high-fit jobs, properly tailored materials, applied efficiently. Not a firehose.
 
-The deeper problem is the matching problem itself — the **n×m problem** of connecting the right job seekers to the right employers at scale. I spent three years at [Jobscan](https://www.jobscan.co) as a lead engineer thinking about exactly this. We built resume optimization tuned per company and ATS, job trackers, job search tools, and coaching tools for career professionals — all trying to close the gap between what candidates bring and what employers can actually see. It's hard. The current system is structurally broken.
+The deeper problem is the matching problem itself — the **n×m problem** of connecting the right job seekers to the right employers at scale. I spent three years at [Jobscan](https://www.jobscan.co) as a lead engineer thinking about exactly this. We built resume optimization tuned per company and ATS, job trackers, and coaching tools for career professionals — all trying to close the gap between what candidates bring and what employers can actually see. It's hard. The current system is structurally broken.
 
-That's why, at a recent [Venture Mechanics](https://venturemechanics.com) AI Scalathon in Seattle, my team and I explored what I think is the natural next step: **agent-to-agent matching**. Instead of humans gaming systems built for computers, imagine employer agents and candidate agents negotiating directly — structured, transparent, and actually aligned with what both sides want. A distributed future where AI closes the gap rather than adding to the noise.
+That's why, at a recent [Venture Mechanics](https://venturemechanics.com) AI Scalathon in Seattle, my team and I explored what I think is the natural next step: **agent-to-agent matching**. Instead of humans gaming systems built for computers, imagine employer agents and candidate agents negotiating directly — structured, transparent, and actually aligned with what both sides want. A future where AI closes the gap rather than adding to the noise.
 
-ApplyPilot is a tool for today's broken system. The agent-to-agent future is what I'm working toward next — and it's apparently been a running joke in VC and AI startup circles for years. Ask anyone building in the recruiting tech space and they'll tell you: "yeah, the real solution is obviously a2a, someone just needs to actually build it." A punchline that kept coming up in founder conversations, investor pitches, and hackathon hallways. My team and I are building that something. It's called **Pursit**.
+ApplyPilot is a tool for today's broken system. The agent-to-agent future is what I'm working toward next. My team and I are building that — it's called **Pursuit**.
 
 Good luck out there. Reach me at [elninja.com](https://elninja.com) if you want to talk.
 
