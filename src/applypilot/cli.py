@@ -35,12 +35,24 @@ def _configure_logging() -> None:
     # Per-attempt warnings and validation details are useful for debugging
     # but too noisy for normal CLI output.
     from applypilot.config import LOG_DIR
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
     _file_fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        bootstrap_log.debug("Could not create log directory %s: %s", LOG_DIR, exc)
+        return
+
     for logger_name in ("applypilot.scoring.tailor", "applypilot.scoring.cover_letter"):
         file_log = logging.getLogger(logger_name)
         file_log.propagate = False  # suppress terminal output
-        fh = logging.FileHandler(LOG_DIR / f"{logger_name.split('.')[-1]}.log", encoding="utf-8")
+        if any(isinstance(handler, logging.FileHandler) for handler in file_log.handlers):
+            continue
+        try:
+            fh = logging.FileHandler(LOG_DIR / f"{logger_name.split('.')[-1]}.log", encoding="utf-8")
+        except OSError as exc:
+            bootstrap_log.debug("Could not open log file for %s: %s", logger_name, exc)
+            file_log.propagate = True
+            continue
         fh.setFormatter(_file_fmt)
         file_log.addHandler(fh)
 
