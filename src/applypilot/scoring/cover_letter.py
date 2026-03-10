@@ -6,7 +6,6 @@ profile at runtime. No hardcoded personal information.
 """
 
 import hashlib
-import json
 import logging
 import re
 import time
@@ -14,10 +13,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
-from applypilot.database import commit_with_retry, get_connection, get_jobs_by_stage, write_with_retry
+from applypilot.database import get_connection, write_with_retry
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
-    BANNED_WORDS,
     sanitize_text,
     validate_cover_letter,
 )

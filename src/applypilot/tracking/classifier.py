@@ -81,7 +81,7 @@ def _parse_response(response: str) -> dict:
     if text.startswith("```"):
         lines = text.split("\n")
         # Remove first and last lines (```json and ```)
-        lines = [l for l in lines if not l.strip().startswith("```")]
+        lines = [ln for ln in lines if not ln.strip().startswith("```")]
         text = "\n".join(lines)
 
     try:

@@ -500,7 +500,7 @@ def _run_streaming(ordered: list[str], min_score: int, limit: int = 20, workers:
     stop_event = threading.Event()
     pipeline_start = time.time()
 
-    console.print(f"\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
+    console.print("\n  [bold cyan]STREAMING MODE[/bold cyan] — stages run concurrently")
     console.print(f"  Poll interval: {_STREAM_POLL_INTERVAL}s\n")
 
     # Mark stages NOT in `ordered` as done so downstream doesn't wait for them
@@ -614,7 +614,7 @@ def run_pipeline(
         for name in ordered:
             meta = STAGE_META[name]
             console.print(f"    {name:<12s}  {meta['desc']}")
-        console.print(f"\n  No changes made.")
+        console.print("\n  No changes made.")
         return {"stages": [], "errors": {}, "elapsed": 0.0}
 
     # Set up per-run file logging
@@ -656,7 +656,7 @@ def run_pipeline(
 
     # Final DB stats
     final = get_stats()
-    console.print(f"\n  [bold]DB Final State:[/bold]")
+    console.print("\n  [bold]DB Final State:[/bold]")
     console.print(f"    Total jobs:     {final['total']}")
     console.print(f"    With desc:      {final['with_description']}")
     console.print(f"    Scored:         {final['scored']}")

@@ -5,7 +5,10 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+import hashlib
+import json
 import logging
+import re as _re
 import sqlite3
 import threading
 import time
@@ -1516,9 +1519,6 @@ def get_tracking_stats(conn: sqlite3.Connection | None = None) -> dict:
 # ---------------------------------------------------------------------------
 # Q&A Knowledge Base
 # ---------------------------------------------------------------------------
-
-import hashlib
-import re as _re
 
 
 def normalize_question(text: str) -> str:

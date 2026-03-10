@@ -13,7 +13,6 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -373,7 +372,7 @@ def _setup_optional_files(profile: dict) -> None:
     if files:
         profile["files"] = files
         PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
-        console.print(f"[green]Document paths saved to profile.json[/green]")
+        console.print("[green]Document paths saved to profile.json[/green]")
 
 
 # ---------------------------------------------------------------------------

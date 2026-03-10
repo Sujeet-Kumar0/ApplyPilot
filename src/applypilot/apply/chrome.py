@@ -885,8 +885,10 @@ def _raise_x11_window(pid: int) -> bool:
             NET_WM_PID      = X11.XInternAtom(dpy, b"_NET_WM_PID", 0)
             NET_ACTIVE_WIN  = X11.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", 0)
 
-            atype = ctypes.c_ulong(); afmt = ctypes.c_int()
-            nitems = ctypes.c_ulong(); bafter = ctypes.c_ulong()
+            atype = ctypes.c_ulong()
+            afmt = ctypes.c_int()
+            nitems = ctypes.c_ulong()
+            bafter = ctypes.c_ulong()
             data = ctypes.c_void_p()
 
             # Fetch all managed windows

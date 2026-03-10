@@ -110,7 +110,7 @@ def run(
             aliases = [a for a, canon in _SOURCE_ALIASES.items() if canon == name]
             alias_str = f"  (alias: {', '.join(aliases)})" if aliases else ""
             console.print(f"  [cyan]{name:<14s}[/cyan] {desc}{alias_str}")
-        console.print(f"\nUsage: applypilot run discover --source hn --source jobspy")
+        console.print("\nUsage: applypilot run discover --source hn --source jobspy")
         raise typer.Exit()
 
     _bootstrap()
@@ -264,7 +264,7 @@ def apply(
             raise typer.Exit(code=1)
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
@@ -275,7 +275,7 @@ def apply(
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
+        console.print("\n[bold]Run manually:[/bold]")
         console.print(
             f"  claude --model {model} -p "
             f"--mcp-config {mcp_path} "
@@ -294,7 +294,7 @@ def apply(
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if fresh_sessions:
-        console.print(f"  Sessions: [yellow]refreshing from real Chrome profile[/yellow]")
+        console.print("  Sessions: [yellow]refreshing from real Chrome profile[/yellow]")
     if url:
         console.print(f"  Target:   {url}")
     console.print()
@@ -647,7 +647,7 @@ def qa_stats() -> None:
         console.print("[dim]No Q&A pairs stored yet.[/dim]")
         return
 
-    console.print(f"\n[bold]Q&A Knowledge Base Stats[/bold]\n")
+    console.print("\n[bold]Q&A Knowledge Base Stats[/bold]\n")
     console.print(f"  Total pairs:    {stats['total']}")
     console.print(f"  Unique Qs:      {stats['unique_questions']}")
 

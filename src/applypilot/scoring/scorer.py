@@ -5,15 +5,14 @@ job description. All personal data is loaded at runtime from the user's
 profile and resume file.
 """
 
-import json
 import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-from applypilot.config import RESUME_PATH, load_profile
-from applypilot.database import commit_with_retry, get_connection, get_jobs_by_stage, write_with_retry
+from applypilot.config import RESUME_PATH
+from applypilot.database import get_connection, get_jobs_by_stage, write_with_retry
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)

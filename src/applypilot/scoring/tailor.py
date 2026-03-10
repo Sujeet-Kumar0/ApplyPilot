@@ -16,16 +16,13 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
-from applypilot.database import commit_with_retry, get_connection, get_jobs_by_stage, write_with_retry
+from applypilot.database import get_connection, get_jobs_by_stage, write_with_retry
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
@@ -59,7 +56,7 @@ def _build_tailor_prompt(profile: dict) -> str:
     real_metrics = resume_facts.get("real_metrics", [])
 
     companies_str = ", ".join(companies) if companies else "N/A"
-    projects_str = ", ".join(projects) if projects else "N/A"
+    _projects_str = ", ".join(projects) if projects else "N/A"
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
     education = profile.get("experience", {})

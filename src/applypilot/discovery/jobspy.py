@@ -19,7 +19,6 @@ from jobspy import scrape_jobs
 # (SIGABRT), killing the process. A named profile avoids the crash.
 try:
     import tls_client
-    import jobspy.util as _jobspy_util
 
     _orig_tls_init = tls_client.Session.__init__
 
@@ -51,7 +50,7 @@ except Exception:
     pass  # If patching fails, fall back to original behavior
 
 from applypilot import config
-from applypilot.database import commit_with_retry, get_connection, init_db, store_jobs
+from applypilot.database import commit_with_retry, get_connection, init_db
 
 log = logging.getLogger(__name__)
 
@@ -165,7 +164,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
-        company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
+        _company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
         # Build salary string from min/max

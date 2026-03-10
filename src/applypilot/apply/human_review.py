@@ -16,16 +16,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import platform
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 from applypilot import config
 from applypilot.apply.chrome import (
@@ -635,7 +632,6 @@ def _navigate_chrome(port: int, url: str) -> bool:
         req_url = f"http://localhost:{port}/json/activate/{tab_id}"
         urllib.request.urlopen(req_url, timeout=3)
         # Navigate by opening a new blank tab and using CDP
-        import json as _json
         # Use the existing tab's websocket to navigate
         # Simple approach: PUT /json/new with URL
         req = urllib.request.Request(
@@ -740,7 +736,7 @@ def _run_agent_for_job(h: str) -> None:
         mark_result(job["url"], "applied", duration_ms=duration_ms)
         # Save ATS session — the user just authenticated via HITL,
         # so this session has fresh cookies to reuse on future jobs
-        from applypilot.apply.chrome import detect_ats, save_ats_session, HITL_WORKER_ID
+        from applypilot.apply.chrome import detect_ats, save_ats_session
         from applypilot import config
         ats_slug = detect_ats(job.get("application_url") or job.get("url"))
         if ats_slug:
@@ -939,7 +935,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_skip(self, h: str) -> None:
         """Permanently skip a job (mark as failed)."""
-        from applypilot.database import get_needs_human_jobs, get_connection
+        from applypilot.database import get_needs_human_jobs
 
         jobs = get_needs_human_jobs()
         job = next((j for j in jobs if _job_hash(j["url"]) == h), None)

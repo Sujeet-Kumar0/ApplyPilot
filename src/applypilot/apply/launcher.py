@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -30,13 +30,12 @@ from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection, categorize_apply_result
-from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     detect_ats, save_ats_session, clear_ats_session,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
-    BASE_CDP_PORT, HITL_CDP_PORT, HITL_WORKER_ID,
-    bring_to_foreground,
+    BASE_CDP_PORT, bring_to_foreground,
     probe_existing_chrome, _AdoptedChromeProcess,
     _chrome_procs, _chrome_lock,
 )
@@ -434,7 +433,6 @@ def _start_worker_listener(worker_id: int) -> int:
             if score:
                 meta_parts.append(f"Score {score}/10")
             meta_line = " · ".join(meta_parts)
-            reason = state.get("reason", "")
             instructions = state.get("instructions", "")
             instructions_block = ""
             if instructions:
@@ -2559,7 +2557,6 @@ def _worker_loop_body(
 
                     # --- Screening Q&A: interactive TUI answers + relaunch ---
                     if nh_reason == "screening_questions" and screening_qs:
-                        from applypilot.database import store_qa
                         add_event(f"[W{worker_id}] Q&A: {len(screening_qs)} question(s) — waiting for answers")
                         update_state(worker_id, status="waiting_answer",
                                      last_action=f"Q&A: {len(screening_qs)} question(s)")
@@ -2912,7 +2909,7 @@ def _prompt_user_for_qa(console: Console, worker_id: int,
                 for j, opt in enumerate(opts, 1):
                     console.print(f"    {j}. {opt}")
         try:
-            answer = console.input(f"  [bold]Your answer: [/bold]")
+            answer = console.input("  [bold]Your answer: [/bold]")
             # If user typed a number and there are options, map to the option text
             if q.get("options") and answer.strip().isdigit():
                 opts = [o.strip() for o in q["options"].split(",") if o.strip()]

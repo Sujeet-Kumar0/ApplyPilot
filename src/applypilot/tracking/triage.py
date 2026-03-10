@@ -214,13 +214,13 @@ def triage_email(email: dict) -> TriageResult:
         return TriageResult(
             classification="llm_needed",
             confidence=0.0,
-            reason=f"subject matches LLM-required pattern",
+            reason="subject matches LLM-required pattern",
         )
     if _matches_any(snippet, LLM_REQUIRED_SNIPPET_PATTERNS):
         return TriageResult(
             classification="llm_needed",
             confidence=0.0,
-            reason=f"snippet matches LLM-required pattern",
+            reason="snippet matches LLM-required pattern",
         )
 
     # --- Priority 2: Noise ---

@@ -109,10 +109,10 @@ def _build_profile_summary(profile: dict) -> str:
     languages = personal.get("languages", [])
     if languages:
         if isinstance(languages[0], dict):
-            lang_parts = [f"{l['language']} ({l['proficiency']})" for l in languages]
+            lang_parts = [f"{lang['language']} ({lang['proficiency']})" for lang in languages]
             lines.append(f"Languages: {', '.join(lang_parts)}")
             # Also list just the language names for simple yes/no questions
-            lines.append(f"Languages spoken: {', '.join(l['language'] for l in languages)}")
+            lines.append(f"Languages spoken: {', '.join(lang['language'] for lang in languages)}")
             lines.append("IMPORTANT: Do NOT claim proficiency in any language not listed above. If asked about a language not listed, answer NO / Not proficient.")
         else:
             lines.append(f"Languages: {', '.join(languages)}")
@@ -258,7 +258,6 @@ def _build_hard_rules(profile: dict) -> str:
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
