@@ -17,6 +17,7 @@ from applypilot import __version__
 
 def _configure_logging() -> None:
     """Set consistent logging output for CLI runs."""
+    bootstrap_log = logging.getLogger(__name__)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
