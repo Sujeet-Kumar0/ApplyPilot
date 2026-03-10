@@ -237,3 +237,32 @@ def test_setup_canonical_resume_import_skips_metadata_prompts_when_complete(monk
     assert destination.exists()
     assert canonical["basics"]["name"] == "Alex Example"
     assert profile["experience"]["target_role"] == "Staff Engineer"
+
+
+def test_setup_canonical_resume_import_uses_social_profiles_from_basics(monkeypatch, tmp_path: Path) -> None:
+    pytest.importorskip("jsonschema")
+    source = tmp_path / "source-resume.json"
+    destination = tmp_path / "resume.json"
+    resume_data = _sample_resume_json()
+    resume_data["meta"]["applypilot"]["personal"] = {}
+    source.write_text(json.dumps(resume_data), encoding="utf-8")
+
+    monkeypatch.setattr(wizard_init, "RESUME_JSON_PATH", destination)
+
+    def fail_on_social_prompts(label: str, *args, **kwargs):
+        if label in {"LinkedIn URL", "GitHub URL"}:
+            raise AssertionError(f"{label} should be inferred from basics.profiles")
+        raise AssertionError(f"Unexpected prompt: {label}")
+
+    monkeypatch.setattr(wizard_init.Prompt, "ask", fail_on_social_prompts)
+    monkeypatch.setattr(
+        wizard_init.Confirm,
+        "ask",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Confirm.ask should not be called")),
+    )
+
+    canonical, _profile = wizard_init._setup_canonical_resume(resume_json=source)
+
+    personal = canonical["meta"]["applypilot"]["personal"]
+    assert personal["linkedin_url"] == "https://linkedin.com/in/alex"
+    assert personal["github_url"] == "https://github.com/alex"

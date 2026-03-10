@@ -321,6 +321,17 @@ def _prompt_missing_applypilot_fields(resume_data: dict) -> dict:
     eeo = applypilot.setdefault("eeo_voluntary", {})
     resume_facts = applypilot.setdefault("resume_facts", {})
     applypilot.setdefault("files", {})
+    derived_profile = normalize_profile_from_resume_json(resume_data)
+    derived_personal = derived_profile.get("personal", {})
+
+    if not personal.get("linkedin_url"):
+        personal["linkedin_url"] = derived_personal.get("linkedin_url", "")
+    if not personal.get("github_url"):
+        personal["github_url"] = derived_personal.get("github_url", "")
+    if not personal.get("portfolio_url"):
+        personal["portfolio_url"] = derived_personal.get("portfolio_url", "")
+    if not personal.get("website_url"):
+        personal["website_url"] = derived_personal.get("website_url", "")
 
     if not basics.get("name"):
         basics["name"] = Prompt.ask("Full name")
@@ -365,7 +376,6 @@ def _prompt_missing_applypilot_fields(resume_data: dict) -> dict:
     compensation.setdefault("currency_conversion_note", "")
 
     if not applypilot.get("years_of_experience_total"):
-        derived_profile = normalize_profile_from_resume_json(resume_data)
         derived_years = derived_profile.get("experience", {}).get("years_of_experience_total", "")
         if derived_years:
             applypilot["years_of_experience_total"] = derived_years
