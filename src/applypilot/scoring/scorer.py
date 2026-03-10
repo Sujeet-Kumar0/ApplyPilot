@@ -226,14 +226,18 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list,
          "excluded": int}
     """
+    if not RESUME_PATH.exists():
+        log.error("Resume file not found: %s. Run 'applypilot init' first.", RESUME_PATH)
+        return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": [], "excluded": 0}
+
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
     if rescore:
-        query = "SELECT * FROM jobs WHERE full_description IS NOT NULL"
         if limit > 0:
-            query += f" LIMIT {limit}"
-        jobs = conn.execute(query).fetchall()
+            jobs = conn.execute("SELECT * FROM jobs WHERE full_description IS NOT NULL LIMIT ?", (limit,)).fetchall()
+        else:
+            jobs = conn.execute("SELECT * FROM jobs WHERE full_description IS NOT NULL").fetchall()
     else:
         jobs = get_jobs_by_stage(conn=conn, stage="pending_score", limit=limit)
 

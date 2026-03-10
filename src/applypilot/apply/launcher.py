@@ -249,13 +249,26 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
     else:
-        attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
-        conn.execute(f"""
-            UPDATE jobs SET apply_status = ?, apply_error = ?,
-                           apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
-            WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
+        if permanent:
+            conn.execute(
+                """
+                UPDATE jobs SET apply_status = ?, apply_error = ?,
+                               apply_attempts = 99, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?
+                WHERE url = ?
+                """,
+                (status, error or "unknown", duration_ms, task_id, url),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE jobs SET apply_status = ?, apply_error = ?,
+                               apply_attempts = COALESCE(apply_attempts, 0) + 1, agent_id = NULL,
+                               apply_duration_ms = ?, apply_task_id = ?
+                WHERE url = ?
+                """,
+                (status, error or "unknown", duration_ms, task_id, url),
+            )
     conn.commit()
 
 
@@ -396,8 +409,9 @@ def run_job(
 
     try:
         backend = get_backend(agent)
+        backend_name = getattr(backend, "name", agent)
         original_opencode_agent = None
-        if backend.name == "opencode" and opencode_agent is not None:
+        if backend_name == "opencode" and opencode_agent is not None:
             original_opencode_agent = os.environ.get("APPLY_OPENCODE_AGENT")
             os.environ["APPLY_OPENCODE_AGENT"] = opencode_agent
         try:
@@ -411,7 +425,7 @@ def run_job(
                 unregister_process=_unregister_agent_process,
             )
         finally:
-            if backend.name == "opencode" and opencode_agent is not None:
+            if backend_name == "opencode" and opencode_agent is not None:
                 if original_opencode_agent is None:
                     os.environ.pop("APPLY_OPENCODE_AGENT", None)
                 else:

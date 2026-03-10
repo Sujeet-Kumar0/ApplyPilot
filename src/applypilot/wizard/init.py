@@ -10,6 +10,7 @@ Interactive flow that creates ~/.applypilot/ with:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -168,6 +169,11 @@ def _setup_profile() -> dict:
         "website_url": Prompt.ask("Personal website URL (optional)", default=""),
         "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
     }
+    if profile["personal"]["password"]:
+        console.print(
+            "[yellow]Note: Password is stored in plaintext in profile.json. "
+            "Consider setting APPLYPILOT_SITE_PASSWORD instead.[/yellow]"
+        )
 
     # -- Work Authorization --
     console.print("\n[bold cyan]Work Authorization[/bold cyan]")
@@ -182,7 +188,9 @@ def _setup_profile() -> dict:
     salary = Prompt.ask("Expected annual salary (number)", default="")
     salary_currency = Prompt.ask("Currency", default="USD")
     salary_range = Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
-    range_parts = salary_range.split("-") if "-" in salary_range else [salary, salary]
+    clean_salary = re.sub(r"[$,\s]", "", salary)
+    clean_range = re.sub(r"[$,\s]", "", salary_range)
+    range_parts = clean_range.split("-") if "-" in clean_range else [clean_salary, clean_salary]
     profile["compensation"] = {
         "salary_expectation": salary,
         "salary_currency": salary_currency,

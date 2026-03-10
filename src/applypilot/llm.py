@@ -8,8 +8,10 @@ Public contract:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import threading
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -271,7 +273,10 @@ class LLMClient:
             if content:
                 parts.append(content)
         return "".join(parts).strip()
+
+
 _instance: LLMClient | None = None
+_instance_lock = threading.Lock()
 
 
 def get_client() -> LLMClient:
@@ -279,13 +284,16 @@ def get_client() -> LLMClient:
 
     global _instance
     if _instance is None:
-        try:
-            from applypilot.config import load_env
+        with _instance_lock:
+            if _instance is None:
+                try:
+                    from applypilot.config import load_env
 
-            load_env()
-        except ModuleNotFoundError:
-            log.debug("python-dotenv not installed; skipping .env auto-load in llm.get_client().")
-        config = resolve_llm_config()
-        log.info("LLM provider: %s  model: %s", config.provider, config.model)
-        _instance = LLMClient(config)
+                    load_env()
+                except ModuleNotFoundError:
+                    log.debug("python-dotenv not installed; skipping .env auto-load in llm.get_client().")
+                config = resolve_llm_config()
+                log.info("LLM provider: %s  model: %s", config.provider, config.model)
+                _instance = LLMClient(config)
+                atexit.register(_instance.close)
     return _instance

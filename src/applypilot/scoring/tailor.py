@@ -530,6 +530,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
     """
     profile = load_profile()
+    if not RESUME_PATH.exists():
+        log.error("Resume file not found: %s. Run 'applypilot init' first.", RESUME_PATH)
+        return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 

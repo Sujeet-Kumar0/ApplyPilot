@@ -205,6 +205,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
         # Auto-apply command button (only for jobs not yet applied)
         raw_url = j["url"] or ""
         auto_apply_cmd = f"applypilot apply --url {raw_url}"
+        data_location = escape((j["location"] or "").lower())
 
         # Applied indicator
         was_applied = j["apply_status"] == "applied" and j["applied_at"]
@@ -262,7 +263,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
             card_extra_class = "  job-card--failed"
 
         job_sections += f"""
-        <div class="job-card{card_extra_class}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{location.lower()}"{applied_attr}>
+        <div class="job-card{card_extra_class}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{data_location}"{applied_attr}>
           {applied_banner}{failed_banner}
           <div class="card-header">
             <span class="score-pill" style="background:{'#10b981' if score >= 7 else '#f59e0b'}">{score}</span>

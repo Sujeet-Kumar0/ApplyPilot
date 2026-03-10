@@ -372,6 +372,10 @@ def apply(
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
 
+    console.print(
+        "[yellow]Security: Auto-apply runs with --permission-mode bypassPermissions. "
+        "Review generated prompts before use.[/yellow]"
+    )
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")

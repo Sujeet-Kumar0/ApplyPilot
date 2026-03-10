@@ -225,7 +225,7 @@ def _build_captcha_section() -> str:
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
-API key: {capsolver_key or 'NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs'}
+API key: $CAPSOLVER_API_KEY env var ({"configured" if capsolver_key else "NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs"})
 API base: https://api.capsolver.com
 
 CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regardless of what it looks like visually), you MUST:
@@ -298,24 +298,10 @@ Result actions:
 - Any other type -> proceed to CAPTCHA SOLVE below.
 
 --- CAPTCHA SOLVE ---
-Three steps: createTask -> poll -> inject. Do each as a separate browser_evaluate call.
+Three steps: createTask -> poll -> inject. Keep the API key out of page context.
 
 STEP 1 -- CREATE TASK (copy this exactly, fill in the 3 placeholders):
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/createTask', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      task: {{{{
-        type: 'TASK_TYPE',
-        websiteURL: 'PAGE_URL',
-        websiteKey: 'SITE_KEY'
-      }}}}
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
+Bash command: curl -s -X POST https://api.capsolver.com/createTask -H 'Content-Type: application/json' -d '{{"clientKey":"'$CAPSOLVER_API_KEY'","task":{{"type":"TASK_TYPE","websiteURL":"PAGE_URL","websiteKey":"SITE_KEY"}}}}'
 
 TASK_TYPE values (use EXACTLY these strings):
   hcaptcha     -> HCaptchaTaskProxyLess
@@ -332,18 +318,8 @@ Response: {{"errorId": 0, "taskId": "abc123"}} on success.
 If errorId > 0 -> CAPTCHA SOLVE failed. Go to MANUAL FALLBACK.
 
 STEP 2 -- POLL (replace TASK_ID with the taskId from step 1):
-Loop: browser_wait_for time: 3, then run:
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/getTaskResult', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      taskId: 'TASK_ID'
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
+Loop: wait 3 seconds, then run:
+Bash command: curl -s -X POST https://api.capsolver.com/getTaskResult -H 'Content-Type: application/json' -d '{{"clientKey":"'$CAPSOLVER_API_KEY'","taskId":"TASK_ID"}}'
 
 - status "processing" -> wait 3s, poll again. Max 10 polls (30s).
 - status "ready" -> extract token:
@@ -595,14 +571,14 @@ LINKEDIN EASY APPLY - CRITICAL FAST PATH:
    - IGNORE everything except finding the "Easy Apply" button
    - DO NOT read job description, DO NOT scroll, DO NOT analyze
    - IMMEDIATELY use browser_evaluate to find and click Easy Apply:
-     () => {
+     () => {{
        const btn = Array.from(document.querySelectorAll('button, a')).find(b =>
          b.textContent.toLowerCase().includes('easy apply') ||
          b.getAttribute('aria-label')?.toLowerCase().includes('easy apply')
        );
-       if (btn) { btn.click(); return 'clicked easy apply'; }
+       if (btn) {{ btn.click(); return 'clicked easy apply'; }}
        return 'not found';
-     }
+     }}
    - If JavaScript fails, use browser_click on "Easy Apply" text
    - MAXIMUM 5 seconds from page load to Easy Apply click
    
@@ -611,13 +587,13 @@ LINKEDIN EASY APPLY - CRITICAL FAST PATH:
    - DO NOT scroll page behind modal
    - Find "Continue" button and click immediately
    - If blocked by overlay (#interop-outlet):
-     () => {
+     () => {{
        const overlay = document.querySelector('#interop-outlet');
        if (overlay) overlay.style.pointerEvents = 'none';
        const btn = document.querySelector('button[aria-label*="Continue"], button.artdeco-button--primary');
-       if (btn) { btn.click(); return 'clicked'; }
+       if (btn) {{ btn.click(); return 'clicked'; }}
        return 'not found';
-     }
+     }}
 
 6. Find and click the Apply button using browser_click with text matching. Common button texts: "Apply", "Apply Now", "Apply for this job", "I'm Interested", "Submit Application", "Start Application". 
    - If multiple apply buttons exist, click the main one (usually largest/most prominent)
@@ -642,9 +618,9 @@ LINKEDIN EASY APPLY - CRITICAL FAST PATH:
         - Once back on the job site, continue with the application flow
     7c. If you land on SSO/OAuth pages other than Google (Microsoft, Okta, corporate SSO) -> STOP. Output RESULT:FAILED:sso_required.
     7d. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's non-Google SSO -> RESULT:FAILED:sso_required.
-    7e. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
+    7e. Regular login form (employer's own site)? Try sign in with email {personal['email']}. For the password, read APPLYPILOT_SITE_PASSWORD from the environment.
     7f. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
-    7g. Sign in failed? Try sign up with same email and password.
+    7g. Sign in failed? Try sign up with the same email and the APPLYPILOT_SITE_PASSWORD value.
     7h. Need email verification? Use search_emails + read_email to get the code.
     7i. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
     7j. All failed? Output RESULT:FAILED:login_issue. Do not loop.
