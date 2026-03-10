@@ -382,7 +382,7 @@ def _prompt_missing_applypilot_fields(resume_data: dict) -> dict:
         else:
             applypilot["years_of_experience_total"] = Prompt.ask("Years of professional experience", default="")
     if not applypilot.get("target_role"):
-        default_role = basics.get("label", "")
+        default_role = derived_profile.get("experience", {}).get("target_role", "") or basics.get("label", "")
         applypilot["target_role"] = Prompt.ask("Target role", default=default_role)
 
     if "earliest_start_date" not in availability or availability.get("earliest_start_date") in (None, ""):

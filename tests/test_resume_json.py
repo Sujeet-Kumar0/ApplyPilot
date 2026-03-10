@@ -128,6 +128,16 @@ def test_resolve_render_theme_prefers_applypilot_then_meta() -> None:
     assert resolve_render_theme(data, explicit_theme="jsonresume-theme-professional") == "jsonresume-theme-professional"
 
 
+def test_normalize_profile_uses_first_role_from_multi_role_label_when_target_role_missing() -> None:
+    data = sample_resume_json()
+    data["meta"]["applypilot"].pop("target_role", None)
+    data["basics"]["label"] = "Systems Architect, Senior Full Stack Developer, UI/UX"
+
+    profile = normalize_profile_from_resume_json(data)
+
+    assert profile["experience"]["target_role"] == "Systems Architect"
+
+
 def test_validate_resume_json_rejects_secret_keys() -> None:
     pytest.importorskip("jsonschema")
     data = sample_resume_json()

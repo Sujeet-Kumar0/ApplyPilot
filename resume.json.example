@@ -1,0 +1,294 @@
+{
+  "basics": {
+    "name": "Jordan Example",
+    "label": "Staff Software Engineer",
+    "email": "jordan@example.com",
+    "phone": "+1-555-123-4567",
+    "url": "https://jordanexample.dev",
+    "summary": "Staff-level software engineer with 10+ years of experience building backend platforms, internal tooling, and customer-facing web applications. Known for translating product requirements into reliable systems, improving developer velocity, and shipping measurable business outcomes across startups and growth-stage teams.",
+    "location": {
+      "address": "123 Example St",
+      "city": "Portland",
+      "region": "OR",
+      "countryCode": "US",
+      "postalCode": "97203"
+    },
+    "profiles": [
+      {
+        "network": "LinkedIn",
+        "url": "https://linkedin.com/in/jordan-example"
+      },
+      {
+        "network": "GitHub",
+        "url": "https://github.com/jordanexample"
+      },
+      {
+        "network": "Portfolio",
+        "url": "https://jordanexample.dev"
+      }
+    ]
+  },
+  "work": [
+    {
+      "name": "Northwind Labs",
+      "position": "Staff Software Engineer",
+      "location": "Remote",
+      "url": "https://northwindlabs.example",
+      "startDate": "2021-04",
+      "summary": "Led architecture for internal platform services and customer-facing workflow automation products.",
+      "highlights": [
+        "Designed and launched a workflow automation platform used by 40+ internal operators and customer success teams.",
+        "Reduced API latency by 38% through database query optimization, caching, and queue redesign.",
+        "Built reusable deployment templates that cut new service setup time from 2 days to under 2 hours.",
+        "Partnered with product and design to ship customer-facing admin tools that reduced support volume."
+      ],
+      "x-applypilot": {
+        "key_metrics": [
+          "38% lower API latency",
+          "2 days to under 2 hours setup time",
+          "40+ internal operators onboarded"
+        ]
+      }
+    },
+    {
+      "name": "Acme Commerce",
+      "position": "Senior Software Engineer",
+      "location": "Chicago, IL",
+      "url": "https://acmecommerce.example",
+      "startDate": "2018-01",
+      "endDate": "2021-03",
+      "summary": "Built and maintained ecommerce platform services across checkout, fulfillment, and reporting workflows.",
+      "highlights": [
+        "Implemented order orchestration services that supported 3 regional warehouses and improved fulfillment visibility.",
+        "Shipped reporting pipelines that gave finance and operations same-day access to sales and refund trends.",
+        "Improved test and release workflows, reducing failed production deploys across core services."
+      ],
+      "x-applypilot": {
+        "key_metrics": [
+          "3 regional warehouses supported",
+          "Same-day reporting availability"
+        ]
+      }
+    },
+    {
+      "name": "Bluebird Health",
+      "position": "Software Engineer",
+      "location": "Austin, TX",
+      "url": "https://bluebirdhealth.example",
+      "startDate": "2015-06",
+      "endDate": "2017-12",
+      "summary": "Worked on patient scheduling and internal operations systems for a multi-location healthcare platform.",
+      "highlights": [
+        "Built scheduling features for clinic staff and patients using web application and API integrations.",
+        "Maintained billing and reporting workflows used by operations and support teams.",
+        "Collaborated with QA and customer support to address production issues and improve release quality."
+      ],
+      "x-applypilot": {
+        "key_metrics": []
+      }
+    }
+  ],
+  "education": [
+    {
+      "institution": "State University",
+      "url": "https://stateuniversity.example",
+      "area": "Computer Science",
+      "studyType": "Bachelor of Science",
+      "startDate": "2011",
+      "endDate": "2015"
+    }
+  ],
+  "certificates": [
+    {
+      "name": "AWS Certified Developer - Associate",
+      "issuer": "Amazon Web Services",
+      "date": "2023-08",
+      "url": "https://aws.amazon.com/certification/"
+    }
+  ],
+  "publications": [
+    {
+      "name": "Scaling Internal Platform Tooling",
+      "publisher": "Example Engineering Blog",
+      "releaseDate": "2024-05",
+      "url": "https://engineering.example.com/scaling-internal-platform-tooling",
+      "summary": "An overview of architecture and rollout lessons from consolidating internal service templates and deployment workflows."
+    }
+  ],
+  "skills": [
+    {
+      "name": "Programming Languages",
+      "keywords": [
+        "Python",
+        "TypeScript",
+        "SQL",
+        "JavaScript"
+      ]
+    },
+    {
+      "name": "Frameworks & Libraries",
+      "keywords": [
+        "FastAPI",
+        "Node.js",
+        "React",
+        "Next.js"
+      ]
+    },
+    {
+      "name": "DevOps & Infra",
+      "keywords": [
+        "Docker",
+        "Kubernetes",
+        "Terraform",
+        "AWS",
+        "CI/CD"
+      ]
+    },
+    {
+      "name": "Databases",
+      "keywords": [
+        "PostgreSQL",
+        "Redis"
+      ]
+    },
+    {
+      "name": "Tools & Platforms",
+      "keywords": [
+        "Git",
+        "GitHub Actions",
+        "Linux",
+        "Datadog"
+      ]
+    }
+  ],
+  "projects": [
+    {
+      "name": "Fulfillment Control Center",
+      "description": "Operations dashboard for order routing, queue health, and manual recovery workflows.",
+      "highlights": [
+        "Unified service health, queue status, and order exceptions into a single operator interface.",
+        "Reduced manual escalation time by consolidating order-state visibility."
+      ],
+      "keywords": [
+        "React",
+        "FastAPI",
+        "Operations"
+      ],
+      "startDate": "2022-02",
+      "endDate": "2022-11",
+      "url": "https://portfolio.example.com/fulfillment-control-center",
+      "roles": [
+        "Technical Lead",
+        "Backend Engineer"
+      ],
+      "entity": "Northwind Labs",
+      "type": "application"
+    },
+    {
+      "name": "Revenue Reporting Pipeline",
+      "description": "Internal analytics workflow for same-day finance and refund reporting.",
+      "highlights": [
+        "Built scheduled data ingestion and normalization jobs for finance dashboards.",
+        "Improved reporting trust by formalizing reconciliation checks and failure alerts."
+      ],
+      "keywords": [
+        "Python",
+        "SQL",
+        "Analytics"
+      ],
+      "startDate": "2019-03",
+      "endDate": "2020-01",
+      "url": "https://portfolio.example.com/revenue-reporting-pipeline",
+      "roles": [
+        "Software Engineer"
+      ],
+      "entity": "Acme Commerce",
+      "type": "internal-tool"
+    }
+  ],
+  "references": [
+    {
+      "name": "Taylor Manager",
+      "reference": "Director of Engineering, Northwind Labs. Email: taylor.manager@example.com"
+    }
+  ],
+  "meta": {
+    "canonical": "https://jsonresume.org/schema",
+    "version": "v1.0.0",
+    "applypilot": {
+      "personal": {
+        "preferred_name": "Jordan",
+        "address": "123 Example St",
+        "province_state": "OR",
+        "country": "US",
+        "postal_code": "97203",
+        "linkedin_url": "https://linkedin.com/in/jordan-example",
+        "github_url": "https://github.com/jordanexample",
+        "portfolio_url": "https://jordanexample.dev",
+        "website_url": "https://jordanexample.dev"
+      },
+      "target_role": "Staff Software Engineer",
+      "years_of_experience_total": 10,
+      "work_authorization": {
+        "legally_authorized_to_work": true,
+        "legally_authorized": true,
+        "require_sponsorship": false,
+        "needs_sponsorship": false,
+        "work_permit_type": ""
+      },
+      "compensation": {
+        "salary_expectation": "185000",
+        "salary_currency": "USD",
+        "salary_range_min": "170000",
+        "salary_range_max": "210000",
+        "currency_conversion_note": ""
+      },
+      "availability": {
+        "earliest_start_date": "Immediately",
+        "available_for_full_time": "Yes",
+        "available_for_contract": "No"
+      },
+      "eeo_voluntary": {
+        "gender": "Decline to self-identify",
+        "race_ethnicity": "Decline to self-identify",
+        "ethnicity": "Decline to self-identify",
+        "veteran_status": "Decline to self-identify",
+        "disability_status": "Decline to self-identify"
+      },
+      "resume_facts": {
+        "preserved_companies": [
+          "Northwind Labs",
+          "Acme Commerce"
+        ],
+        "preserved_projects": [
+          "Fulfillment Control Center",
+          "Revenue Reporting Pipeline"
+        ],
+        "preserved_school": "State University",
+        "real_metrics": [
+          "38% lower API latency",
+          "2 days to under 2 hours setup time",
+          "40+ internal operators onboarded"
+        ]
+      },
+      "tailoring_config": {
+        "default_role_type": "software_engineer",
+        "validation": {
+          "enabled": true,
+          "max_retries": 3,
+          "min_bullets_per_role": 2,
+          "max_bullets_per_role": 5,
+          "min_metrics_ratio": 0.7
+        },
+        "role_types": {}
+      },
+      "files": {
+        "profile_photo": "~/.applypilot/files/profile_photo.jpg",
+        "portfolio_pdf": "~/.applypilot/files/portfolio_pdf.pdf"
+      },
+      "render": {
+        "theme": "jsonresume-theme-even"
+      }
+    }
+  }
+}

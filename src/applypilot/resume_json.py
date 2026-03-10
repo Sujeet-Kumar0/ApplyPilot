@@ -314,6 +314,18 @@ def _profile_urls(profiles: list[dict[str, Any]]) -> dict[str, str]:
     return urls
 
 
+def _primary_role_from_label(label: str) -> str:
+    """Return a single target-role candidate from a potentially multi-role label."""
+
+    value = _coerce_str(label)
+    if not value:
+        return ""
+    parts = [part.strip() for part in re.split(r"[;,|]", value) if part.strip()]
+    if parts:
+        return parts[0]
+    return value
+
+
 def _normalize_skill_category(name: str) -> str:
     lowered = name.lower()
     if "language" in lowered:
@@ -415,7 +427,11 @@ def normalize_profile_from_resume_json(data: dict) -> dict:
     profile_urls = _profile_urls(basics.get("profiles", []) if isinstance(basics.get("profiles"), list) else [])
 
     experience_total = _coerce_str(applypilot.get("years_of_experience_total")) or _compute_years_experience(work_entries)
-    target_role = _coerce_str(applypilot.get("target_role")) or _coerce_str(basics.get("label"))
+    target_role = (
+        _coerce_str(applypilot.get("target_role"))
+        or _primary_role_from_label(_coerce_str(basics.get("label")))
+        or _coerce_str(current_work.get("position"))
+    )
     current_title = _coerce_str(current_work.get("position"))
     current_company = _coerce_str(current_work.get("name"))
 
@@ -763,4 +779,3 @@ class CanonicalResumeSource:
     mode: str
     path: Path | None
     detail: str = ""
-

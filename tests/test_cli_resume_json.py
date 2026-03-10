@@ -266,3 +266,33 @@ def test_setup_canonical_resume_import_uses_social_profiles_from_basics(monkeypa
     personal = canonical["meta"]["applypilot"]["personal"]
     assert personal["linkedin_url"] == "https://linkedin.com/in/alex"
     assert personal["github_url"] == "https://github.com/alex"
+
+
+def test_setup_canonical_resume_uses_single_role_default_from_multi_role_label(monkeypatch, tmp_path: Path) -> None:
+    pytest.importorskip("jsonschema")
+    source = tmp_path / "source-resume.json"
+    destination = tmp_path / "resume.json"
+    resume_data = _sample_resume_json()
+    resume_data["meta"]["applypilot"].pop("target_role", None)
+    resume_data["basics"]["label"] = "Systems Architect, Senior Full Stack Developer, UI/UX"
+    source.write_text(json.dumps(resume_data), encoding="utf-8")
+
+    monkeypatch.setattr(wizard_init, "RESUME_JSON_PATH", destination)
+
+    def prompt_ask(label: str, default="", **kwargs):
+        if label == "Target role":
+            assert default == "Systems Architect"
+            return default
+        raise AssertionError(f"Unexpected prompt: {label}")
+
+    monkeypatch.setattr(wizard_init.Prompt, "ask", prompt_ask)
+    monkeypatch.setattr(
+        wizard_init.Confirm,
+        "ask",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Confirm.ask should not be called")),
+    )
+
+    canonical, profile = wizard_init._setup_canonical_resume(resume_json=source)
+
+    assert canonical["meta"]["applypilot"]["target_role"] == "Systems Architect"
+    assert profile["experience"]["target_role"] == "Systems Architect"
