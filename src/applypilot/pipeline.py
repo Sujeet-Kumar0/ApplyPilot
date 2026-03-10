@@ -198,22 +198,22 @@ def _run_score() -> dict:
         return {"status": f"error: {e}"}
 
 
-def _run_tailor(min_score: int = 7, limit: int = 20) -> dict:
+def _run_tailor(min_score: int = 7, limit: int = 20, validation_mode: str = "normal") -> dict:
     """Stage: Resume tailoring — generate tailored resumes for high-fit jobs."""
     try:
         from applypilot.scoring.tailor import run_tailoring
-        run_tailoring(min_score=min_score, limit=limit)
+        run_tailoring(min_score=min_score, limit=limit, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
         log.error("Tailoring failed: %s", e)
         return {"status": f"error: {e}"}
 
 
-def _run_cover(min_score: int = 7, limit: int = 20) -> dict:
+def _run_cover(min_score: int = 7, limit: int = 20, validation_mode: str = "normal") -> dict:
     """Stage: Cover letter generation."""
     try:
         from applypilot.scoring.cover_letter import run_cover_letters
-        run_cover_letters(min_score=min_score, limit=limit)
+        run_cover_letters(min_score=min_score, limit=limit, validation_mode=validation_mode)
         return {"status": "ok"}
     except Exception as e:
         log.error("Cover letter generation failed: %s", e)
@@ -340,6 +340,7 @@ def _run_stage_streaming(
     limit: int = 20,
     workers: int = 1,
     sources: list[str] | None = None,
+    validation_mode: str = "normal",
 ) -> None:
     """Run a single stage in streaming mode: loop until upstream done + no work.
 
@@ -352,6 +353,7 @@ def _run_stage_streaming(
     if stage in ("tailor", "cover"):
         kwargs["min_score"] = min_score
         kwargs["limit"] = limit
+        kwargs["validation_mode"] = validation_mode
     if stage in ("discover", "enrich"):
         kwargs["workers"] = workers
     if stage == "discover" and sources is not None:
@@ -409,6 +411,7 @@ def _run_sequential(
     limit: int = 20,
     workers: int = 1,
     sources: list[str] | None = None,
+    validation_mode: str = "normal",
 ) -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
@@ -430,6 +433,7 @@ def _run_sequential(
             if name in ("tailor", "cover"):
                 kwargs["min_score"] = min_score
                 kwargs["limit"] = limit
+                kwargs["validation_mode"] = validation_mode
             if name in ("discover", "enrich"):
                 kwargs["workers"] = workers
             if name == "discover" and sources is not None:
@@ -464,7 +468,9 @@ def _run_sequential(
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}
 
 
-def _run_streaming(ordered: list[str], min_score: int, limit: int = 20, workers: int = 1, sources: list[str] | None = None) -> dict:
+def _run_streaming(ordered: list[str], min_score: int, limit: int = 20,
+                   workers: int = 1, sources: list[str] | None = None,
+                   validation_mode: str = "normal") -> dict:
     """Execute stages concurrently with DB as conveyor belt."""
     tracker = _StageTracker()
     stop_event = threading.Event()
@@ -486,7 +492,7 @@ def _run_streaming(ordered: list[str], min_score: int, limit: int = 20, workers:
         start_times[name] = time.time()
         t = threading.Thread(
             target=_run_stage_streaming,
-            args=(name, tracker, stop_event, min_score, limit, workers, sources),
+            args=(name, tracker, stop_event, min_score, limit, workers, sources, validation_mode),
             name=f"stage-{name}",
             daemon=True,
         )
@@ -535,6 +541,7 @@ def run_pipeline(
     stream: bool = False,
     workers: int = 1,
     sources: list[str] | None = None,
+    validation_mode: str = "normal",
 ) -> dict:
     """Run pipeline stages.
 
@@ -568,12 +575,13 @@ def run_pipeline(
         f"[bold]ApplyPilot Pipeline[/bold] ({mode})",
         border_style="blue",
     ))
-    console.print(f"  Min score: {min_score}")
-    console.print(f"  Limit:     {effective_limit} jobs/batch")
-    console.print(f"  Workers:   {workers}")
-    console.print(f"  Stages:    {' -> '.join(ordered)}")
+    console.print(f"  Min score:  {min_score}")
+    console.print(f"  Limit:      {effective_limit} jobs/batch")
+    console.print(f"  Workers:    {workers}")
+    console.print(f"  Validation: {validation_mode}")
+    console.print(f"  Stages:     {' -> '.join(ordered)}")
     if sources:
-        console.print(f"  Sources:   {', '.join(sources)}")
+        console.print(f"  Sources:    {', '.join(sources)}")
 
     # Pre-run stats
     pre_stats = get_stats()
@@ -593,9 +601,13 @@ def run_pipeline(
     # Execute
     try:
         if stream:
-            result = _run_streaming(ordered, min_score, limit=effective_limit, workers=workers, sources=sources)
+            result = _run_streaming(ordered, min_score, limit=effective_limit,
+                                    workers=workers, sources=sources,
+                                    validation_mode=validation_mode)
         else:
-            result = _run_sequential(ordered, min_score, limit=effective_limit, workers=workers, sources=sources)
+            result = _run_sequential(ordered, min_score, limit=effective_limit,
+                                     workers=workers, sources=sources,
+                                     validation_mode=validation_mode)
     finally:
         # Always remove file handler, even on crash
         if file_handler:
