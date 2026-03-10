@@ -45,7 +45,7 @@ applypilot apply --dry-run  # fill forms without submitting
 ## Two Paths
 
 ### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for `npx`), a built-in LLM provider (Gemini is the default), a browser agent CLI (Codex CLI by default, Claude Code CLI optional), Chrome
+**Requires:** Python 3.11+, Node.js (for `npx`), a built-in LLM provider (Gemini is the default), a browser agent CLI (Codex CLI by default, Claude Code CLI optional, OpenCode supported), Chrome
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
 
@@ -60,7 +60,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 
 | Stage | What Happens |
 |-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
+| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 129 Greenhouse ATS employers + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
 | **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
@@ -79,7 +79,7 @@ Each stage is independent. Run them all or pick what you need.
 | AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
 | Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
 | Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
+| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 129 Greenhouse employers, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
 | License | AGPL-3.0 | MIT | N/A |
 
 ---
@@ -90,11 +90,11 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
-| LLM provider | Scoring, tailoring, cover letters | Gemini is recommended; OpenRouter, OpenAI, and local models are also supported |
+| LLM provider | Scoring, tailoring, cover letters | Gemini is recommended; OpenRouter, OpenAI, Anthropic, and local models are also supported |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Codex CLI or Claude Code CLI | Auto-apply | Codex is preferred by default; Claude remains supported as a fallback |
+| Codex CLI, Claude Code CLI, or OpenCode CLI | Auto-apply | Codex is preferred by default; Claude and OpenCode remain supported as additive backends |
 
-**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenRouter, OpenAI, and local models (Ollama/llama.cpp) are also supported.
+**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenRouter, OpenAI, Anthropic, and local models (Ollama/llama.cpp) are also supported.
 
 ### Optional
 
@@ -117,15 +117,17 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_AGENT_PRIORITY`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_AGENT_PRIORITY`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional).
 
 ## Two AI Layers
 
 ApplyPilot intentionally separates its AI work into two different layers:
 
 1. The built-in LLM layer handles text-heavy tasks like scoring jobs, tailoring resumes, writing cover letters, and some enrichment. Gemini is the default here.
-2. The auto-apply agent layer drives the browser through MCP tools. Codex CLI is the default browser agent. Claude Code CLI remains supported as a compatibility backend.
-   If you keep `AUTO_APPLY_AGENT=auto`, you can override the fallback order with `AUTO_APPLY_AGENT_PRIORITY=codex,claude` or `claude,codex`.
+2. The auto-apply agent layer drives the browser through MCP tools. Codex CLI is the default browser agent. Claude Code CLI and OpenCode CLI remain supported as compatibility backends.
+   If you keep `AUTO_APPLY_AGENT=auto`, you can override the fallback order with `AUTO_APPLY_AGENT_PRIORITY=codex,claude,opencode`.
+
+Canonical auto-apply settings stay on `AUTO_APPLY_*`. Compatibility aliases such as `APPLY_BACKEND`, `APPLY_CLAUDE_MODEL`, `APPLY_OPENCODE_MODEL`, and `APPLY_OPENCODE_AGENT` are accepted for merged-branch compatibility, but they are not the primary interface.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -137,7 +139,7 @@ ApplyPilot intentionally separates its AI work into two different layers:
 ## How Stages Work
 
 ### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
+Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Queries Greenhouse employer boards from `config/greenhouse.yaml`. Hits 30 direct career sites with custom extractors. Deduplicates by URL.
 
 ### Enrich
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
@@ -152,7 +154,7 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-ApplyPilot launches a Chrome instance, then hands control to a browser agent CLI. By default that is Codex CLI; Claude Code CLI is still supported. The agent navigates each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
+ApplyPilot launches a Chrome instance, then hands control to a browser agent CLI. By default that is Codex CLI; Claude Code CLI and OpenCode CLI are also supported. The agent navigates each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
 
 The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 
@@ -184,6 +186,8 @@ applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
+applypilot analyze --url URL            # Parse a job description and optional resume match
+applypilot greenhouse validate          # Validate configured Greenhouse employers
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```

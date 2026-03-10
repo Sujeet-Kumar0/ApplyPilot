@@ -7,12 +7,13 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from applypilot import config
 from applypilot.apply.chrome import BASE_CDP_PORT, reset_worker_dir
@@ -40,6 +41,22 @@ DISALLOWED_GMAIL_TOOLS = [
 ]
 
 
+class BackendError(Exception):
+    """Raised when backend operations fail."""
+
+
+class InvalidBackendError(BackendError, ValueError):
+    """Raised when a backend identifier is not supported."""
+
+    def __init__(self, backend: str, available: frozenset[str]) -> None:
+        self.backend = backend
+        self.available = available
+        super().__init__(
+            f"Invalid backend '{backend}'. Supported backends: {', '.join(sorted(available))}. "
+            "Set via AUTO_APPLY_AGENT, APPLY_BACKEND, or the apply --agent flag."
+        )
+
+
 @dataclass(frozen=True)
 class BackendExecution:
     """Captured output from an auto-apply agent run."""
@@ -56,6 +73,33 @@ class AutoApplyBackend(abc.ABC):
 
     key: str
     label: str
+
+    @classmethod
+    def is_installed(cls) -> bool:
+        """Return whether the backend CLI is installed."""
+
+        return shutil.which(cls.key) is not None
+
+    @classmethod
+    def get_version(cls) -> str | None:
+        """Return a short CLI version string when available."""
+
+        binary = shutil.which(cls.key)
+        if not binary:
+            return None
+        try:
+            result = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            return None
+        output = f"{result.stdout}\n{result.stderr}".strip()
+        return next((line.strip() for line in output.splitlines() if line.strip()), None)
 
     @abc.abstractmethod
     def build_command(
@@ -93,6 +137,82 @@ class AutoApplyBackend(abc.ABC):
             model=model,
         )
         return f"{_shell_join(cmd)} < {shlex.quote(str(prompt_file))}"
+
+    @property
+    def name(self) -> str:
+        return self.key
+
+    def get_active_proc(self, worker_id: int) -> subprocess.Popen | None:
+        return getattr(self, "_active_procs", {}).get(worker_id)
+
+    def list_mcp_servers(self) -> list[str]:
+        return []
+
+    def add_mcp_server(self, *args: object, **kwargs: object) -> None:
+        raise BackendError(f"{self.label} does not support MCP server registration via ApplyPilot.")
+
+    def setup(self, import_from: str | None = None) -> dict[str, object]:
+        del import_from
+        return {
+            "success": True,
+            "servers_added": [],
+            "servers_existing": self.list_mcp_servers(),
+            "errors": [],
+        }
+
+    def _register_internal_process(self, worker_id: int, proc: subprocess.Popen) -> None:
+        self._active_procs[worker_id] = proc
+
+    def _unregister_internal_process(self, worker_id: int) -> None:
+        self._active_procs.pop(worker_id, None)
+
+    def run_job(
+        self,
+        job: dict[str, Any],
+        port: int,
+        worker_id: int,
+        model: str,
+        agent: str | None,
+        dry_run: bool,
+        prompt: str,
+        mcp_config_path: Path,
+        worker_dir: Path,
+        required_mcp_servers: Sequence[str] | None = None,
+        update_callback: Any | None = None,
+    ) -> tuple[str, int]:
+        """Compatibility wrapper used by the dev-branch backend tests."""
+
+        del mcp_config_path, worker_dir, required_mcp_servers, update_callback
+        try:
+            execution = self.run(
+                job=job,
+                port=port,
+                worker_id=worker_id,
+                prompt=prompt,
+                model=model,
+                register_process=self._register_internal_process,
+                unregister_process=self._unregister_internal_process,
+            )
+        except subprocess.TimeoutExpired:
+            return "failed:timeout", config.DEFAULTS["apply_timeout"] * 1000
+        except Exception as exc:
+            return f"failed:{str(exc)[:100]}", 0
+
+        if execution.skipped:
+            return "skipped", execution.duration_ms
+
+        combined_output = "\n".join(
+            part.strip()
+            for part in (execution.final_output, execution.raw_output)
+            if part and part.strip()
+        )
+        result = extract_result_status(combined_output)
+        if result:
+            return result, execution.duration_ms
+        return (
+            f"failed:{_fallback_failure_reason(combined_output, execution.returncode, self.key)}",
+            execution.duration_ms,
+        )
 
 
 def build_claude_command(mcp_config_path: Path, model: str | None) -> list[str]:
@@ -182,6 +302,11 @@ class ClaudeAutoApplyBackend(AutoApplyBackend):
 
     key = "claude"
     label = "Claude Code CLI"
+
+    def __init__(self) -> None:
+        self._active_procs: dict[int, subprocess.Popen] = {}
+        self._config_dir = Path.home() / ".claude"
+        self._config_path = self._config_dir / "claude.json"
 
     def build_command(
         self,
@@ -306,6 +431,11 @@ class CodexAutoApplyBackend(AutoApplyBackend):
     key = "codex"
     label = "Codex CLI"
 
+    def __init__(self) -> None:
+        self._active_procs: dict[int, subprocess.Popen] = {}
+        self._config_dir = config.APP_DIR
+        self._config_path = config.APP_DIR / ".codex"
+
     def build_command(
         self,
         *,
@@ -385,19 +515,391 @@ class CodexAutoApplyBackend(AutoApplyBackend):
             unregister_process(worker_id)
 
 
+class OpenCodeAutoApplyBackend(AutoApplyBackend):
+    """OpenCode CLI backend."""
+
+    key = "opencode"
+    label = "OpenCode CLI"
+
+    def __init__(self) -> None:
+        self._active_procs: dict[int, subprocess.Popen] = {}
+        self._config_dir = config.OPENCODE_CONFIG_DIR
+        self._config_path = config.OPENCODE_CONFIG_PATH
+
+    def _find_binary(self) -> str:
+        binary = shutil.which("opencode")
+        if binary:
+            return binary
+
+        default_binary = Path.home() / ".opencode" / "bin" / "opencode"
+        if default_binary.exists():
+            return str(default_binary)
+
+        raise BackendError(
+            "OpenCode CLI not found on PATH. Install OpenCode CLI and configure playwright+gmail MCP servers."
+        )
+
+    def _prepare_environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        opencode_bin_dir = str(Path.home() / ".opencode" / "bin")
+        current_path = env.get("PATH", "")
+        if opencode_bin_dir not in current_path:
+            env["PATH"] = f"{opencode_bin_dir}:{current_path}" if current_path else opencode_bin_dir
+        if not env.get("TERM"):
+            env["TERM"] = "xterm-256color"
+        return env
+
+    def _build_command(
+        self,
+        model: str | None,
+        worker_dir: Path,
+        agent_name: str | None = None,
+    ) -> list[str]:
+        cmd = [
+            self._find_binary(),
+            "run",
+            "--format",
+            "json",
+            "--dir",
+            str(worker_dir),
+        ]
+        if model:
+            cmd.extend(["--model", model])
+        if agent_name:
+            cmd.extend(["--agent", agent_name])
+        variant = os.environ.get("APPLY_OPENCODE_VARIANT", "").strip()
+        if variant:
+            cmd.extend(["--variant", variant])
+        return cmd
+
+    def build_command(
+        self,
+        *,
+        worker_dir: Path,
+        worker_id: int,
+        port: int,
+        model: str | None,
+    ) -> list[str]:
+        del worker_id, port
+        return self._build_command(
+            model=model,
+            worker_dir=worker_dir,
+            agent_name=config.get_opencode_agent_setting(),
+        )
+
+    def _list_mcp_servers(self) -> set[str]:
+        proc = subprocess.run(
+            [self._find_binary(), "mcp", "list"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self._prepare_environment(),
+            cwd=str(config.APP_DIR),
+        )
+        output = _ANSI_ESCAPE_RE.sub("", f"{proc.stdout}\n{proc.stderr}")
+        servers: set[str] = set()
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            match = re.match(
+                r"^[●*]?\s*[✓x]?\s*([A-Za-z0-9_-]+)\s+(connected|disconnected|error)\b",
+                line,
+            )
+            if match:
+                servers.add(match.group(1))
+        return servers
+
+    def list_mcp_servers(self) -> list[str]:
+        return sorted(self._list_mcp_servers())
+
+    def _ensure_required_mcp_servers(self, required: Sequence[str] | None) -> None:
+        if not required:
+            return
+        configured = self._list_mcp_servers()
+        missing = [name for name in required if name not in configured]
+        if missing:
+            raise BackendError(
+                "Missing server(s): "
+                + ", ".join(missing)
+                + ". Configure OpenCode with playwright+gmail MCP servers before auto-apply."
+            )
+
+    def setup(self, import_from: str | None = None) -> dict[str, object]:
+        del import_from
+        config.OPENCODE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if not config.OPENCODE_CONFIG_PATH.exists():
+            config.OPENCODE_CONFIG_PATH.write_text("{\n  \"mcp\": {}\n}\n", encoding="utf-8")
+        existing = self.list_mcp_servers()
+        return {
+            "success": True,
+            "servers_added": [],
+            "servers_existing": existing,
+            "errors": [],
+        }
+
+    def run(
+        self,
+        *,
+        job: dict,
+        port: int,
+        worker_id: int,
+        prompt: str,
+        model: str | None,
+        register_process: ProcessRegistrar,
+        unregister_process: ProcessUnregister,
+    ) -> BackendExecution:
+        del port
+        worker_dir = reset_worker_dir(worker_id)
+        agent_name = config.get_opencode_agent_setting()
+        cmd = self._build_command(model=model, worker_dir=worker_dir, agent_name=agent_name)
+
+        worker_log = _worker_log_path(worker_id)
+        start = time.time()
+        proc = None
+        raw_parts: list[str] = []
+        text_parts: list[str] = []
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=self._prepare_environment(),
+                cwd=str(worker_dir),
+            )
+            register_process(worker_id, proc)
+
+            if proc.stdin is not None:
+                proc.stdin.write(prompt)
+                proc.stdin.close()
+
+            with open(worker_log, "a", encoding="utf-8") as lf:
+                lf.write(_log_header(job, self.label))
+                lf.write(f"$ {_shell_join(cmd)}\n")
+                update_state(worker_id, last_action="running OpenCode")
+
+                if proc.stdout is not None:
+                    for line in proc.stdout:
+                        raw_parts.append(line)
+                        lf.write(line)
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            msg = json.loads(stripped)
+                        except json.JSONDecodeError:
+                            text_parts.append(stripped)
+                            continue
+
+                        msg_type = msg.get("type")
+                        if msg_type == "text":
+                            text = msg.get("part", {}).get("text", "")
+                            if text:
+                                text_parts.append(text)
+                        elif msg_type == "tool_use":
+                            ws = get_state(worker_id)
+                            current_actions = ws.actions if ws else 0
+                            update_state(
+                                worker_id,
+                                actions=current_actions + 1,
+                                last_action="tool use",
+                            )
+
+            proc.wait(timeout=config.DEFAULTS["apply_timeout"])
+            duration_ms = int((time.time() - start) * 1000)
+            returncode = proc.returncode or 0
+
+            final_output = "\n".join(part for part in text_parts if part).strip()
+            log_output = final_output if final_output else "".join(raw_parts)
+            _write_job_log(self.key, worker_id, job, log_output)
+            return BackendExecution(
+                final_output=final_output,
+                raw_output="".join(raw_parts),
+                duration_ms=duration_ms,
+                returncode=returncode,
+                skipped=returncode < 0,
+            )
+        finally:
+            unregister_process(worker_id)
+
+    def run_job(
+        self,
+        job: dict[str, Any],
+        port: int,
+        worker_id: int,
+        model: str,
+        agent: str | None,
+        dry_run: bool,
+        prompt: str,
+        mcp_config_path: Path,
+        worker_dir: Path,
+        required_mcp_servers: Sequence[str] | None = None,
+        update_callback: Any | None = None,
+    ) -> tuple[str, int]:
+        """Compatibility wrapper that preserves the dev-branch OpenCode contract."""
+
+        del dry_run, mcp_config_path, update_callback
+        try:
+            self._ensure_required_mcp_servers(required_mcp_servers)
+            cmd = self._build_command(
+                model=model,
+                worker_dir=worker_dir,
+                agent_name=agent or config.get_opencode_agent_setting(),
+            )
+            worker_log = _worker_log_path(worker_id)
+            start = time.time()
+            raw_parts: list[str] = []
+            text_parts: list[str] = []
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=self._prepare_environment(),
+                cwd=str(worker_dir),
+            )
+            self._register_internal_process(worker_id, proc)
+
+            if proc.stdin is None or proc.stdout is None:
+                raise BackendError("OpenCode backend process streams unavailable")
+
+            proc.stdin.write(prompt)
+            proc.stdin.close()
+
+            with open(worker_log, "a", encoding="utf-8") as lf:
+                lf.write(_log_header(job, self.label))
+                lf.write(f"$ {_shell_join(cmd)}\n")
+                update_state(worker_id, last_action="running OpenCode")
+
+                for line in proc.stdout:
+                    raw_parts.append(line)
+                    lf.write(line)
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        msg = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        text_parts.append(stripped)
+                        continue
+
+                    msg_type = msg.get("type")
+                    if msg_type == "text":
+                        text = msg.get("part", {}).get("text", "")
+                        if text:
+                            text_parts.append(text)
+                    elif msg_type == "tool_use":
+                        ws = get_state(worker_id)
+                        current_actions = ws.actions if ws else 0
+                        update_state(
+                            worker_id,
+                            actions=current_actions + 1,
+                            last_action="tool use",
+                        )
+
+            proc.wait(timeout=config.DEFAULTS["apply_timeout"])
+            duration_ms = int((time.time() - start) * 1000)
+            returncode = proc.returncode or 0
+            if returncode < 0:
+                return "skipped", duration_ms
+
+            final_output = "\n".join(part for part in text_parts if part).strip()
+            combined_output = "\n".join(
+                part.strip()
+                for part in (final_output, "".join(raw_parts))
+                if part and part.strip()
+            )
+            result = extract_result_status(combined_output)
+            if result:
+                return result, duration_ms
+            return f"failed:{_fallback_failure_reason(combined_output, returncode, self.key)}", duration_ms
+        except subprocess.TimeoutExpired:
+            return "failed:timeout", config.DEFAULTS["apply_timeout"] * 1000
+        except Exception as exc:
+            return f"failed:{str(exc)[:100]}", 0
+        finally:
+            self._unregister_internal_process(worker_id)
+
+
 BACKENDS: dict[str, AutoApplyBackend] = {
     "claude": ClaudeAutoApplyBackend(),
     "codex": CodexAutoApplyBackend(),
+    "opencode": OpenCodeAutoApplyBackend(),
 }
 
+VALID_BACKENDS: frozenset[str] = frozenset(BACKENDS)
+DEFAULT_BACKEND = "claude"
 
-def get_backend(agent: str) -> AutoApplyBackend:
+
+def get_backend(agent: str | None = None) -> AutoApplyBackend:
     """Return the backend implementation for the given agent key."""
 
+    agent = resolve_backend_name(agent)
     try:
         return BACKENDS[agent]
     except KeyError as exc:
-        raise ValueError(f"Unsupported auto-apply agent: {agent}") from exc
+        raise InvalidBackendError(agent, VALID_BACKENDS) from exc
+
+
+def get_available_backends() -> frozenset[str]:
+    return VALID_BACKENDS
+
+
+def resolve_backend_name(backend_name: str | None = None, environ: Mapping[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    if backend_name is not None:
+        raw = backend_name
+    elif env.get("AUTO_APPLY_AGENT", "").strip() and env.get("AUTO_APPLY_AGENT", "").strip().lower() != "auto":
+        raw = env.get("AUTO_APPLY_AGENT", "")
+    else:
+        raw = env.get("APPLY_BACKEND", DEFAULT_BACKEND)
+
+    normalized = raw.lower().strip()
+    if not normalized:
+        raise InvalidBackendError(raw, VALID_BACKENDS)
+    if normalized not in VALID_BACKENDS:
+        raise InvalidBackendError(normalized, VALID_BACKENDS)
+    return normalized
+
+
+def detect_backends() -> list[str]:
+    """Return installed backend CLI names, preserving canonical ordering."""
+
+    available: list[str] = []
+    for key in ("codex", "claude", "opencode"):
+        backend = BACKENDS[key]
+        try:
+            installed = backend.is_installed()
+        except Exception:
+            installed = False
+        if installed:
+            available.append(key)
+    return available
+
+
+def get_preferred_backend(environ: Mapping[str, str] | None = None) -> str | None:
+    """Return the first ready backend according to configured preference rules."""
+
+    selection = config.resolve_auto_apply_agent(environ=environ)
+    return selection.resolved
+
+
+def resolve_default_model(backend_name: str, environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    return config.get_auto_apply_model_setting(backend_name, env)
+
+
+def resolve_default_agent(backend_name: str, environ: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if environ is None else environ
+    if backend_name == "opencode":
+        return config.get_opencode_agent_setting(env)
+    return None
 
 
 def _build_codex_config_overrides(port: int) -> list[str]:
@@ -476,3 +978,23 @@ def _log_header(job: dict, label: str) -> str:
 
 def _shell_join(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
+
+
+def _fallback_failure_reason(output: str, returncode: int, agent: str) -> str:
+    if returncode:
+        last_line = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "")
+        if last_line:
+            cleaned = re.sub(r"[^a-zA-Z0-9._:-]+", "_", last_line.lower()).strip("_")
+            return f"{agent}_runtime_error:{cleaned[:60] or returncode}"
+        return f"{agent}_runtime_error:{returncode}"
+    return "no_result_line"
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
+
+# Compatibility aliases for dev-branch imports/tests.
+AgentBackend = AutoApplyBackend
+AgentBackendError = BackendError
+ClaudeBackend = ClaudeAutoApplyBackend
+CodexBackend = CodexAutoApplyBackend
+OpenCodeBackend = OpenCodeAutoApplyBackend

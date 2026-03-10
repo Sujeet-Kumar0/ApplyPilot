@@ -1,0 +1,181 @@
+{
+  "personal": {
+    "full_name": "YOUR_LEGAL_NAME",
+    "preferred_name": "YOUR_PREFERRED_NAME",
+    "email": "your.email@example.com",
+    "password": "YOUR_JOB_SITE_PASSWORD",
+    "phone": "555-123-4567",
+    "address": "123 Main St",
+    "city": "Your City",
+    "province_state": "Your State/Province",
+    "country": "Your Country",
+    "postal_code": "A1B 2C3",
+    "linkedin_url": "https://www.linkedin.com/in/yourprofile",
+    "github_url": "https://github.com/yourusername",
+    "portfolio_url": "",
+    "website_url": ""
+  },
+  "work_authorization": {
+    "legally_authorized_to_work": "Yes",
+    "require_sponsorship": "No",
+    "work_permit_type": ""
+  },
+  "availability": {
+    "earliest_start_date": "Immediately",
+    "available_for_full_time": "Yes",
+    "available_for_contract": "No"
+  },
+  "compensation": {
+    "salary_expectation": "85000",
+    "salary_currency": "USD",
+    "salary_range_min": "80000",
+    "salary_range_max": "100000",
+    "currency_conversion_note": ""
+  },
+  "work_history": [
+    {
+      "company": "Current Company",
+      "position": "Senior Software Engineer",
+      "start_year": 2021,
+      "end_year": null,
+      "location": "Remote"
+    },
+    {
+      "company": "Previous Corp",
+      "position": "Software Engineer",
+      "start_year": 2018,
+      "end_year": 2021,
+      "location": "San Francisco, CA"
+    },
+    {
+      "company": "First Startup",
+      "position": "Junior Developer",
+      "start_year": 2016,
+      "end_year": 2018,
+      "location": "New York, NY"
+    }
+  ],
+  "experience": {
+    "years_of_experience_total": "8",
+    "education_level": "Bachelor's Degree",
+    "current_job_title": "Senior Software Engineer",
+    "current_company": "Current Company",
+    "target_role": "Staff Software Engineer"
+  },
+  "skills_boundary": {
+    "languages": ["Python", "SQL", "JavaScript", "TypeScript"],
+    "frameworks": ["FastAPI", "Flask", "React", "Node.js"],
+    "devops": ["Docker", "AWS", "Kubernetes", "CI/CD"],
+    "databases": ["PostgreSQL", "MongoDB", "Redis"],
+    "tools": ["Git", "Linux", "Terraform"]
+  },
+  "resume_facts": {
+    "preserved_companies": ["Current Company", "Previous Corp", "First Startup"],
+    "preserved_projects": ["E-commerce Platform", "ML Pipeline", "Real-time Analytics"],
+    "preserved_school": "Your University",
+    "real_metrics": ["50% improvement", "10x faster", "$2M revenue impact", "99.9% uptime"]
+  },
+  "eeo_voluntary": {
+    "gender": "Decline to self-identify",
+    "race_ethnicity": "Decline to self-identify",
+    "veteran_status": "I am not a protected veteran",
+    "disability_status": "I do not wish to answer"
+  },
+  "tailoring_config": {
+    "enabled": true,
+    "default_role_type": "software_engineer",
+    
+    "validation": {
+      "enabled": true,
+      "max_retries": 3,
+      
+      "min_bullets_per_role": 2,
+      "max_bullets_per_role": 5,
+      
+      "min_total_bullets_senior": 15,
+      "max_total_bullets_senior": 25,
+      "min_total_bullets_mid": 12,
+      "max_total_bullets_mid": 20,
+      "min_total_bullets_junior": 8,
+      "max_total_bullets_junior": 15,
+      
+      "min_metrics_ratio": 0.7,
+      
+      "weak_verbs": [
+        "responsible for",
+        "assisted with",
+        "helped with",
+        "worked on",
+        "involved in",
+        "participated in",
+        "contributed to"
+      ],
+      
+      "metric_patterns": [
+        "\\d+%",
+        "\\$\\d",
+        "\\d+x",
+        "\\d+\\s*(?:hours?|days?|weeks?|months?|years?)",
+        "\\d+\\s*(?:k|k\\+|million|m|billion|b)?\\s+(?:users?|customers?|requests?|transactions?)"
+      ]
+    },
+    
+    "role_types": {
+      "software_engineer": {
+        "detection_keywords": ["engineer", "developer", "software", "backend", "frontend"],
+        "instructions": {
+          "bullet_template": "CAR",
+          "max_bullets_per_role": 5
+        },
+        "constraints": {
+          "mechanism_required": true,
+          "banned_phrases": ["passionate about", "team player"],
+          "required_patterns": ["built", "designed", "implemented"]
+        }
+      },
+      "product_manager": {
+        "detection_keywords": ["product manager", "pm", "product owner"],
+        "instructions": {
+          "bullet_template": "WHO",
+          "max_bullets_per_role": 4
+        },
+        "constraints": {
+          "mechanism_required": false,
+          "banned_phrases": [],
+          "required_patterns": ["launched", "drove", "delivered"]
+        }
+      }
+    },
+    
+    "global_rules": {
+      "max_summary_lines": 4,
+      "selected_impact_metrics": 5,
+      "role_compression": {
+        "enabled": true,
+        "older_than_years": 10,
+        "max_bullets_per_old_role": 3
+      },
+      "formatting": {
+        "date_format": "YYYY-MM",
+        "bullet_style": "sentence_case",
+        "skills_separator": " | "
+      }
+    },
+    
+    "quality_gates": {
+      "step_final_assembly": {
+        "enabled": true,
+        "checks": [
+          "check_role_completeness",
+          "check_project_completeness",
+          "check_bullet_counts",
+          "check_total_bullets",
+          "check_summary_quality",
+          "check_bullet_metrics",
+          "check_weak_verbs",
+          "check_education_completeness"
+        ]
+      }
+    }
+  }
+}

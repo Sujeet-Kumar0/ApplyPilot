@@ -37,6 +37,7 @@ _PROVIDER_CREDENTIAL_PROMPTS = {
     "gemini": "Gemini API key (from aistudio.google.com)",
     "openrouter": "OpenRouter API key (from openrouter.ai/keys)",
     "openai": "OpenAI API key",
+    "anthropic": "Anthropic API key",
     "local": "Local LLM endpoint URL",
 }
 
@@ -44,6 +45,7 @@ _PROVIDER_MODEL_PROMPTS = {
     "gemini": "Model",
     "openrouter": "Model",
     "openai": "Model",
+    "anthropic": "Model",
     "local": "Model name",
 }
 
@@ -94,6 +96,53 @@ def _setup_resume() -> None:
 # ---------------------------------------------------------------------------
 # Profile
 # ---------------------------------------------------------------------------
+
+def _collect_education() -> list[dict]:
+    """Collect structured education entries for the profile."""
+
+    console.print("\n[bold cyan]Education[/bold cyan]")
+    console.print("[dim]Press Enter on the school name to skip or finish this section.[/dim]")
+    education: list[dict] = []
+    while True:
+        institution = Prompt.ask("School / institution", default="").strip()
+        if not institution:
+            break
+        education.append(
+            {
+                "institution": institution,
+                "studyType": Prompt.ask("Degree", default="").strip(),
+                "area": Prompt.ask("Field of study", default="").strip(),
+                "endDate": Prompt.ask("Graduation date (YYYY or YYYY-MM-DD)", default="").strip(),
+            }
+        )
+        if not Confirm.ask("Add another education entry?", default=False):
+            break
+    return education
+
+
+def _setup_tailoring_config(target_role: str) -> dict:
+    """Collect lightweight tailoring preferences for the validation stack."""
+
+    console.print("\n[bold cyan]Tailoring Preferences[/bold cyan]")
+    primary_role_type = Prompt.ask(
+        "Primary role type key",
+        default="software_engineer" if "engineer" in target_role.lower() else "general",
+    ).strip() or "general"
+    min_bullets = Prompt.ask("Minimum bullets per role", default="2").strip()
+    max_bullets = Prompt.ask("Maximum bullets per role", default="5").strip()
+    min_metrics_ratio = Prompt.ask("Minimum metrics ratio (0-1)", default="0.7").strip()
+
+    return {
+        "default_role_type": primary_role_type,
+        "validation": {
+            "enabled": True,
+            "max_retries": 3,
+            "min_bullets_per_role": int(min_bullets or "2"),
+            "max_bullets_per_role": int(max_bullets or "5"),
+            "min_metrics_ratio": float(min_metrics_ratio or "0.7"),
+        },
+        "role_types": {},
+    }
 
 def _setup_profile() -> dict:
     """Walk through profile questions and return a nested profile dict."""
@@ -152,6 +201,8 @@ def _setup_profile() -> dict:
         "current_title": current_title,
         "target_role": target_role,
     }
+    profile["education"] = _collect_education()
+    profile["tailoring_config"] = _setup_tailoring_config(target_role)
 
     # -- Skills Boundary --
     console.print("\n[bold cyan]Skills[/bold cyan] (comma-separated)")
@@ -329,7 +380,7 @@ def _setup_ai_features() -> None:
 
     console.print(
         "Supported providers: [bold]Gemini[/bold] (recommended, free tier), "
-        "OpenRouter (flexible multi-model), OpenAI, local (Ollama/llama.cpp)"
+        "OpenRouter (flexible multi-model), OpenAI, Anthropic, local (Ollama/llama.cpp)"
     )
     provider = Prompt.ask(
         "Provider",
@@ -387,11 +438,22 @@ def _setup_auto_apply() -> None:
             "Install it from: [bold]https://claude.ai/code[/bold] if you want Claude compatibility."
         )
 
+    opencode_status = statuses.get("opencode")
+    if opencode_status:
+        if opencode_status.available:
+            console.print(f"[green]OpenCode CLI ready.[/green] {opencode_status.note}")
+        elif opencode_status.binary_path:
+            console.print(f"[yellow]OpenCode CLI found but not ready.[/yellow] {opencode_status.note}")
+        else:
+            console.print(f"[dim]OpenCode CLI optional.[/dim] {opencode_status.note}")
+
     default_agent = DEFAULT_AUTO_APPLY_AGENT
     if statuses["codex"].available and not statuses["claude"].available:
         default_agent = "codex"
     elif statuses["claude"].available and not statuses["codex"].available:
         default_agent = "claude"
+    elif opencode_status and opencode_status.available and not statuses["codex"].available and not statuses["claude"].available:
+        default_agent = "opencode"
 
     selected_agent = Prompt.ask(
         "Browser agent",
@@ -400,6 +462,14 @@ def _setup_auto_apply() -> None:
     )
     model_override = Prompt.ask("Browser agent model override (optional)", default="")
     updates = {"AUTO_APPLY_AGENT": selected_agent}
+    if selected_agent == "opencode":
+        opencode_agent = Prompt.ask("OpenCode sub-agent (optional)", default="").strip()
+        if opencode_agent:
+            updates["APPLY_OPENCODE_AGENT"] = opencode_agent
+        else:
+            _delete_env_vars(["APPLY_OPENCODE_AGENT"])
+    else:
+        _delete_env_vars(["APPLY_OPENCODE_AGENT"])
     if model_override.strip():
         updates["AUTO_APPLY_MODEL"] = model_override.strip()
     else:

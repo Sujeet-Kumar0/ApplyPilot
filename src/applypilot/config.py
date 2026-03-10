@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 """ApplyPilot configuration: paths, platform detection, user data."""
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 import os
 import platform
+import re
 import shutil
 import subprocess
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from applypilot.llm_provider import has_llm_provider, llm_config_hint
@@ -29,21 +32,28 @@ LOG_DIR = APP_DIR / "logs"
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
+OPENCODE_CONFIG_DIR = APP_DIR / ".opencode"
+OPENCODE_CONFIG_PATH = OPENCODE_CONFIG_DIR / "opencode.jsonc"
 
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
 
-AUTO_APPLY_AGENT_CHOICES = ("auto", "codex", "claude")
-AUTO_APPLY_AGENT_PRIORITY_CHOICES = ("codex", "claude")
+AUTO_APPLY_AGENT_CHOICES = ("auto", "codex", "claude", "opencode")
+AUTO_APPLY_AGENT_PRIORITY_CHOICES = ("codex", "claude", "opencode")
 AUTO_APPLY_AGENT_LABELS = {
     "auto": "Auto-detect",
     "codex": "Codex CLI",
     "claude": "Claude Code CLI",
+    "opencode": "OpenCode CLI",
 }
 DEFAULT_AUTO_APPLY_AGENT = "auto"
-DEFAULT_AUTO_APPLY_AGENT_PRIORITY = ("codex", "claude")
+DEFAULT_AUTO_APPLY_AGENT_PRIORITY = ("codex", "claude", "opencode")
 DEFAULT_CLAUDE_AUTO_APPLY_MODEL = "haiku"
+DEFAULT_OPENCODE_AUTO_APPLY_MODEL = "gpt-4o-mini"
+DEFAULT_OPENCODE_AUTO_APPLY_AGENT = "applypilot-apply"
+OPENCODE_REQUIRED_MCP_SERVERS = ("playwright", "gmail")
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
 
 
 @dataclass(frozen=True)
@@ -263,8 +273,21 @@ def get_auto_apply_model_setting(
     if configured:
         return configured
     if agent == "claude":
-        return DEFAULT_CLAUDE_AUTO_APPLY_MODEL
+        return env.get("APPLY_CLAUDE_MODEL", "").strip() or DEFAULT_CLAUDE_AUTO_APPLY_MODEL
+    if agent == "opencode":
+        return (
+            env.get("APPLY_OPENCODE_MODEL", "").strip()
+            or env.get("LLM_MODEL", "").strip()
+            or DEFAULT_OPENCODE_AUTO_APPLY_MODEL
+        )
     return None
+
+
+def get_opencode_agent_setting(environ: Mapping[str, str] | None = None) -> str:
+    """Return the configured OpenCode sub-agent name."""
+
+    env = _env(environ)
+    return env.get("APPLY_OPENCODE_AGENT", "").strip() or DEFAULT_OPENCODE_AUTO_APPLY_AGENT
 
 
 def get_codex_login_status(timeout: int = 10) -> tuple[bool, str]:
@@ -300,6 +323,56 @@ def get_codex_login_status(timeout: int = 10) -> tuple[bool, str]:
     return False, "Run `codex login`"
 
 
+def get_opencode_binary_path() -> str | None:
+    """Return the OpenCode binary path if available."""
+
+    binary = shutil.which("opencode")
+    if binary:
+        return binary
+
+    default_binary = Path.home() / ".opencode" / "bin" / "opencode"
+    if default_binary.exists():
+        return str(default_binary)
+    return None
+
+
+def get_opencode_mcp_servers(timeout: int = 10) -> tuple[set[str], str | None]:
+    """Return configured OpenCode MCP server names and an optional error message."""
+
+    opencode_bin = get_opencode_binary_path()
+    if not opencode_bin:
+        return set(), "Install OpenCode CLI and configure playwright+gmail MCP servers"
+
+    try:
+        result = subprocess.run(
+            [opencode_bin, "mcp", "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return set(), f"OpenCode MCP check failed: {exc}"
+
+    output = _ANSI_ESCAPE_RE.sub("", f"{result.stdout}\n{result.stderr}")
+    servers: set[str] = set()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        match = re.match(
+            r"^[●*]?\s*[✓x]?\s*([A-Za-z0-9_-]+)\s+(connected|disconnected|error)\b",
+            line,
+        )
+        if match:
+            servers.add(match.group(1))
+
+    if result.returncode != 0 and not servers:
+        last_line = next((line for line in reversed(output.splitlines()) if line.strip()), "")
+        return set(), last_line or "OpenCode MCP check failed"
+
+    return servers, None
+
+
 def get_auto_apply_agent_statuses() -> dict[str, AutoApplyAgentStatus]:
     """Return availability diagnostics for supported auto-apply backends."""
 
@@ -309,6 +382,18 @@ def get_auto_apply_agent_statuses() -> dict[str, AutoApplyAgentStatus]:
         "Install Codex CLI and run `codex login`",
     )
     claude_bin = shutil.which("claude")
+    opencode_bin = get_opencode_binary_path()
+    opencode_servers, opencode_error = get_opencode_mcp_servers()
+    opencode_missing = [name for name in OPENCODE_REQUIRED_MCP_SERVERS if name not in opencode_servers]
+    if opencode_bin and not opencode_error and not opencode_missing:
+        opencode_note = f"{opencode_bin} (MCP ready: {', '.join(OPENCODE_REQUIRED_MCP_SERVERS)})"
+        opencode_available = True
+    elif opencode_bin and not opencode_error:
+        opencode_note = "Missing MCP servers: " + ", ".join(opencode_missing)
+        opencode_available = False
+    else:
+        opencode_note = opencode_error or "Install OpenCode CLI and configure playwright+gmail MCP servers"
+        opencode_available = False
 
     return {
         "codex": AutoApplyAgentStatus(
@@ -327,6 +412,14 @@ def get_auto_apply_agent_statuses() -> dict[str, AutoApplyAgentStatus]:
             note=claude_bin or "Install from https://claude.ai/code",
             auth_ok=claude_bin is not None,
         ),
+        "opencode": AutoApplyAgentStatus(
+            key="opencode",
+            label=AUTO_APPLY_AGENT_LABELS["opencode"],
+            binary_path=opencode_bin,
+            available=opencode_available,
+            note=opencode_note,
+            auth_ok=opencode_available,
+        ),
     }
 
 
@@ -336,14 +429,21 @@ def resolve_auto_apply_agent(
 ) -> AutoApplyAgentSelection:
     """Resolve the auto-apply backend and optional model override."""
 
-    requested = preferred.lower() if preferred else get_auto_apply_agent_setting(environ)
+    env = _env(environ)
+    if preferred is not None:
+        requested = preferred.lower().strip()
+    elif env.get("AUTO_APPLY_AGENT", "").strip():
+        requested = get_auto_apply_agent_setting(env)
+    else:
+        compat_backend = env.get("APPLY_BACKEND", "").strip().lower()
+        requested = compat_backend or DEFAULT_AUTO_APPLY_AGENT
     if requested not in AUTO_APPLY_AGENT_CHOICES:
         requested = DEFAULT_AUTO_APPLY_AGENT
 
     statuses = get_auto_apply_agent_statuses()
     resolved: str | None = None
     if requested == "auto":
-        for candidate in get_auto_apply_agent_priority(environ):
+        for candidate in get_auto_apply_agent_priority(env):
             if statuses[candidate].available:
                 resolved = candidate
                 break
@@ -353,7 +453,7 @@ def resolve_auto_apply_agent(
     return AutoApplyAgentSelection(
         requested=requested,
         resolved=resolved,
-        model=get_auto_apply_model_setting(resolved, environ),
+        model=get_auto_apply_model_setting(resolved or (requested if requested != "auto" else None), env),
     )
 
 
@@ -367,7 +467,10 @@ def has_auto_apply_backend() -> bool:
 def describe_auto_apply_backend_requirement() -> str:
     """Return a short human-readable Tier 3 requirement hint."""
 
-    return "supported auto-apply agent CLI (Codex logged in or Claude installed)"
+    return (
+        "supported auto-apply agent CLI (Codex logged in, Claude installed, "
+        "or OpenCode installed with playwright+gmail MCP servers)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -435,16 +538,20 @@ def check_tier(required: int, feature: str) -> None:
         if not any(status.available for status in statuses.values()):
             missing.append(
                 "Auto-apply agent CLI — install Codex CLI and run `codex login`, "
-                "or install Claude Code CLI from [bold]https://claude.ai/code[/bold]"
+                "install Claude Code CLI from [bold]https://claude.ai/code[/bold], "
+                "or install OpenCode CLI with playwright+gmail MCP servers"
             )
-            codex_status = statuses["codex"]
-            claude_status = statuses["claude"]
-            if codex_status.binary_path and not codex_status.available:
-                missing.append(f"Codex CLI login — {codex_status.note}")
-            if not codex_status.binary_path:
-                missing.append("Codex CLI — install Codex CLI and run `codex login`")
-            if not claude_status.available:
-                missing.append(f"Claude Code CLI — {claude_status.note}")
+        codex_status = statuses["codex"]
+        claude_status = statuses["claude"]
+        opencode_status = statuses["opencode"]
+        if codex_status.binary_path and not codex_status.available:
+            missing.append(f"Codex CLI login — {codex_status.note}")
+        if not codex_status.binary_path:
+            missing.append("Codex CLI — install Codex CLI and run `codex login`")
+        if not claude_status.available:
+            missing.append(f"Claude Code CLI — {claude_status.note}")
+        if not opencode_status.available:
+            missing.append(f"OpenCode CLI — {opencode_status.note}")
         try:
             get_chrome_path()
         except FileNotFoundError:

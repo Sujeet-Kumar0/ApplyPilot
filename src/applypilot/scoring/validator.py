@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Resume and cover letter validation: banned words, fabrication detection, structural checks.
 
 All validation is profile-driven -- no hardcoded personal data. The validator receives
@@ -11,8 +13,14 @@ normal  -- banned words = warnings only; fabrication/structure = errors (default
 lenient -- banned words ignored; only fabrication and required structure checked
 """
 
-import re
 import logging
+import re
+from typing import Optional
+
+from applypilot.scoring.tailoring_config import (
+    check_banned_phrases,
+    check_required_patterns,
+)
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +77,20 @@ FABRICATION_WATCHLIST: set[str] = {
 }
 
 REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
+MECHANISM_VERBS: set[str] = {
+    "built",
+    "designed",
+    "implemented",
+    "architected",
+    "developed",
+    "created",
+    "engineered",
+    "constructed",
+    "automated",
+    "optimized",
+    "improved",
+    "reduced",
+}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -94,9 +116,46 @@ def sanitize_text(text: str) -> str:
     return text.strip()
 
 
+def _get_role_constraints(role_type: str, config: dict) -> dict:
+    """Get role-specific validation constraints from tailoring_config."""
+
+    if not config or not role_type:
+        return {}
+    role_config = config.get("role_types", {}).get(role_type, {})
+    return role_config.get("constraints", {})
+
+
+def _check_banned_phrases(text: str, role_type: str, config: dict) -> list[str]:
+    if not config or not role_type:
+        return []
+    return check_banned_phrases(text, role_type, config)
+
+
+def _check_required_patterns(text: str, role_type: str, config: dict) -> tuple[list[str], list[str]]:
+    if not config or not role_type:
+        return [], []
+    return check_required_patterns(text, role_type, config)
+
+
+def _check_mechanism_required(text: str, role_type: str, config: dict) -> bool:
+    if not config or not role_type:
+        return True
+    constraints = _get_role_constraints(role_type, config)
+    if not constraints.get("mechanism_required", False):
+        return True
+    pattern = r"\b(" + "|".join(map(re.escape, MECHANISM_VERBS)) + r")\b"
+    return bool(re.search(pattern, text.lower()))
+
+
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
-def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
+def validate_json_fields(
+    data: dict,
+    profile: dict,
+    mode: str = "normal",
+    role_type: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
@@ -113,17 +172,55 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    # Required keys — always checked regardless of mode.
+    # "projects" may be an empty list; only the field itself is required.
+    for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
+    if "projects" not in data:
+        errors.append("Missing required field: projects")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
-    # Collect all text for bulk checks
-    all_text_parts: list[str] = [data["summary"]]
+    sanitized_title = sanitize_text(str(data.get("title", "")))
+    sanitized_summary = sanitize_text(str(data.get("summary", "")))
 
-    # Skills: check for fabrication (always enforced)
+    skills_val = data.get("skills", "")
+    if isinstance(skills_val, dict):
+        skills_joined = " ".join(str(v) for v in skills_val.values())
+    elif isinstance(skills_val, list):
+        skills_joined = " ".join(str(v) for v in skills_val)
+    else:
+        skills_joined = str(skills_val)
+    sanitized_skills = sanitize_text(skills_joined)
+
+    edu_val = data.get("education", "")
+    if isinstance(edu_val, list):
+        edu_joined = " ".join(str(e) for e in edu_val)
+    elif isinstance(edu_val, dict):
+        edu_joined = " ".join(str(v) for v in edu_val.values())
+    else:
+        edu_joined = str(edu_val)
+    sanitized_education = sanitize_text(edu_joined)
+
+    all_text_parts: list[str] = [sanitized_title, sanitized_summary, sanitized_skills, sanitized_education]
+
+    # Generated titles must stay aligned with the target job title when provided.
+    job_context = profile.get("job_context", {}) or {}
+    target_title = str(job_context.get("title", "")).strip()
+    generated_title = str(data.get("title", "")).strip()
+    if target_title and generated_title:
+        def _norm(text: str) -> str:
+            return re.sub(r"[^a-z0-9 ]", "", text.lower())
+
+        target_words = [word for word in _norm(target_title).split() if len(word) > 2]
+        generated_words = [word for word in _norm(generated_title).split() if len(word) > 2]
+        shared = set(target_words) & set(generated_words)
+        odd_modifiers = {"partner", "alliances", "evangelist", "advocate", "champion", "ambassador", "specialist"}
+        generated_has_odd = any(word in generated_words for word in odd_modifiers)
+        if not shared or (generated_has_odd and not any(word in target_words for word in odd_modifiers)):
+            errors.append(f"Generated title '{generated_title}' is not aligned with target '{target_title}'")
+
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
         for fake in FABRICATION_WATCHLIST:
@@ -132,51 +229,81 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
             if fake in skills_text:
                 errors.append(f"Fabricated skill: '{fake}'")
 
-    # Experience: preserved companies must be present (always enforced)
+    work_history = profile.get("work_history", [])
+    work_companies = {str(item.get("company", "")).strip() for item in work_history if item.get("company")}
     resume_facts = profile.get("resume_facts", {})
-    preserved_companies = resume_facts.get("preserved_companies", [])
+    preserved_companies = set(resume_facts.get("preserved_companies", []))
+    for company in preserved_companies:
+        work_companies.add(company)
 
     if isinstance(data["experience"], list):
-        for company in preserved_companies:
+        for company in work_companies:
             has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
-                for e in data["experience"]
+                company.lower() in str(entry.get("header", "")).lower()
+                or company.lower() in str(entry.get("company", "")).lower()
+                for entry in data["experience"]
             )
             if not has_company:
                 errors.append(f"Company '{company}' missing from experience")
         for entry in data["experience"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            for bullet in entry.get("bullets", []):
+                all_text_parts.append(sanitize_text(str(bullet)))
 
-    # Projects: collect bullets
     if isinstance(data["projects"], list):
         for entry in data["projects"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            for bullet in entry.get("bullets", []):
+                all_text_parts.append(sanitize_text(str(bullet)))
 
-    # Education: preserved school must be present (always enforced)
     preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school:
-        edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
-            errors.append(f"Education '{preserved_school}' missing")
+    if preserved_school and preserved_school.lower() not in sanitized_education.lower():
+        errors.append(f"Education '{preserved_school}' missing")
 
-    # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
 
-    # LLM self-talk is always an error regardless of mode (indicates broken output)
-    found_leaks = [p for p in LLM_LEAK_PHRASES if p in all_text]
+    found_leaks = [phrase for phrase in LLM_LEAK_PHRASES if phrase in all_text]
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
 
-    # Banned filler words — severity depends on mode
     if mode != "lenient":
-        found_banned = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", all_text)]
+        found_banned = [word for word in BANNED_WORDS if re.search(r"\b" + re.escape(word) + r"\b", all_text)]
         if found_banned:
             msg = f"Banned words: {', '.join(found_banned[:5])}"
             if mode == "strict":
                 errors.append(msg)
-            else:  # normal
+            else:
+                warnings.append(msg)
+
+    if config and role_type:
+        if mode != "lenient":
+            try:
+                found_role_banned = _check_banned_phrases(all_text, role_type, config)
+            except Exception as exc:
+                log.warning("Role-specific banned phrase check failed: %s", exc)
+                found_role_banned = []
+            if found_role_banned:
+                msg = f"Role-specific banned phrases: {', '.join(found_role_banned[:5])}"
+                if mode == "strict":
+                    errors.append(msg)
+                else:
+                    warnings.append(msg)
+
+        try:
+            _, missing_patterns = _check_required_patterns(all_text, role_type, config)
+        except Exception as exc:
+            log.warning("Required pattern check failed: %s", exc)
+            missing_patterns = []
+        if missing_patterns:
+            msg = f"Missing required patterns: {', '.join(missing_patterns[:5])}"
+            if mode == "strict":
+                errors.append(msg)
+            else:
+                warnings.append(msg)
+
+        if not _check_mechanism_required(all_text, role_type, config):
+            msg = "Missing mechanism verb (e.g., built, designed, implemented, architected)"
+            if mode == "strict":
+                errors.append(msg)
+            else:
                 warnings.append(msg)
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

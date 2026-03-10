@@ -50,6 +50,13 @@ LLM_PROVIDER_SPECS: dict[str, LLMProviderSpec] = {
         default_model="gpt-4o-mini",
         base_url="https://api.openai.com/v1",
     ),
+    "anthropic": LLMProviderSpec(
+        key="anthropic",
+        label="Anthropic",
+        env_key="ANTHROPIC_API_KEY",
+        default_model="claude-3-5-haiku-latest",
+        base_url="https://api.anthropic.com/v1",
+    ),
     "local": LLMProviderSpec(
         key="local",
         label="Local",
@@ -58,9 +65,9 @@ LLM_PROVIDER_SPECS: dict[str, LLMProviderSpec] = {
     ),
 }
 
-REMOTE_PROVIDER_ORDER = ("gemini", "openrouter", "openai")
+REMOTE_PROVIDER_ORDER = ("gemini", "openrouter", "openai", "anthropic")
 PROVIDER_DETECTION_ORDER = ("local", *REMOTE_PROVIDER_ORDER)
-WIZARD_PROVIDER_ORDER = ("gemini", "openrouter", "openai", "local")
+WIZARD_PROVIDER_ORDER = ("gemini", "openrouter", "openai", "anthropic", "local")
 
 
 def _env(environ: Mapping[str, str] | None) -> Mapping[str, str]:
@@ -120,6 +127,6 @@ def llm_config_hint() -> str:
     """Return the canonical guidance string for missing LLM setup."""
 
     return (
-        "Set GEMINI_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, "
+        "Set GEMINI_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, "
         "or LLM_URL in ~/.applypilot/.env (run 'applypilot init')"
     )

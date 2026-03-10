@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Resume tailoring: LLM-powered ATS-optimized resume generation per job.
 
 THIS IS THE HEAVIEST REFACTOR. Every piece of personal data -- name, email, phone,
@@ -14,17 +16,15 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from typing import Any
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
     BANNED_WORDS,
-    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
@@ -34,7 +34,24 @@ MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
 
-def _build_tailor_prompt(profile: dict) -> str:
+def _build_education_block(education_list: list[dict]) -> str:
+    """Build the education block from structured profile education data."""
+
+    if not education_list:
+        return "N/A"
+    lines: list[str] = []
+    for edu in education_list:
+        institution = edu.get("institution", "Unknown")
+        degree = edu.get("studyType", "") or edu.get("degree", "")
+        field = edu.get("area", "") or edu.get("field", "")
+        end_date = edu.get("endDate", "") or edu.get("graduation_date", "")
+        year = end_date[:4] if end_date and len(end_date) >= 4 else end_date
+        parts = [part for part in (degree, field, year) if part]
+        lines.append(f"{institution} | {' | '.join(parts)}" if parts else institution)
+    return "\n".join(lines)
+
+
+def _build_tailor_prompt(profile: dict, resume_text: str | None = None) -> str:
     """Build the resume tailoring system prompt from the user's profile.
 
     All skills boundaries, preserved entities, and formatting rules are
@@ -67,6 +84,10 @@ def _build_tailor_prompt(profile: dict) -> str:
 
     education = profile.get("experience", {})
     education_level = education.get("education_level", "")
+    education_block = _build_education_block(profile.get("education", []))
+    if education_block == "N/A" and education_level:
+        education_block = f"{school} | {education_level}" if school else education_level
+    del resume_text
 
     return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
 
@@ -114,7 +135,7 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{education_block}"}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -218,6 +239,40 @@ def extract_json(raw: str) -> dict:
     raise ValueError("No valid JSON found in LLM response")
 
 
+def _normalize_bullet(bullet: Any) -> str:
+    """Normalize a bullet to plain text, stripping embedded JSON metadata."""
+
+    if isinstance(bullet, dict):
+        for key in ("text", "bullet", "content", "description"):
+            value = bullet.get(key)
+            if isinstance(value, str):
+                return value.strip()
+        return json.dumps(bullet, ensure_ascii=False)
+
+    bullet_str = str(bullet).strip()
+    if bullet_str.startswith("{") or bullet_str.startswith("["):
+        try:
+            parsed = json.loads(bullet_str)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("text", "bullet", "content", "description"):
+                value = parsed.get(key)
+                if isinstance(value, str):
+                    return value.strip()
+            return json.dumps(parsed, ensure_ascii=False)
+
+    json_start = bullet_str.find(" {")
+    if json_start == -1:
+        json_start = bullet_str.find("\t{")
+    if json_start != -1:
+        candidate = bullet_str[:json_start].rstrip()
+        remainder = bullet_str[json_start:].strip()
+        if remainder.startswith("{") and ("variants" in remainder or "tags" in remainder or "role_families" in remainder):
+            return candidate
+    return bullet_str
+
+
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
 def assemble_resume_text(data: dict, profile: dict) -> str:
@@ -277,7 +332,9 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         if entry.get("subtitle"):
             lines.append(sanitize_text(entry["subtitle"]))
         for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+            bullet_text = _normalize_bullet(b)
+            if bullet_text:
+                lines.append(f"- {sanitize_text(bullet_text)}")
         lines.append("")
 
     # Projects
@@ -287,7 +344,9 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
         if entry.get("subtitle"):
             lines.append(sanitize_text(entry["subtitle"]))
         for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+            bullet_text = _normalize_bullet(b)
+            if bullet_text:
+                lines.append(f"- {sanitize_text(bullet_text)}")
         lines.append("")
 
     # Education

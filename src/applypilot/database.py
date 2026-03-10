@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """ApplyPilot database layer: schema, migrations, stats, and connection helpers.
 
 Single source of truth for the jobs table schema. All columns from every
@@ -110,6 +112,11 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             score_reasoning       TEXT,
             scored_at             TEXT,
 
+            -- Exclusion audit (deterministic gate)
+            exclusion_reason_code TEXT,
+            exclusion_rule_id     TEXT,
+            excluded_at           TEXT,
+
             -- Tailoring stage (resume tailor)
             tailored_resume_path  TEXT,
             tailored_at           TEXT,
@@ -162,6 +169,10 @@ _ALL_COLUMNS: dict[str, str] = {
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
+    # Exclusion audit
+    "exclusion_reason_code": "TEXT",
+    "exclusion_rule_id": "TEXT",
+    "excluded_at": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",

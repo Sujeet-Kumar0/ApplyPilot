@@ -5,13 +5,12 @@ job description. All personal data is loaded at runtime from the user's
 profile and resume file.
 """
 
-import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
 
-from applypilot.config import RESUME_PATH, load_profile
+from applypilot.config import RESUME_PATH
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 
@@ -40,6 +39,119 @@ SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
 REASONING: [2-3 sentences explaining the score]"""
 
+
+
+# ── Deterministic Exclusion Gate ──────────────────────────────────────────
+# Hardcoded exclusion rules aligned with task-8 contract semantics.
+# Future: load from config/rules.yaml per the contract schema.
+
+EXCLUSION_RULES: list[dict] = [
+    {
+        "id": "r-001",
+        "type": "keyword",
+        "value": ["intern", "internship"],
+        "match_scope": "title",
+        "match_type": "exact",
+        "reason_code": "excluded_keyword",
+        "description": "Exclude internship positions",
+    },
+    {
+        "id": "r-002",
+        "type": "keyword",
+        "value": ["clearance"],
+        "match_scope": "title+description",
+        "match_type": "exact",
+        "reason_code": "excluded_keyword",
+        "description": "Exclude positions requiring security clearance",
+    },
+]
+
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize text on non-alphanumeric boundaries, lowercased.
+
+    Follows task-8 contract: tokenization on non-alphanumeric characters,
+    matching performed on tokens normalized to lower-case.
+    """
+    return re.findall(r"[a-zA-Z0-9]+", text.lower())
+
+
+def _exclusion_result(rule: dict, matched_value: str) -> dict:
+    """Build a blocked scoring result for an excluded job.
+
+    Returns a dict with score fields plus audit metadata:
+      - exclusion_reason_code: stable reason code from the rule
+      - exclusion_rule_id: rule identifier for traceability
+    """
+    reason_code = rule["reason_code"]
+    return {
+        "score": 0,
+        "keywords": "",
+        "reasoning": f"EXCLUDED: {reason_code} \u2014 matched '{matched_value}' (rule {rule['id']})",
+        "exclusion_reason_code": reason_code,
+        "exclusion_rule_id": rule["id"],
+    }
+
+
+def evaluate_exclusion(job: dict) -> dict | None:
+    """Evaluate deterministic exclusion rules against a job.
+
+    Returns exclusion result dict if job is excluded, None if job passes.
+    Uses case-insensitive exact/prefix token matching per task-8 contract.
+    No LLM calls, no network, fully deterministic.
+
+    Args:
+        job: Job dict with keys: title, site, full_description.
+
+    Returns:
+        {"score": 0, "keywords": "", "reasoning": "EXCLUDED: ..."} or None.
+    """
+    title = job.get("title") or ""
+    description = job.get("full_description") or job.get("description") or ""
+    site = job.get("site") or ""
+
+    title_tokens = _tokenize(title)
+    desc_tokens = _tokenize(description)
+    combined_tokens = title_tokens + desc_tokens
+
+    for rule in EXCLUSION_RULES:
+        values = rule["value"]
+        if isinstance(values, str):
+            values = [values]
+
+        match_scope = rule.get("match_scope", "title+description")
+        match_type = rule.get("match_type", "exact")
+
+        # Site-scoped matching: substring/exact against raw site field
+        if match_scope == "site":
+            field_lower = site.lower()
+            for val in values:
+                val_lower = val.lower()
+                if match_type == "substring" and val_lower in field_lower:
+                    return _exclusion_result(rule, val)
+                elif match_type == "exact" and val_lower == field_lower:
+                    return _exclusion_result(rule, val)
+            continue
+
+        # Select tokens based on scope
+        if match_scope == "title":
+            tokens = title_tokens
+        elif match_scope == "description":
+            tokens = desc_tokens
+        else:  # title+description (default)
+            tokens = combined_tokens
+
+        # Token-based matching
+        for val in values:
+            val_lower = val.lower()
+            if match_type == "exact":
+                if val_lower in tokens:
+                    return _exclusion_result(rule, val)
+            elif match_type == "prefix":
+                if any(t.startswith(val_lower) for t in tokens):
+                    return _exclusion_result(rule, val)
+
+    return None
 
 def _parse_score_response(response: str) -> dict:
     """Parse the LLM's score response into structured data.
@@ -94,7 +206,7 @@ def score_job(resume_text: str, job: dict) -> dict:
 
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        response = client.chat(messages, max_output_tokens=512)
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
@@ -103,13 +215,16 @@ def score_job(resume_text: str, job: dict) -> dict:
 
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     """Score unscored jobs that have full descriptions.
+    Jobs are first evaluated against deterministic exclusion rules. Excluded
+    jobs bypass the LLM and receive score=0 with an EXCLUDED reason marker.
 
     Args:
         limit: Maximum number of jobs to score in this run.
         rescore: If True, re-score all jobs (not just unscored ones).
 
     Returns:
-        {"scored": int, "errors": int, "elapsed": float, "distribution": list}
+        {"scored": int, "errors": int, "elapsed": float, "distribution": list,
+         "excluded": int}
     """
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
@@ -124,7 +239,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
     if not jobs:
         log.info("No unscored jobs with descriptions found.")
-        return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": []}
+        return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": [], "excluded": 0}
 
     # Convert sqlite3.Row to dicts if needed
     if jobs and not isinstance(jobs[0], dict):
@@ -135,34 +250,48 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     t0 = time.time()
     completed = 0
     errors = 0
+    excluded_count = 0
     results: list[dict] = []
-
     for job in jobs:
-        result = score_job(resume_text, job)
+        # Deterministic exclusion gate: check before LLM scoring
+        exclusion = evaluate_exclusion(job)
+        if exclusion is not None:
+            result = exclusion
+            excluded_count += 1
+        else:
+            result = score_job(resume_text, job)
         result["url"] = job["url"]
         completed += 1
-
         if result["score"] == 0:
             errors += 1
-
         results.append(result)
-
         log.info(
-            "[%d/%d] score=%d  %s",
+            "[%d/%d] score=%d  %s%s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
+            " [EXCLUDED]" if exclusion else "",
         )
 
     # Write scores to DB
     now = datetime.now(timezone.utc).isoformat()
     for r in results:
         conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?,"
+            " exclusion_reason_code = ?, exclusion_rule_id = ?, excluded_at = ?"
+            " WHERE url = ?",
+            (
+                r["score"],
+                f"{r['keywords']}\n{r['reasoning']}",
+                now,
+                r.get("exclusion_reason_code"),
+                r.get("exclusion_rule_id"),
+                now if r.get("exclusion_reason_code") else None,
+                r["url"],
+            ),
         )
     conn.commit()
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    log.info("Done: %d scored (%d excluded) in %.1fs (%.1f jobs/sec)", len(results), excluded_count, elapsed, len(results) / elapsed if elapsed > 0 else 0)
 
     # Score distribution
     dist = conn.execute("""
@@ -177,4 +306,5 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
         "errors": errors,
         "elapsed": elapsed,
         "distribution": distribution,
+        "excluded": excluded_count,
     }

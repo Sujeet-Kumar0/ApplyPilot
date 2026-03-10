@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Rich live dashboard for the apply pipeline.
 
 Displays real-time worker status, job progress, and recent events
@@ -7,7 +9,7 @@ in a terminal dashboard using the Rich library.
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 

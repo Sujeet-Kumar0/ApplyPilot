@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -23,6 +25,8 @@ app = typer.Typer(
     help="AI-powered end-to-end job application pipeline.",
     no_args_is_help=True,
 )
+from applypilot.cli_greenhouse import app as greenhouse_app
+app.add_typer(greenhouse_app, name="greenhouse")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -73,6 +77,57 @@ def _resolve_auto_apply_settings(agent: Optional[str], agent_model: Optional[str
 
     effective_model = agent_model.strip() if agent_model and agent_model.strip() else selection.model
     return selection.resolved, effective_model
+
+
+def _resolve_backend_option(
+    agent: Optional[str],
+    backend: Optional[str],
+    agent_model: Optional[str],
+) -> tuple[str, str | None]:
+    """Resolve canonical backend selection, allowing --backend as a strict alias."""
+
+    if agent and backend and agent.strip().lower() != backend.strip().lower():
+        console.print("[red]--agent and --backend must match when both are provided.[/red]")
+        raise typer.Exit(code=1)
+    requested_agent = agent if agent is not None else backend
+    return _resolve_auto_apply_settings(requested_agent, agent_model)
+
+
+def _load_job_for_analysis(url: Optional[str], job_id: Optional[int]) -> dict:
+    """Load a job from the database for the analyze command."""
+
+    from applypilot.database import get_connection
+
+    conn = get_connection()
+    if job_id is not None:
+        row = conn.execute(
+            """
+            SELECT url, title, site, application_url, full_description
+            FROM jobs
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+    elif url is not None:
+        like = f"%{url.split('?')[0].rstrip('/')}%"
+        row = conn.execute(
+            """
+            SELECT url, title, site, application_url, full_description
+            FROM jobs
+            WHERE url = ? OR application_url = ? OR url LIKE ? OR application_url LIKE ?
+            LIMIT 1
+            """,
+            (url, url, like, like),
+        ).fetchone()
+    else:
+        raise typer.Exit(code=1)
+
+    if row is None:
+        target = f"id={job_id}" if job_id is not None else url
+        console.print(f"[red]No matching job found:[/red] {target}")
+        raise typer.Exit(code=1)
+    return dict(row)
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +228,27 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Auto-apply agent: auto, codex, or claude."),
+    agent: Optional[str] = typer.Option(
+        None,
+        "--agent",
+        help="Auto-apply backend: auto, codex, claude, or opencode.",
+    ),
+    backend: Optional[str] = typer.Option(
+        None,
+        "--backend",
+        help="Compatibility alias for --agent. Must match --agent if both are provided.",
+    ),
     agent_model: Optional[str] = typer.Option(
         None,
         "--agent-model",
         "--model",
         "-m",
         help="Browser agent model override. '--model' is kept as a deprecated alias.",
+    ),
+    opencode_agent: Optional[str] = typer.Option(
+        None,
+        "--opencode-agent",
+        help="OpenCode sub-agent override. Only applies when --agent opencode is selected.",
     ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
@@ -221,7 +290,7 @@ def apply(
 
     # Check 1: Tier 3 required (browser agent CLI + Chrome + Node.js)
     check_tier(3, "auto-apply")
-    resolved_agent, resolved_model = _resolve_auto_apply_settings(agent, agent_model)
+    resolved_agent, resolved_model = _resolve_backend_option(agent, backend, agent_model)
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -251,7 +320,7 @@ def apply(
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score)
+        prompt_file = gen_prompt(target, min_score=min_score, model=resolved_model)
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
@@ -269,6 +338,8 @@ def apply(
     console.print(f"  Workers:  {workers}")
     console.print(f"  Agent:    {resolved_agent}")
     console.print(f"  Model:    {resolved_model or '(default)'}")
+    if opencode_agent:
+        console.print(f"  OpenCode: {opencode_agent}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -282,10 +353,78 @@ def apply(
         headless=headless,
         agent=resolved_agent,
         model=resolved_model,
+        opencode_agent=opencode_agent,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
     )
+
+
+@app.command()
+def analyze(
+    url: Optional[str] = typer.Option(None, "--url", help="Analyze a job already stored in the database by URL."),
+    job_id: Optional[int] = typer.Option(None, "--job-id", help="Analyze a job already stored in the database by row id."),
+    text_file: Optional[Path] = typer.Option(None, "--text-file", help="Analyze a job description from a local text file."),
+    resume_file: Optional[Path] = typer.Option(None, "--resume-file", help="Override the resume text used for match analysis."),
+) -> None:
+    """Analyze a job description and optional resume match."""
+    _bootstrap()
+
+    provided_sources = sum(1 for value in (url, job_id, text_file) if value is not None)
+    if provided_sources != 1:
+        console.print("[red]Provide exactly one of --url, --job-id, or --text-file.[/red]")
+        raise typer.Exit(code=1)
+
+    if text_file is not None:
+        if not text_file.exists():
+            console.print(f"[red]File not found:[/red] {text_file}")
+            raise typer.Exit(code=1)
+        job = {
+            "title": text_file.stem.replace("_", " "),
+            "company": "Unknown",
+            "description": text_file.read_text(encoding="utf-8"),
+        }
+    else:
+        row = _load_job_for_analysis(url, job_id)
+        description = row.get("full_description") or ""
+        if not description.strip():
+            console.print("[red]Job has no full_description yet. Run `applypilot run enrich` first.[/red]")
+            raise typer.Exit(code=1)
+        job = {
+            "title": row.get("title") or "Unknown",
+            "company": row.get("site") or "Unknown",
+            "description": description,
+        }
+
+    from applypilot.intelligence.jd_parser import JobDescriptionParser
+    from applypilot.intelligence.resume_matcher import ResumeMatcher
+
+    parser = JobDescriptionParser()
+    job_intel = parser.parse(job)
+    analysis_output = {
+        "title": job_intel.title,
+        "company": job_intel.company,
+        "seniority": job_intel.seniority.value,
+        "requirements": [req.__dict__ for req in job_intel.requirements],
+        "skills": [skill.__dict__ for skill in job_intel.skills],
+        "key_responsibilities": job_intel.key_responsibilities,
+        "red_flags": job_intel.red_flags,
+        "company_context": job_intel.company_context,
+    }
+
+    resume_path = resume_file or config.RESUME_PATH
+    if resume_path.exists():
+        matcher = ResumeMatcher()
+        match = matcher.analyze(resume_path.read_text(encoding="utf-8"), job_intel)
+        analysis_output["match"] = {
+            "overall_score": match.overall_score,
+            "strengths": match.strengths,
+            "gaps": [gap.__dict__ for gap in match.gaps],
+            "recommendations": match.recommendations,
+            "bullet_priorities": match.bullet_priorities,
+        }
+
+    console.print_json(json.dumps(analysis_output))
 
 
 @app.command()
@@ -446,6 +585,13 @@ def doctor() -> None:
     else:
         results.append(("Claude Code CLI", "[dim]optional[/dim]", claude_status.note))
 
+    opencode_status = agent_statuses.get("opencode")
+    if opencode_status:
+        if opencode_status.binary_path:
+            results.append(("OpenCode CLI", ok_mark if opencode_status.available else warn_mark, opencode_status.note))
+        else:
+            results.append(("OpenCode CLI", "[dim]optional[/dim]", opencode_status.note))
+
     # Chrome
     try:
         chrome_path = get_chrome_path()
@@ -490,12 +636,12 @@ def doctor() -> None:
         console.print("[dim]  -> Tier 2 unlocks: scoring, tailoring, cover letters (needs an LLM provider)[/dim]")
         console.print(
             "[dim]  -> Tier 3 unlocks: auto-apply "
-            "(needs Codex logged in or Claude installed, plus Chrome + Node.js)[/dim]"
+            "(needs Codex logged in, Claude installed, or OpenCode MCP-ready, plus Chrome + Node.js)[/dim]"
         )
     elif tier == 2:
         console.print(
             "[dim]  -> Tier 3 unlocks: auto-apply "
-            "(needs Codex logged in or Claude installed, plus Chrome + Node.js)[/dim]"
+            "(needs Codex logged in, Claude installed, or OpenCode MCP-ready, plus Chrome + Node.js)[/dim]"
         )
 
     console.print()

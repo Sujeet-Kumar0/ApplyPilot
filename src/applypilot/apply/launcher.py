@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Apply orchestration: acquire jobs, spawn browser-agent sessions, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
@@ -6,7 +8,9 @@ result, and updates the database. Supports parallel workers via --workers.
 """
 
 import atexit
+import json
 import logging
+import os
 import platform
 import re
 import signal
@@ -45,6 +49,45 @@ def _load_blocked():
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
 
+
+def pre_navigate_to_job(job: dict, port: int, worker_id: int) -> bool:
+    """Preload the target job URL in Chrome before starting OpenCode."""
+
+    try:
+        import requests
+        import urllib.parse
+
+        job_url = job.get("application_url") or job["url"]
+        add_event(f"[W{worker_id}] Pre-navigating to {job_url[:50]}...")
+        base_url = f"http://localhost:{port}"
+
+        try:
+            list_resp = requests.get(f"{base_url}/json/list", timeout=5)
+            if list_resp.status_code == 200:
+                for target in list_resp.json():
+                    target_id = target.get("id")
+                    if target_id and target.get("type") == "page":
+                        try:
+                            requests.get(f"{base_url}/json/close/{target_id}", timeout=5)
+                        except Exception:
+                            pass
+        except Exception as exc:
+            add_event(f"[W{worker_id}] Warning: Could not close existing tabs: {str(exc)[:30]}")
+
+        encoded_url = urllib.parse.quote(job_url, safe="")
+        response = requests.get(f"{base_url}/json/new?{encoded_url}", timeout=10)
+        if response.status_code != 200:
+            add_event(f"[W{worker_id}] Pre-navigation failed: HTTP {response.status_code}")
+            return False
+
+        time.sleep(3)
+        add_event(f"[W{worker_id}] Pre-navigation complete")
+        return True
+    except Exception as exc:
+        logger.debug("Pre-navigation failed for worker %d: %s", worker_id, exc)
+        add_event(f"[W{worker_id}] Pre-navigation failed: {str(exc)[:30]}")
+        return False
+
 # How often to poll the DB when the queue is empty (seconds)
 POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 
@@ -80,6 +123,27 @@ def _kill_active_agent_processes() -> None:
         for proc in list(_agent_procs.values()):
             if proc.poll() is None:
                 _kill_process_tree(proc.pid)
+
+
+def _make_mcp_config(cdp_port: int) -> dict:
+    """Build the per-worker MCP config used for manual debug generation."""
+
+    return {
+        "mcpServers": {
+            "playwright": {
+                "command": "npx",
+                "args": [
+                    "@playwright/mcp@latest",
+                    f"--cdp-endpoint=http://localhost:{cdp_port}",
+                    f"--viewport-size={config.DEFAULTS['viewport']}",
+                ],
+            },
+            "gmail": {
+                "command": "npx",
+                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
+            },
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +273,12 @@ def release_lock(url: str) -> None:
 # Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
 
-def gen_prompt(target_url: str, min_score: int = 7,
-               worker_id: int = 0) -> Path | None:
+def gen_prompt(
+    target_url: str,
+    min_score: int = 7,
+    model: str | None = None,
+    worker_id: int = 0,
+) -> Path | None:
     """Generate a prompt file for manual debugging.
 
     Returns:
@@ -237,6 +305,9 @@ def gen_prompt(target_url: str, min_score: int = 7,
     site_slug = (job.get("site") or "unknown")[:20].replace(" ", "_")
     prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{job['title'][:30].replace(' ', '_')}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
+    mcp_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
+    mcp_path.write_text(json.dumps(_make_mcp_config(BASE_CDP_PORT + worker_id)), encoding="utf-8")
+    del model
 
     return prompt_file
 
@@ -294,6 +365,7 @@ def run_job(
     worker_id: int = 0,
     agent: str = "claude",
     model: str | None = None,
+    opencode_agent: str | None = None,
     dry_run: bool = False,
 ) -> tuple[str, int]:
     """Spawn a browser-agent session for one job application.
@@ -324,15 +396,26 @@ def run_job(
 
     try:
         backend = get_backend(agent)
-        execution = backend.run(
-            job=job,
-            port=port,
-            worker_id=worker_id,
-            prompt=agent_prompt,
-            model=model,
-            register_process=_register_agent_process,
-            unregister_process=_unregister_agent_process,
-        )
+        original_opencode_agent = None
+        if backend.name == "opencode" and opencode_agent is not None:
+            original_opencode_agent = os.environ.get("APPLY_OPENCODE_AGENT")
+            os.environ["APPLY_OPENCODE_AGENT"] = opencode_agent
+        try:
+            execution = backend.run(
+                job=job,
+                port=port,
+                worker_id=worker_id,
+                prompt=agent_prompt,
+                model=model,
+                register_process=_register_agent_process,
+                unregister_process=_unregister_agent_process,
+            )
+        finally:
+            if backend.name == "opencode" and opencode_agent is not None:
+                if original_opencode_agent is None:
+                    os.environ.pop("APPLY_OPENCODE_AGENT", None)
+                else:
+                    os.environ["APPLY_OPENCODE_AGENT"] = original_opencode_agent
         if execution.skipped:
             return "skipped", execution.duration_ms
 
@@ -422,6 +505,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
                 agent: str = "claude", model: str | None = None,
+                opencode_agent: str | None = None,
                 dry_run: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
@@ -476,12 +560,16 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
+            if agent == "opencode":
+                pre_navigate_to_job(job, port=port, worker_id=worker_id)
+
             result, duration_ms = run_job(
                 job,
                 port=port,
                 worker_id=worker_id,
                 agent=agent,
                 model=model,
+                opencode_agent=opencode_agent,
                 dry_run=dry_run,
             )
 
@@ -533,7 +621,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, agent: str = "claude",
-         model: str | None = None,
+         model: str | None = None, opencode_agent: str | None = None,
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1) -> None:
     """Launch the apply pipeline.
@@ -571,6 +659,11 @@ def main(limit: int = 1, target_url: str | None = None,
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
     console.print(
         f"Launching apply pipeline ({mode_label}, {worker_label}, agent={agent}, poll every {POLL_INTERVAL}s)..."
+    )
+    console.print(
+        f"[dim]Agent: {agent} | Model: {model or '(default)'}"
+        + (f" | OpenCode sub-agent: {opencode_agent}" if opencode_agent else "")
+        + "[/dim]"
     )
     console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
@@ -615,6 +708,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     agent=agent,
                     model=model,
+                    opencode_agent=opencode_agent,
                     dry_run=dry_run,
                 )
             else:
@@ -639,6 +733,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             agent=agent,
                             model=model,
+                            opencode_agent=opencode_agent,
                             dry_run=dry_run,
                         ): i
                         for i in range(workers)
