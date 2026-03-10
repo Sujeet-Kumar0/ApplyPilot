@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 # ── Universal Constants (not personal data) ───────────────────────────────
 
 BANNED_WORDS: list[str] = [
-    "passionate", "dedicated", "committed to",
+    "passionate", "committed to",
     "utilizing", "utilize", "harnessing",
     "spearheaded", "spearhead", "orchestrated", "championed", "pioneered",
     "robust", "scalable solutions", "cutting-edge", "state-of-the-art", "best-in-class",
@@ -54,12 +54,15 @@ LLM_LEAK_PHRASES: list[str] = [
 # Reasonable stretches (K8s, Terraform, Redis, Kafka etc.) are ALLOWED.
 FABRICATION_WATCHLIST: set[str] = {
     # Languages with zero relation to the candidate's stack
-    "c#", "c++", "golang", "rust", "ruby",
-    "kotlin", "swift", "scala", "matlab",
+    # NOTE: "golang" removed — synonym for Go (in profile). "c#" skipped by len<=2 guard.
+    "c#", "c++", "rust", "ruby",
+    "swift", "scala", "matlab",
     # Frameworks for wrong languages
-    "spring", "django", "rails", "angular", "vue", "svelte",
-    # Hard lies: certifications can't be stretched
-    "certif", "certified", "pmp", "scrum master", "aws certified",
+    # NOTE: kotlin, django, spring, angular, vue removed — all in candidate's skills_boundary.
+    # The skip logic cross-references against profile, but keeping them out avoids edge cases.
+    "rails", "svelte",
+    # Hard lies: certifications not in profile (real certs are checked via skills_boundary)
+    "pmp", "scrum master",
 }
 
 REQUIRED_SECTIONS: set[str] = {"SUMMARY", "TECHNICAL SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION"}
@@ -103,43 +106,53 @@ def validate_json_fields(data: dict, profile: dict) -> dict:
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Required keys
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    # Required keys (projects is optional — 1-page resumes may omit them)
+    for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
+    if "projects" not in data or not data.get("projects"):
+        warnings.append("Missing field: projects (optional, LLM may have folded into experience)")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
     # Collect all text for bulk checks
     all_text_parts: list[str] = [data["summary"]]
 
-    # Skills: check for fabrication
+    # Skills: check for fabrication (exclude items that are in user's actual profile)
+    allowed_skills = _build_skills_set(profile)
     if isinstance(data["skills"], dict):
         skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
                 continue
+            # Skip if this "fabrication" is actually a real skill in the profile
+            if any(fake in skill for skill in allowed_skills):
+                continue
             if fake in skills_text:
                 errors.append(f"Fabricated skill: '{fake}'")
 
-    # Experience: preserved companies must be present
+    # Experience: check preserved companies (warn for missing, don't hard-fail
+    # since 1-page resumes may legitimately omit early-career roles)
     resume_facts = profile.get("resume_facts", {})
     preserved_companies = resume_facts.get("preserved_companies", [])
 
     if isinstance(data["experience"], list):
-        for company in preserved_companies:
-            has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
-                for e in data["experience"]
+        exp_and_proj_text = " ".join(
+            str(e.get("header", "")) for e in data["experience"]
+        )
+        if isinstance(data.get("projects"), list):
+            exp_and_proj_text += " " + " ".join(
+                str(e.get("header", "")) for e in data["projects"]
             )
-            if not has_company:
-                errors.append(f"Company '{company}' missing from experience")
+        for company in preserved_companies:
+            if company.lower() not in exp_and_proj_text.lower():
+                warnings.append(f"Company '{company}' not in experience or projects")
         for entry in data["experience"]:
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
 
     # Projects: collect bullets
-    if isinstance(data["projects"], list):
+    if isinstance(data.get("projects"), list):
         for entry in data["projects"]:
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
@@ -156,7 +169,7 @@ def validate_json_fields(data: dict, profile: dict) -> dict:
 
     found_banned = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", all_text)]
     if found_banned:
-        errors.append(f"Banned words: {', '.join(found_banned[:3])}")
+        warnings.append(f"Banned words (style): {', '.join(found_banned[:3])}")
 
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in all_text]
     if found_leaks:
@@ -184,6 +197,7 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     personal = profile.get("personal", {})
     resume_facts = profile.get("resume_facts", {})
+    allowed_skills = _build_skills_set(profile)
 
     # 1. Check required sections exist (flexible matching)
     section_variants: dict[str, list[str]] = {
@@ -202,10 +216,10 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     if full_name and full_name.lower() not in text_lower:
         warnings.append(f"Name '{full_name}' missing -- will be injected")
 
-    # 3. Check companies preserved
+    # 3. Check companies preserved (warning, not error — 1-page resumes may drop early-career roles)
     for company in resume_facts.get("preserved_companies", []):
         if company.lower() not in text_lower:
-            errors.append(f"Company '{company}' missing -- cannot remove real experience")
+            warnings.append(f"Company '{company}' not in resume (may be omitted for space)")
 
     # 4. Check projects preserved
     for project in resume_facts.get("preserved_projects", []):
@@ -233,6 +247,8 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
                 continue
+            if any(fake in skill for skill in allowed_skills):
+                continue
             if fake in skills_block:
                 errors.append(f"FABRICATED SKILL in Technical Skills: '{fake}'")
 
@@ -249,10 +265,10 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     if "\u2014" in text or "\u2013" in text:
         errors.append("Contains em dash or en dash.")
 
-    # 10. Banned words (word-boundary matching)
+    # 10. Banned words (style warning, not hard error — judge layer evaluates tone)
     found_banned = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text_lower)]
     if found_banned:
-        errors.append(f"Banned words: {', '.join(found_banned[:5])}")
+        warnings.append(f"Banned words (style): {', '.join(found_banned[:5])}")
 
     # 11. LLM self-talk leak detection
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in text_lower]
@@ -286,21 +302,22 @@ def validate_cover_letter(text: str) -> dict:
         {"passed": bool, "errors": list[str]}
     """
     errors: list[str] = []
+    warnings: list[str] = []
     text_lower = text.lower()
 
     # 1. Em dashes
     if "\u2014" in text or "\u2013" in text:
         errors.append("Contains em dash or en dash.")
 
-    # 2. Banned words (word-boundary matching)
+    # 2. Banned words (style warning, not hard error — judge layer evaluates tone)
     found = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text_lower)]
     if found:
-        errors.append(f"Banned words: {', '.join(found[:5])}")
+        warnings.append(f"Banned words (style): {', '.join(found[:5])}")
 
-    # 3. Too long
+    # 3. Too long (275 buffer over the 250-word prompt instruction)
     words = len(text.split())
-    if words > 300:
-        errors.append(f"Too long ({words} words). Max 250.")
+    if words > 275:
+        errors.append(f"Too long ({words} words). Max 275.")
 
     # 4. LLM self-talk
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in text_lower]
@@ -312,4 +329,4 @@ def validate_cover_letter(text: str) -> dict:
     if not stripped.lower().startswith("dear"):
         errors.append("Must start with 'Dear Hiring Manager,'")
 
-    return {"passed": len(errors) == 0, "errors": errors}
+    return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

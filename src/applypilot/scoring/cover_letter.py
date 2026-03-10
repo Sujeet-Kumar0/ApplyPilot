@@ -131,7 +131,7 @@ def generate_cover_letter(
 
     avoid_notes: list[str] = []
     letter = ""
-    client = get_client()
+    client = get_client(quality=True)
     cl_prompt_base = _build_cover_letter_prompt(profile)
 
     for attempt in range(max_retries + 1):
@@ -151,7 +151,7 @@ def generate_cover_letter(
             )},
         ]
 
-        letter = client.chat(messages, max_tokens=1024, temperature=0.7)
+        letter = client.chat(messages, max_tokens=8192, temperature=0.7)
         letter = sanitize_text(letter)  # auto-fix em dashes, smart quotes
 
         validation = validate_cover_letter(letter)
@@ -218,10 +218,12 @@ def run_cover_letters(min_score: int = 7, limit: int = 20) -> dict:
         try:
             letter = generate_cover_letter(resume_text, job, profile)
 
-            # Build safe filename prefix
+            # Build safe filename prefix (include URL hash to avoid collisions)
+            import hashlib
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            url_hash = hashlib.md5(job["url"].encode()).hexdigest()[:8]
+            prefix = f"{safe_site}_{safe_title}_{url_hash}"
 
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")

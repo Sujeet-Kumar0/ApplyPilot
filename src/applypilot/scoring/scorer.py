@@ -20,25 +20,31 @@ log = logging.getLogger(__name__)
 
 # ── Scoring Prompt ────────────────────────────────────────────────────────
 
-SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+SCORE_PROMPT_TEMPLATE = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+
+THE CANDIDATE: {candidate_summary}
 
 SCORING CRITERIA:
-- 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
-- 7-8: Strong match. Candidate has most required skills, minor gaps easily bridged.
-- 5-6: Moderate match. Candidate has some relevant skills but missing key requirements.
-- 3-4: Weak match. Significant skill gaps, would need substantial ramp-up.
-- 1-2: Poor match. Completely different field or experience level.
+- 10: Near-perfect IC engineering match. The role is a software/platform/infrastructure engineer position requiring the candidate's exact stack (Go/Kotlin/Python/Java, distributed systems, K8s). Seniority aligns (Senior/Staff/Principal). The candidate would be a top-tier applicant with minimal gaps.
+- 9: Excellent engineering match. Strong alignment on tech stack and seniority, with 1-2 gaps in secondary skills or slightly different domain.
+- 7-8: Good engineering match. Candidate has most required technical skills. Minor gaps in specific frameworks or domain experience, easily bridged.
+- 5-6: Moderate match. The role is engineering but uses a different primary stack, or there's a seniority mismatch (e.g., junior role or executive-only role with no IC component).
+- 3-4: Weak match. Engineering role but wrong specialization (frontend-only, mobile, ML research, data science), or a non-engineering role with some technical overlap.
+- 1-2: Poor match. Non-engineering role (recruiting, design, marketing, product management, sales) or completely different field.
 
-IMPORTANT FACTORS:
-- Weight technical skills heavily (programming languages, frameworks, tools)
-- Consider transferable experience (automation, scripting, API work)
-- Factor in the candidate's project experience
-- Be realistic about experience level vs. job requirements (years of experience, seniority)
+CRITICAL RULES:
+- Non-engineering roles (recruiters, designers, PMs, marketing, sales, executive search) score 1-2 MAX regardless of seniority or domain.
+- Roles requiring a specific language the candidate doesn't know (Rust, C++, Ruby, Scala, Clojure) as the PRIMARY requirement score 4-6 max depending on transferability.
+- "CTO" or "VP Engineering" roles that are purely management with no IC engineering component score 5-6 max.
+- Remote roles are neutral (no bonus or penalty).
+- Distinguish REQUIRED skills from NICE-TO-HAVE. Only penalize for missing required skills.
+- Value transferable experience: workflow orchestration, distributed systems, microservices, developer platforms transfer across domains.
 
-RESPOND IN EXACTLY THIS FORMAT (no other text):
+You MUST include all three lines below. Do not skip REASONING.
+
 SCORE: [1-10]
 KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
-REASONING: [2-3 sentences explaining the score]"""
+REASONING: [2-3 sentences explaining the score, what matched well, and any gaps]"""
 
 
 def _parse_score_response(response: str) -> dict:
@@ -70,16 +76,49 @@ def _parse_score_response(response: str) -> dict:
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 
-def score_job(resume_text: str, job: dict) -> dict:
+def _build_candidate_summary(profile: dict) -> str:
+    """Build a candidate summary string from profile for the scoring prompt."""
+    exp = profile.get("experience", {})
+    boundary = profile.get("skills_boundary", {})
+
+    years = exp.get("years_of_experience_total", "several")
+    target = exp.get("target_role", "Software Engineer")
+    current_title = exp.get("current_job_title", "Software Engineer")
+
+    # Collect primary languages/skills from boundary
+    languages = boundary.get("languages", [])
+    platforms = boundary.get("platforms", [])
+    frameworks = boundary.get("frameworks", [])
+
+    parts = [f"{current_title} with {years} years experience."]
+    if languages:
+        parts.append(f"Primary stack: {', '.join(languages[:8])}.")
+    if platforms:
+        parts.append(f"Platforms: {', '.join(platforms[:6])}.")
+    if frameworks:
+        parts.append(f"Frameworks: {', '.join(frameworks[:6])}.")
+    parts.append(f"Targets: {target}.")
+
+    return " ".join(parts)
+
+
+def score_job(resume_text: str, job: dict, profile: dict | None = None) -> dict:
     """Score a single job against the resume.
 
     Args:
         resume_text: The candidate's full resume text.
         job: Job dict with keys: title, site, location, full_description.
+        profile: User profile dict. Loaded from config if not provided.
 
     Returns:
         {"score": int, "keywords": str, "reasoning": str}
     """
+    if profile is None:
+        profile = load_profile()
+
+    candidate_summary = _build_candidate_summary(profile)
+    score_prompt = SCORE_PROMPT_TEMPLATE.format(candidate_summary=candidate_summary)
+
     job_text = (
         f"TITLE: {job['title']}\n"
         f"COMPANY: {job['site']}\n"
@@ -88,13 +127,13 @@ def score_job(resume_text: str, job: dict) -> dict:
     )
 
     messages = [
-        {"role": "system", "content": SCORE_PROMPT},
+        {"role": "system", "content": score_prompt},
         {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
     ]
 
     try:
         client = get_client()
-        response = client.chat(messages, max_tokens=512, temperature=0.2)
+        response = client.chat(messages, max_tokens=8192, temperature=0.2)
         return _parse_score_response(response)
     except Exception as e:
         log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
@@ -111,6 +150,7 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     Returns:
         {"scored": int, "errors": int, "elapsed": float, "distribution": list}
     """
+    profile = load_profile()
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
@@ -135,31 +175,45 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     t0 = time.time()
     completed = 0
     errors = 0
-    results: list[dict] = []
+    batch_size = 25  # Commit every N jobs so downstream stages see results sooner
+    batch: list[dict] = []
 
     for job in jobs:
-        result = score_job(resume_text, job)
+        result = score_job(resume_text, job, profile=profile)
         result["url"] = job["url"]
         completed += 1
 
         if result["score"] == 0:
             errors += 1
 
-        results.append(result)
+        batch.append(result)
 
         log.info(
             "[%d/%d] score=%d  %s",
             completed, len(jobs), result["score"], job.get("title", "?")[:60],
         )
 
-    # Write scores to DB
-    now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        conn.execute(
-            "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
-            (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
-        )
-    conn.commit()
+        # Flush batch to DB periodically
+        if len(batch) >= batch_size:
+            now = datetime.now(timezone.utc).isoformat()
+            for r in batch:
+                conn.execute(
+                    "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                    (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+                )
+            conn.commit()
+            log.info("Committed batch of %d scores to DB (%d/%d total)", len(batch), completed, len(jobs))
+            batch = []
+
+    # Flush remaining
+    if batch:
+        now = datetime.now(timezone.utc).isoformat()
+        for r in batch:
+            conn.execute(
+                "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ? WHERE url = ?",
+                (r["score"], f"{r['keywords']}\n{r['reasoning']}", now, r["url"]),
+            )
+        conn.commit()
 
     elapsed = time.time() - t0
     log.info("Done: %d scored in %.1fs (%.1f jobs/sec)", len(results), elapsed, len(results) / elapsed if elapsed > 0 else 0)

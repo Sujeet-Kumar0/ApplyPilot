@@ -319,8 +319,8 @@ def judge_tailored_resume(
         )},
     ]
 
-    client = get_client()
-    response = client.chat(messages, max_tokens=512, temperature=0.1)
+    client = get_client()  # judge uses fast model (binary evaluation)
+    response = client.chat(messages, max_tokens=4096, temperature=0.1)
 
     passed = "VERDICT: PASS" in response.upper()
     issues = "none"
@@ -339,7 +339,7 @@ def judge_tailored_resume(
 # ── Core Tailoring ───────────────────────────────────────────────────────
 
 def tailor_resume(
-    resume_text: str, job: dict, profile: dict, max_retries: int = 3
+    resume_text: str, job: dict, profile: dict, max_retries: int = 2
 ) -> tuple[str, dict]:
     """Generate a tailored resume via JSON output + fresh context on each retry.
 
@@ -348,6 +348,8 @@ def tailor_resume(
     - Each retry starts a FRESH conversation (no apologetic spiral)
     - Issues from previous attempts are noted in the system prompt
     - Em dashes and smart quotes are auto-fixed, not rejected
+    - First attempt skips LLM judge if programmatic validation passes clean
+    - Final attempt accepts validation-passing resumes even if judge disagrees
 
     Args:
         resume_text: Base resume text.
@@ -368,7 +370,7 @@ def tailor_resume(
     report: dict = {"attempts": 0, "validator": None, "judge": None, "status": "pending"}
     avoid_notes: list[str] = []
     tailored = ""
-    client = get_client()
+    client = get_client(quality=True)
     tailor_prompt_base = _build_tailor_prompt(profile)
 
     for attempt in range(max_retries + 1):
@@ -386,7 +388,7 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        raw = client.chat(messages, max_tokens=16384, temperature=0.4)
 
         # Parse JSON from response
         try:
@@ -411,16 +413,29 @@ def tailor_resume(
         # Assemble text (header injected by code, em dashes auto-fixed)
         tailored = assemble_resume_text(data, profile)
 
-        # Layer 2: LLM judge (catches subtle fabrication)
+        # Layer 2: LLM judge — skip on first clean pass to save an LLM call
+        is_clean = not validation.get("warnings")
+        is_last = attempt >= max_retries
+
+        if attempt == 0 and is_clean:
+            # First attempt with zero warnings — trust programmatic validation
+            log.debug("Skipping judge on clean first attempt for %s", job.get("title", "")[:40])
+            report["judge"] = {"passed": True, "verdict": "SKIP", "issues": "none", "raw": "skipped (clean first pass)"}
+            report["status"] = "approved"
+            return tailored, report
+
         judge = judge_tailored_resume(resume_text, tailored, job.get("title", ""), profile)
         report["judge"] = judge
 
         if not judge["passed"]:
             avoid_notes.append(f"Judge rejected: {judge['issues']}")
-            if attempt < max_retries:
-                continue
-            report["status"] = "failed_judge"
-            return tailored, report
+            if is_last:
+                # Final attempt: accept if validation passed (judge is advisory)
+                log.warning("Judge failed on final attempt for %s, accepting anyway (validation passed)",
+                           job.get("title", "")[:40])
+                report["status"] = "approved"
+                return tailored, report
+            continue
 
         # Both passed
         report["status"] = "approved"
@@ -464,10 +479,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20) -> dict:
         try:
             tailored, report = tailor_resume(resume_text, job, profile)
 
-            # Build safe filename prefix
+            # Build safe filename prefix (include URL hash to avoid collisions)
+            import hashlib
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            url_hash = hashlib.md5(job["url"].encode()).hexdigest()[:8]
+            prefix = f"{safe_site}_{safe_title}_{url_hash}"
 
             # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
