@@ -147,6 +147,173 @@ def _process_classified_email(
             }, conn)
 
 
+def remap_stubs(conn=None) -> dict:
+    """Re-match emails under multi-company stubs to correct per-company stubs/jobs.
+
+    Identifies stub jobs where multiple distinct companies' emails were collapsed
+    together (e.g., 11 emails for 11 different companies all under one Greenhouse
+    stub). For each such stub:
+      1. Re-runs match_email_to_job() with the improved matcher against all applied jobs
+      2. If a pipeline match is found: moves the email to that job
+      3. If still unmatched: creates a proper per-company stub via create_stub_job()
+      4. Deletes stub jobs that have zero emails remaining
+
+    Returns:
+        {remapped: int, new_stubs: int, deleted_stubs: int}
+    """
+    from applypilot.tracking.matcher import match_email_to_job, extract_company_from_subject
+    from applypilot.database import (
+        get_applied_jobs,
+        create_stub_job,
+        update_tracking_status,
+        update_job_tracking_fields,
+    )
+
+    if conn is None:
+        conn = get_connection()
+
+    applied_jobs = get_applied_jobs(conn)
+
+    # Find all stub job_urls that have more than one email
+    stub_rows = conn.execute("""
+        SELECT job_url, COUNT(*) AS email_count
+        FROM tracking_emails
+        WHERE job_url LIKE 'manual://%'
+        GROUP BY job_url
+        HAVING COUNT(*) > 1
+    """).fetchall()
+
+    if not stub_rows:
+        console.print("[dim]No multi-email stubs found to remap.[/dim]")
+        return {"remapped": 0, "new_stubs": 0, "deleted_stubs": 0}
+
+    console.print(f"  Found {len(stub_rows)} multi-email stubs to inspect")
+
+    remapped = 0
+    new_stubs = 0
+    affected_job_urls: set[str] = set()
+
+    for stub_row in stub_rows:
+        stub_url = stub_row["job_url"]
+
+        # Fetch all emails under this stub
+        emails = conn.execute("""
+            SELECT email_id, sender, sender_name, subject, snippet,
+                   received_at, classification, body_text
+            FROM tracking_emails WHERE job_url = ?
+        """, (stub_url,)).fetchall()
+
+        # Check how many distinct companies are mentioned across subjects
+        companies = set()
+        for e in emails:
+            c = extract_company_from_subject(e["subject"] or "")
+            if c:
+                companies.add(c.lower())
+
+        if len(companies) <= 1:
+            # All emails plausibly about the same company — leave as-is
+            continue
+
+        console.print(f"  Remapping stub {stub_url[:60]} ({len(emails)} emails, "
+                      f"{len(companies)} companies: {', '.join(sorted(companies)[:5])})")
+
+        # Exclude the current stub so emails can't just re-match back to it
+        jobs_without_stub = [j for j in applied_jobs if j["url"] != stub_url]
+
+        for email_row in emails:
+            email_dict = {
+                "id": email_row["email_id"],
+                "sender": email_row["sender"] or "",
+                "sender_name": email_row["sender_name"] or "",
+                "subject": email_row["subject"] or "",
+                "snippet": email_row["snippet"] or "",
+                "date": email_row["received_at"] or "",
+                "body": email_row["body_text"] or "",
+            }
+            classification = email_row["classification"] or "confirmation"
+
+            # Try improved matcher (excluding the current stub)
+            match = match_email_to_job(email_dict, jobs_without_stub)
+            if match:
+                new_url = match["job_url"]
+                log.info("  remap: %s -> pipeline job %s (score=%d)",
+                         email_row["email_id"], new_url[:50], match["score"])
+            else:
+                # Create a proper per-company stub
+                new_url = create_stub_job(email_dict, classification, conn)
+                if new_url != stub_url:
+                    new_stubs += 1
+                    log.info("  remap: %s -> new stub %s",
+                             email_row["email_id"], new_url[:50])
+
+            if new_url != stub_url:
+                conn.execute(
+                    "UPDATE tracking_emails SET job_url = ? WHERE email_id = ?",
+                    (new_url, email_row["email_id"]),
+                )
+                affected_job_urls.add(new_url)
+                remapped += 1
+
+        conn.commit()
+
+    # Re-compute tracking_status for all affected jobs
+    for job_url in affected_job_urls:
+        rows = conn.execute(
+            "SELECT classification FROM tracking_emails WHERE job_url = ? "
+            "ORDER BY received_at DESC",
+            (job_url,),
+        ).fetchall()
+        for row in rows:
+            if row["classification"]:
+                update_tracking_status(job_url, row["classification"], conn)
+
+    # Delete stub jobs that now have zero emails
+    orphans = conn.execute("""
+        SELECT url FROM jobs
+        WHERE url LIKE 'manual://%'
+          AND url NOT IN (SELECT DISTINCT job_url FROM tracking_emails)
+    """).fetchall()
+    deleted_stubs = 0
+    for orphan in orphans:
+        conn.execute("DELETE FROM jobs WHERE url = ?", (orphan["url"],))
+        deleted_stubs += 1
+    if deleted_stubs:
+        conn.commit()
+
+    console.print(f"  Remapped {remapped} emails to correct jobs/stubs")
+    console.print(f"  Created {new_stubs} new per-company stubs")
+    console.print(f"  Deleted {deleted_stubs} empty stub jobs")
+    return {"remapped": remapped, "new_stubs": new_stubs, "deleted_stubs": deleted_stubs}
+
+
+def relabel_all_tracked(conn=None) -> int:
+    """Apply 'ap-track' Gmail label to all emails stored in tracking_emails.
+
+    Used for one-time backfills and to catch emails tracked before the label
+    feature existed. Safe to run repeatedly — Gmail ignores duplicate label adds.
+
+    Returns:
+        Count of emails submitted for labeling.
+    """
+    import asyncio
+    from applypilot.tracking.gmail_client import apply_label_to_emails
+
+    if conn is None:
+        conn = get_connection()
+
+    rows = conn.execute("SELECT email_id FROM tracking_emails").fetchall()
+    email_ids = [r["email_id"] for r in rows]
+
+    if not email_ids:
+        console.print("[dim]No tracked emails found in DB.[/dim]")
+        return 0
+
+    console.print(f"  Applying 'ap-track' to {len(email_ids)} tracked emails...")
+    count = asyncio.run(apply_label_to_emails(email_ids))
+    console.print(f"  [green]Labeled {count} emails.[/green]")
+    return count
+
+
 def run_tracking(
     days: int = 14,
     ghosted_days: int = 7,
@@ -162,9 +329,10 @@ def run_tracking(
       4. Read bodies only for LLM-needed emails
       5. LLM classify ambiguous/interview/offer emails
       6. Match all classified emails to jobs and store
-      7. Detect ghosting
-      8. Generate markdown docs
-      9. Print summary with triage stats
+      7. Apply 'ap-track' Gmail label to non-noise emails
+      8. Detect ghosting
+      9. Generate markdown docs
+      10. Print summary with triage stats
 
     Returns:
         Dict with counts: {fetched, matched, classified, ghosted, errors, triage_savings_pct}
@@ -266,12 +434,24 @@ def run_tracking(
 
             _process_classified_email(email, result, applied_jobs, dry_run, conn, counters)
 
-    # 7. Detect ghosting
+    # 7. Apply 'ap-track' Gmail label to non-noise emails
+    if not dry_run:
+        from applypilot.tracking.gmail_client import apply_label_to_emails
+        labeled_ids = [
+            email["id"] for email, triage in triage_results
+            if triage.classification != "noise"
+        ]
+        if labeled_ids:
+            labeled_count = asyncio.run(apply_label_to_emails(labeled_ids))
+            if labeled_count:
+                console.print(f"  Labeled {labeled_count} emails with 'ap-track'")
+
+    # 8. Detect ghosting
     ghosted_count = 0
     if not dry_run:
         ghosted_count = detect_ghosted(applied_jobs, ghosted_days=ghosted_days, conn=conn)
 
-    # 8. Generate markdown docs
+    # 9. Generate markdown docs
     matched_count = counters["matched"]
     if not dry_run:
         doc_count = 0
@@ -286,7 +466,7 @@ def run_tracking(
         if doc_count:
             console.print(f"  Generated {doc_count} tracking documents")
 
-    # 9. Summary
+    # 10. Summary
     console.print(f"\n[bold]Tracking Summary[/bold]")
     console.print(f"  Emails fetched:   {len(emails)}")
     console.print(f"  New emails:       {len(new_emails)}")

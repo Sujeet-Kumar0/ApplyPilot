@@ -37,6 +37,8 @@ from applypilot.apply.chrome import (
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
     BASE_CDP_PORT, HITL_CDP_PORT, HITL_WORKER_ID,
     bring_to_foreground,
+    probe_existing_chrome, _AdoptedChromeProcess,
+    _chrome_procs, _chrome_lock,
 )
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
@@ -62,8 +64,37 @@ _claude_lock = threading.Lock()
 
 # Register cleanup on exit
 atexit.register(cleanup_on_exit)
+
+
+def _kill_all_children() -> None:
+    """Kill all Claude subprocesses and mini-task procs."""
+    with _claude_lock:
+        procs = list(_claude_procs.values())
+        _claude_procs.clear()
+    for p in procs:
+        if p.poll() is None:
+            try:
+                _kill_process_tree(p.pid)
+            except Exception:
+                pass
+    for p in list(_mini_procs.values()):
+        if p.poll() is None:
+            try:
+                _kill_process_tree(p.pid)
+            except Exception:
+                pass
+    _mini_procs.clear()
+
+
+atexit.register(_kill_all_children)
+
 if platform.system() != "Windows":
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    def _sigterm_handler(*_):
+        _stop_event.set()
+        _kill_all_children()
+        kill_all_chrome()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
 # Q&A interactive queue: worker threads post questions, main thread answers
 # Each item: (worker_id, questions_list, answer_event)
@@ -248,6 +279,7 @@ def _run_mini_task(worker_id: int, cdp_port: int, instructions: str) -> subproce
         errors="replace",
         env=env,
         cwd=str(config.APP_DIR),
+        start_new_session=True,
     )
     proc.stdin.write(prompt)
     proc.stdin.close()
@@ -298,6 +330,7 @@ def _start_worker_listener(worker_id: int) -> int:
         "saved_instruction": None,
         "chrome_pid": None,
         "last_focused": 0,
+        "history": [],  # list of completed job summaries for the homepage log
     }
 
     takeover_event = threading.Event()
@@ -321,12 +354,17 @@ def _start_worker_listener(worker_id: int) -> int:
                 self._handle_homepage()
             elif self.path == "/api/status":
                 self._handle_status()
+            elif self.path == "/api/log":
+                self._handle_log()
             elif self.path == "/api/task-stream":
                 self._handle_task_stream()
             elif self.path == "/api/focus":
                 self._handle_focus()
+            elif self.path.startswith("/api/jobs"):
+                self._handle_jobs_list()
             else:
                 self.send_response(404)
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
         def do_POST(self):
@@ -346,8 +384,11 @@ def _start_worker_listener(worker_id: int) -> int:
                 self._handle_done()
             elif self.path == "/api/add-job":
                 self._handle_add_job()
+            elif self.path == "/api/jobs/mark":
+                self._handle_jobs_mark()
             else:
                 self.send_response(404)
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
         def _read_body(self) -> dict:
@@ -377,6 +418,7 @@ def _start_worker_listener(worker_id: int) -> int:
             self.wfile.write(text)
 
         def _handle_homepage(self):
+            import html as _html
             job = state.get("job") or {}
             status = state.get("status", "idle")
             title = job.get("title", "") or "No active job"
@@ -388,13 +430,9 @@ def _start_worker_listener(worker_id: int) -> int:
                 "waiting_human": "#a855f7",
                 "idle": "#6b7280",
             }.get(status, "#eab308")
-            meta_parts = []
-            if company:
-                meta_parts.append(company)
-            if site:
-                meta_parts.append(site)
+            meta_parts = [p for p in [company, site] if p]
             if score:
-                meta_parts.append(f"Score {score}")
+                meta_parts.append(f"Score {score}/10")
             meta_line = " · ".join(meta_parts)
             reason = state.get("reason", "")
             instructions = state.get("instructions", "")
@@ -403,43 +441,103 @@ def _start_worker_listener(worker_id: int) -> int:
                 instructions_block = (
                     f'<div class="instructions">'
                     f'<strong>Instructions:</strong><br>'
-                    f'{instructions.replace(chr(10), "<br>")}'
+                    f'{_html.escape(instructions).replace(chr(10), "<br>")}'
                     f'</div>'
                 )
+
+            # Build activity log rows
+            history = list(reversed(state.get("history", [])))
+            outcome_colors = {
+                "applied":       ("#22c55e", "✓ Applied"),
+                "already_applied": ("#6366f1", "↩ Already applied"),
+                "expired":       ("#6b7280", "⌛ Expired"),
+                "needs_human":   ("#a855f7", "⚑ Needs human"),
+                "failed":        ("#ef4444", "✗ Failed"),
+            }
+            log_rows = ""
+            for h in history:
+                oc = h.get("outcome", "failed")
+                color, label = outcome_colors.get(oc, ("#6b7280", oc))
+                ts_str = datetime.fromtimestamp(h["ts"]).strftime("%H:%M:%S") if h.get("ts") else "–"
+                job_title = _html.escape(h.get("title", "–")[:60])
+                job_co = _html.escape(h.get("company", "")[:30])
+                sc = h.get("score", 0)
+                dur = h.get("duration_s", 0)
+                url = _html.escape(h.get("url", "#"))
+                log_rows += (
+                    f'<tr>'
+                    f'<td style="color:#64748b;font-size:11px">{ts_str}</td>'
+                    f'<td><span style="color:{color};font-weight:600;font-size:11px">{label}</span></td>'
+                    f'<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+                    f'<a href="{url}" target="_blank" style="color:#e2e8f0;text-decoration:none">{job_title}</a>'
+                    f'<br><span style="font-size:10px;color:#64748b">{job_co}</span></td>'
+                    f'<td style="color:#60a5fa;font-size:11px;text-align:center">{sc}/10</td>'
+                    f'<td style="color:#64748b;font-size:11px;text-align:right">{dur}s</td>'
+                    f'</tr>'
+                )
+            log_section = ""
+            if log_rows:
+                log_section = f"""
+<div class="log-panel">
+  <div class="log-title">Session Activity</div>
+  <table class="log-table">
+    <thead><tr>
+      <th>Time</th><th>Result</th><th>Job</th><th>Score</th><th>Time</th>
+    </tr></thead>
+    <tbody>{log_rows}</tbody>
+  </table>
+</div>"""
+
             body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
 <title>ApplyPilot W{worker_id}</title>
 <style>
+  * {{box-sizing:border-box;margin:0;padding:0}}
   body {{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;
-        margin:0;display:flex;flex-direction:column;align-items:center;
-        justify-content:center;min-height:100vh;gap:16px;padding:24px;box-sizing:border-box}}
+        min-height:100vh;padding:24px;display:flex;flex-direction:column;
+        align-items:center;gap:16px}}
   .badge {{background:#1e293b;border:1px solid #334155;border-radius:12px;
-           padding:24px 32px;max-width:480px;width:100%;text-align:center}}
-  .wid {{font-size:48px;font-weight:700;color:#eab308}}
+           padding:20px 28px;width:100%;max-width:600px;text-align:center}}
+  .wid {{font-size:40px;font-weight:700;color:#eab308}}
   .status {{display:inline-block;padding:4px 12px;border-radius:9999px;
-            font-size:13px;font-weight:600;margin:8px 0;
+            font-size:12px;font-weight:600;margin:8px 0;
             background:{status_color}22;color:{status_color};
             border:1px solid {status_color}44}}
-  .title {{font-size:20px;font-weight:600;margin:8px 0}}
-  .meta {{font-size:13px;color:#94a3b8;margin:4px 0}}
-  .instructions {{margin-top:16px;padding:12px;background:#1e293b;
+  .title {{font-size:18px;font-weight:600;margin:6px 0}}
+  .meta {{font-size:12px;color:#94a3b8}}
+  .instructions {{margin-top:12px;padding:10px 12px;background:#0f172a;
                   border-left:3px solid #a855f7;border-radius:4px;
-                  font-size:13px;text-align:left;line-height:1.5}}
-  .hint {{font-size:11px;color:#475569;margin-top:16px}}
+                  font-size:12px;text-align:left;line-height:1.5}}
+  .log-panel {{width:100%;max-width:600px;background:#1e293b;
+               border:1px solid #334155;border-radius:12px;overflow:hidden}}
+  .log-title {{padding:12px 16px;font-size:12px;font-weight:700;
+               text-transform:uppercase;letter-spacing:.5px;color:#64748b;
+               border-bottom:1px solid #334155}}
+  .log-table {{width:100%;border-collapse:collapse;font-size:12px}}
+  .log-table th {{padding:6px 10px;text-align:left;font-size:10px;
+                  text-transform:uppercase;color:#475569;
+                  border-bottom:1px solid #1e293b}}
+  .log-table td {{padding:7px 10px;border-bottom:1px solid #0f172a;vertical-align:middle}}
+  .log-table tr:last-child td {{border-bottom:none}}
+  .hint {{font-size:10px;color:#334155;margin-top:4px}}
 </style>
 </head>
 <body>
 <div class="badge">
   <div class="wid">W{worker_id}</div>
   <div class="status">{status.upper().replace("_", " ")}</div>
-  <div class="title">{title}</div>
+  <div class="title">{_html.escape(title)}</div>
   {'<div class="meta">' + meta_line + '</div>' if meta_line else ''}
   {instructions_block}
-  <div class="hint">Auto-refreshes every 5s &nbsp;·&nbsp; ApplyPilot Worker {worker_id}</div>
 </div>
+{log_section}
+<div class="hint">ApplyPilot Worker {worker_id} &nbsp;·&nbsp; <span id="ts"></span></div>
+<script>
+  document.getElementById('ts').textContent = new Date().toLocaleTimeString();
+  setTimeout(() => location.reload(), 5000);
+</script>
 </body>
 </html>""".encode()
             self.send_response(200)
@@ -450,16 +548,10 @@ def _start_worker_listener(worker_id: int) -> int:
 
         def _handle_status(self):
             job = state.get("job") or {}
-            # Look up saved instruction for current site+reason
-            saved = None
             site = job.get("site", "")
             reason = state.get("reason", "")
-            if site and reason:
-                try:
-                    from applypilot.database import get_qa
-                    saved = get_qa(f"HITL:{site}:{reason}")
-                except Exception:
-                    pass
+            # Use cached saved_instruction — never hit DB on status polls.
+            # (DB access from per-request daemon threads leaks SQLite fds over time.)
             self._json_ok({
                 "workerId": worker_id,
                 "status": state.get("status", "idle"),
@@ -469,10 +561,13 @@ def _start_worker_listener(worker_id: int) -> int:
                 "score": job.get("fit_score", 0),
                 "reason": reason,
                 "instructions": state.get("instructions"),
-                "savedInstruction": saved,
+                "savedInstruction": state.get("saved_instruction"),
                 "chromePid": state.get("chrome_pid"),
                 "lastFocused": state.get("last_focused", 0),
             })
+
+        def _handle_log(self):
+            self._json_ok({"history": list(reversed(state.get("history", [])))})
 
         def _handle_focus(self):
             state["last_focused"] = time.time()
@@ -583,10 +678,44 @@ def _start_worker_listener(worker_id: int) -> int:
             self._text_ok()
 
         def _handle_done(self):
+            body = self._read_body()
+            custom_instructions = (body.get("instructions") or "").strip()
+            if custom_instructions:
+                state["handback_instructions"] = custom_instructions
             hitl_evt = state.get("hitl_event")
             if hitl_evt:
+                # Mark as resuming immediately so the extension shows loading state
+                # before the worker loop picks it up and changes status to "applying".
+                state["status"] = "resuming"
                 hitl_evt.set()
             self._text_ok()
+
+        def _handle_jobs_list(self):
+            """Return actionable jobs for the extension Jobs tab."""
+            from urllib.parse import parse_qs, urlparse as _up
+            qs = parse_qs(_up(self.path).query)
+            limit = min(int(qs.get("limit", ["50"])[0]), 200)
+            try:
+                from applypilot.database import get_connection
+                conn = get_connection()
+                rows = conn.execute("""
+                    SELECT url, title, company, site, fit_score,
+                           apply_status, apply_category, apply_error,
+                           tailored_resume_path, cover_letter_path
+                    FROM jobs
+                    WHERE fit_score IS NOT NULL AND fit_score >= 6
+                      AND (apply_status IS NULL
+                           OR apply_status NOT IN ('applied', 'manual', 'in_progress'))
+                    ORDER BY fit_score DESC, discovered_at DESC
+                    LIMIT ?
+                """, (limit,)).fetchall()
+                self._json_ok({"jobs": [dict(r) for r in rows]})
+            except Exception as e:
+                logger.debug("jobs_list error: %s", e)
+                self.send_response(500)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(str(e).encode())
 
         def _handle_add_job(self):
             """Add a job URL to the discovery queue from the extension."""
@@ -626,14 +755,70 @@ def _start_worker_listener(worker_id: int) -> int:
                 self.end_headers()
                 self.wfile.write(str(e).encode())
 
+        def _handle_jobs_mark(self):
+            """Manually mark a job's apply status from the extension Jobs tab."""
+            from applypilot.database import get_connection
+            from datetime import datetime, timezone as tz
+            body = self._read_body()
+            url    = (body.get("url") or "").strip()
+            action = (body.get("action") or "").strip()
+            valid  = ("applied", "skip", "error", "reset")
+            if not url or action not in valid:
+                self.send_response(400)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(b"url and action required")
+                return
+            try:
+                conn = get_connection()
+                now = datetime.now(tz.utc).isoformat()
+                if action == "applied":
+                    conn.execute("""UPDATE jobs SET apply_status='applied', applied_at=?,
+                        apply_category='applied', apply_attempts=COALESCE(apply_attempts,0)+1
+                        WHERE url=?""", (now, url))
+                elif action == "skip":
+                    conn.execute("""UPDATE jobs SET apply_status='failed',
+                        apply_category='archived_ineligible',
+                        apply_error='manually skipped', apply_attempts=99 WHERE url=?""", (url,))
+                elif action == "error":
+                    conn.execute("""UPDATE jobs SET apply_status='failed',
+                        apply_category='archived_platform',
+                        apply_error='manually marked error', apply_attempts=99 WHERE url=?""", (url,))
+                elif action == "reset":
+                    conn.execute("""UPDATE jobs SET apply_status=NULL, apply_category='pending',
+                        apply_error=NULL, apply_attempts=0, agent_id=NULL WHERE url=?""", (url,))
+                conn.commit()
+                logger.info("[W%d] Manual mark '%s': %s", worker_id, action, url[:70])
+                self._json_ok({"status": "ok", "action": action})
+            except Exception as e:
+                logger.debug("jobs_mark error: %s", e)
+                self.send_response(500)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(str(e).encode())
+
         def log_message(self, format, *args):
             pass  # Suppress HTTP logging
 
-    try:
-        server = _ThreadedHTTPServer(("127.0.0.1", port), _Handler)
-    except OSError:
-        server = _ThreadedHTTPServer(("127.0.0.1", 0), _Handler)
-        port = server.server_address[1]
+    # Retry binding to the preferred port for up to 5s (old process may be dying).
+    # Fall back to a random port only as a last resort, with a warning.
+    preferred_port = port
+    server = None
+    for _attempt in range(6):
+        try:
+            server = _ThreadedHTTPServer(("127.0.0.1", port), _Handler)
+            break
+        except OSError:
+            if _attempt < 5:
+                time.sleep(1)
+            else:
+                server = _ThreadedHTTPServer(("127.0.0.1", 0), _Handler)
+                port = server.server_address[1]
+                logger.warning(
+                    "Worker %d: preferred port %d was busy; using random port %d "
+                    "(extension will not connect — restart the pipeline to fix)",
+                    worker_id, preferred_port, port,
+                )
 
     with _worker_server_lock:
         _worker_servers[worker_id] = server
@@ -660,7 +845,8 @@ def _stop_worker_listener(worker_id: int) -> None:
 
 def _inject_banner_for_worker(worker_id: int, cdp_port: int, job: dict,
                               reason: str, server_port: int,
-                              navigate_url: str | None = None) -> bool:
+                              navigate_url: str | None = None,
+                              instructions: str | None = None) -> bool:
     """Inject a HITL banner into the worker's Chrome via CDP.
 
     Navigates to navigate_url first (so the user sees the stuck page, not
@@ -675,7 +861,8 @@ def _inject_banner_for_worker(worker_id: int, cdp_port: int, job: dict,
 
     # Build a job-like dict with HITL fields for the banner
     banner_job = dict(job)
-    instructions = _HITL_INSTRUCTIONS.get(reason, f"Human action required: {reason}")
+    if instructions is None:
+        instructions = _HITL_INSTRUCTIONS.get(reason, f"Human action required: {reason}")
     banner_job["needs_human_instructions"] = instructions
 
     result = _inject_banner(cdp_port, banner_job, server_port=server_port)
@@ -938,32 +1125,81 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             blocked_sites, blocked_patterns = _load_blocked()
             site_filter = " AND ".join(f"site != '{s}'" for s in blocked_sites) if blocked_sites else "1=1"
             url_filter = " AND ".join(f"url NOT LIKE '{p}'" for p in blocked_patterns) if blocked_patterns else "1=1"
-            # Company-aware round-robin: prioritize distinct companies before
-            # applying to multiple jobs at the same company. Within the same
-            # company rank, pick highest score first.
-            max_score_filter = f"AND fit_score <= {max_score}" if max_score is not None else ""
-            row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path,
-                       company
-                FROM (
-                    SELECT *,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY COALESCE(company, url)
-                               ORDER BY fit_score DESC
-                           ) as company_rank
+            max_score_filter = f"AND j.fit_score <= {max_score}" if max_score is not None else ""
+
+            # ── Lane management ───────────────────────────────────────────────
+            # Rule 1 & 2: no more than one active worker per company OR per ATS.
+            # Query in-progress jobs to build exclusion sets.
+            in_progress_rows = conn.execute(
+                "SELECT company, application_url FROM jobs WHERE apply_status = 'in_progress'"
+            ).fetchall()
+            active_companies: set[str] = set()
+            active_ats: set[str] = set()
+            for ip in in_progress_rows:
+                if ip["company"]:
+                    active_companies.add(ip["company"].lower())
+                ats = detect_ats(ip["application_url"] or "")
+                if ats:
+                    active_ats.add(ats)
+
+            # Company exclusion handled in SQL (company is a column).
+            if active_companies:
+                ph = ",".join("?" * len(active_companies))
+                company_excl = f"AND LOWER(COALESCE(j.company, '')) NOT IN ({ph})"
+                company_excl_params: list = list(active_companies)
+            else:
+                company_excl = ""
+                company_excl_params = []
+
+            # Rule 3: deprioritize companies with 2+ applications in the past 7 days.
+            # They stay in the queue but sort below companies with fewer recent apps.
+            candidates = conn.execute(f"""
+                SELECT j.url, j.title, j.site, j.application_url,
+                       j.tailored_resume_path, j.fit_score, j.location,
+                       j.full_description, j.cover_letter_path, j.company,
+                       COALESCE(rc.cnt, 0) AS recent_applied_count,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(j.company, j.url)
+                           ORDER BY j.fit_score DESC
+                       ) AS company_rank
+                FROM jobs j
+                LEFT JOIN (
+                    SELECT company, COUNT(*) AS cnt
                     FROM jobs
-                    WHERE tailored_resume_path IS NOT NULL
-                      AND (apply_status IS NULL OR apply_status = 'failed')
-                      AND (apply_attempts IS NULL OR apply_attempts < {config.DEFAULTS["max_apply_attempts"]})
-                      AND fit_score >= ?
-                      {max_score_filter}
-                      AND {site_filter}
-                      AND {url_filter}
+                    WHERE apply_status = 'applied'
+                      AND last_attempted_at >= datetime('now', '-7 days')
+                      AND company IS NOT NULL
+                    GROUP BY company
+                ) rc ON LOWER(j.company) = LOWER(rc.company)
+                WHERE j.tailored_resume_path IS NOT NULL
+                  AND (j.apply_status IS NULL OR j.apply_status = 'failed')
+                  AND (j.apply_attempts IS NULL OR j.apply_attempts < {config.DEFAULTS["max_apply_attempts"]})
+                  AND j.fit_score >= ?
+                  {max_score_filter}
+                  AND {site_filter}
+                  AND {url_filter}
+                  {company_excl}
+                ORDER BY
+                    CASE WHEN recent_applied_count >= 2 THEN 1 ELSE 0 END ASC,
+                    company_rank ASC,
+                    j.fit_score DESC,
+                    j.url
+                LIMIT 50
+            """, (min_score, *company_excl_params)).fetchall()
+
+            # ATS exclusion: pick first candidate whose ATS is not currently active.
+            row = None
+            for candidate in candidates:
+                ats = detect_ats(candidate["application_url"] or candidate["url"] or "")
+                if ats is None or ats not in active_ats:
+                    row = candidate
+                    break
+            if row is None and candidates:
+                # All candidates share an active ATS — log and skip this cycle.
+                logger.debug(
+                    "acquire_job: all candidates blocked by active ATS lanes %s; will retry",
+                    active_ats,
                 )
-                ORDER BY company_rank ASC, fit_score DESC, url
-                LIMIT 1
-            """, (min_score,)).fetchone()
 
         if not row:
             conn.rollback()
@@ -1065,7 +1301,7 @@ def gen_prompt(target_url: str, min_score: int = 7, max_score: int | None = None
     # Write prompt file
     config.ensure_dirs()
     site_slug = (job.get("site") or "unknown")[:20].replace(" ", "_")
-    prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{job['title'][:30].replace(' ', '_')}.txt"
+    prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{(job.get('title') or 'unknown')[:30].replace(' ', '_')}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
 
     # Write MCP config for reference
@@ -1185,6 +1421,14 @@ _HITL_INSTRUCTIONS: dict[str, str] = {
         "ANSWER SCREENING QUESTIONS. The agent reached screening questions it wasn't "
         "confident answering from your profile. Review and answer them, then submit. "
         "Click Done when finished."
+    ),
+    "security_concern": (
+        "⚠️ SECURITY ALERT — The agent flagged suspicious content on this form. "
+        "Check the apply log for details on what was detected (prompt injection, "
+        "bot trap, credential request, or data exfiltration attempt). "
+        "Review the page carefully before proceeding. "
+        "If the form looks legitimate, complete it manually and click Done. "
+        "If it looks malicious, close the tab and click Done to abandon."
     ),
 }
 
@@ -1344,6 +1588,15 @@ def _infer_result_from_output(output: str) -> str | None:
             "captcha cannot be solved",
             "unsolvable captcha",
         ]),
+        ("already_applied", [
+            "you've already applied",
+            "you have already applied",
+            "already applied to this",
+            "application already submitted",
+            "duplicate application",
+            "already applied for this role",
+            "application already exists",
+        ]),
         ("expired", [
             "no longer accepting",
             "job has been closed",
@@ -1485,6 +1738,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         job=job,
         tailored_resume=resume_text,
         dry_run=dry_run,
+        worker_id=worker_id,
     )
 
     # When resuming after user takeover: inject a RESUME banner so Claude does NOT
@@ -1563,7 +1817,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
                  start_time=time.time(), actions=0, last_action="starting")
-    add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
+    add_event(f"[W{worker_id}] Starting: {(job.get('title') or '')[:40]} @ {job.get('site', '')}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1590,6 +1844,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             errors="replace",
             env=env,
             cwd=str(worker_dir),
+            start_new_session=True,
         )
         with _claude_lock:
             _claude_procs[worker_id] = proc
@@ -1725,17 +1980,18 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
 
-        for result_status in ["APPLIED", "SUCCESS", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
+        for result_status in ["APPLIED", "ALREADY_APPLIED", "SUCCESS", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
             if f"RESULT:{result_status}" in output:
-                # Normalize SUCCESS -> applied
-                canonical = "applied" if result_status == "SUCCESS" else result_status.lower()
+                # Normalize SUCCESS/ALREADY_APPLIED -> applied (already applied counts as applied)
+                canonical = "applied" if result_status in ("SUCCESS", "ALREADY_APPLIED") else result_status.lower()
                 # Mark Q&A outcomes based on application result
                 if canonical == "applied" and job_url:
                     from applypilot.database import mark_qa_outcome
                     mark_qa_outcome(job_url, "accepted")
-                add_event(f"[W{worker_id}] {canonical.upper()} ({elapsed}s): {job['title'][:30]}")
+                display = "ALREADY APPLIED" if result_status == "ALREADY_APPLIED" else canonical.upper()
+                add_event(f"[W{worker_id}] {display} ({elapsed}s): {(job.get('title') or '')[:30]}")
                 update_state(worker_id, status=canonical,
-                             last_action=f"{canonical.upper()} ({elapsed}s)")
+                             last_action=f"{display} ({elapsed}s)")
                 return canonical, duration_ms, screening_qs
 
         # Check for RESULT:NEEDS_HUMAN:{reason}:{stuck_url}
@@ -1743,10 +1999,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         if "RESULT:NEEDS_HUMAN:" in output:
             for out_line in output.split("\n"):
                 if "RESULT:NEEDS_HUMAN:" in out_line:
-                    # Format: RESULT:NEEDS_HUMAN:{reason}:{url}
-                    # Split on "NEEDS_HUMAN:" then split first colon to get reason vs URL
+                    # Format: RESULT:NEEDS_HUMAN:{reason}:{url} [reason: detail]
+                    # Split on "NEEDS_HUMAN:" then split first colon to get reason vs rest
                     after = out_line.split("RESULT:NEEDS_HUMAN:", 1)[-1].strip()
                     after = _clean_reason(after)
+                    # Extract optional [reason: ...] detail suffix from the end
+                    reason_detail = ""
+                    if " [reason: " in after:
+                        after, detail_part = after.rsplit(" [reason: ", 1)
+                        reason_detail = detail_part.rstrip("]").strip()
+                        after = after.strip()
                     if ":" in after:
                         nh_reason, nh_url = after.split(":", 1)
                         nh_reason = nh_reason.strip()
@@ -1754,7 +2016,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     else:
                         nh_reason = after
                         nh_url = job.get("application_url") or job["url"]
-                    add_event(f"[W{worker_id}] NEEDS_HUMAN:{nh_reason} ({elapsed}s): {job['title'][:30]}")
+                    if reason_detail:
+                        nh_url = f"{nh_url}|detail:{reason_detail}"
+                    add_event(f"[W{worker_id}] NEEDS_HUMAN:{nh_reason} ({elapsed}s): {(job.get('title') or '')[:30]}")
                     update_state(worker_id, status="needs_human",
                                  last_action=f"NEEDS_HUMAN: {nh_reason[:25]}")
                     return f"needs_human:{nh_reason}:{nh_url}", duration_ms, screening_qs
@@ -1770,7 +2034,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     reason = _clean_reason(reason)
                     PROMOTE_TO_STATUS = {"captcha", "expired", "login_issue"}
                     if reason in PROMOTE_TO_STATUS:
-                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
+                        add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {(job.get('title') or '')[:30]}")
                         update_state(worker_id, status=reason,
                                      last_action=f"{reason.upper()} ({elapsed}s)")
                         return reason, duration_ms, screening_qs
@@ -1782,13 +2046,14 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
         # No explicit RESULT line. Try to infer the outcome from agent output.
         inferred = _infer_result_from_output(output)
-        if inferred == "applied":
-            add_event(f"[W{worker_id}] INFERRED APPLIED ({elapsed}s): {job['title'][:30]}")
+        if inferred in ("applied", "already_applied"):
+            label = "ALREADY APPLIED" if inferred == "already_applied" else "APPLIED"
+            add_event(f"[W{worker_id}] INFERRED {label} ({elapsed}s): {(job.get('title') or '')[:30]}")
             update_state(worker_id, status="applied",
-                         last_action=f"APPLIED (inferred, {elapsed}s)")
+                         last_action=f"{label} (inferred, {elapsed}s)")
             return "applied", duration_ms, screening_qs
         if inferred:
-            add_event(f"[W{worker_id}] INFERRED {inferred.upper()} ({elapsed}s): {job['title'][:30]}")
+            add_event(f"[W{worker_id}] INFERRED {inferred.upper()} ({elapsed}s): {(job.get('title') or '')[:30]}")
             update_state(worker_id, status="failed",
                          last_action=f"inferred:{inferred[:25]}")
             return f"failed:{inferred}", duration_ms, screening_qs
@@ -1839,6 +2104,43 @@ _NEXT_STEPS: dict[str, str] = {
 
 _FAILED_LOG = config.LOG_DIR / "failed_actions.log"
 _MANUAL_LOG = config.APP_DIR / "manual_actions.md"
+
+
+def _record_job_history(worker_id: int, job: dict, result: str,
+                        duration_ms: int) -> None:
+    """Append a completed job entry to the worker's in-memory history list.
+
+    Shown on the per-worker homepage (http://localhost:{7380+worker_id}/).
+    Keeps the last 50 entries; oldest are dropped automatically.
+    """
+    with _worker_state_lock:
+        ws = _worker_state.get(worker_id)
+    if ws is None:
+        return
+    history: list = ws.setdefault("history", [])
+    # Classify result into a display category
+    if "applied" in result.lower():
+        outcome = "applied"
+    elif "expired" in result.lower():
+        outcome = "expired"
+    elif "already_applied" in result.lower():
+        outcome = "already_applied"
+    elif "needs_human" in result.lower():
+        outcome = "needs_human"
+    else:
+        outcome = "failed"
+    history.append({
+        "ts": time.time(),
+        "title": job.get("title", ""),
+        "company": job.get("company") or job.get("site", ""),
+        "url": job.get("application_url") or job.get("url", ""),
+        "score": job.get("fit_score", 0),
+        "result": result,
+        "outcome": outcome,
+        "duration_s": round(duration_ms / 1000) if duration_ms else 0,
+    })
+    if len(history) > 50:
+        del history[:-50]
 
 
 def _log_failed_attempt(job: dict, reason: str, worker_id: int,
@@ -1959,12 +2261,69 @@ def _is_permanent_failure(result: str) -> bool:
 # Worker loop
 # ---------------------------------------------------------------------------
 
+def _probe_for_reconnect(worker_id: int, port: int) -> tuple[int | None, str | None]:
+    """Check if a previous Chrome session can be reconnected to.
+
+    On startup, if a previous `applypilot apply` run was killed while Chrome
+    was still running, this detects the live browser and finds the interrupted
+    in-progress job so the new run can resume instead of starting fresh.
+
+    Returns:
+        (chrome_pid, interrupted_job_url) if a reconnectable Chrome is found,
+        or (None, None) if Chrome is not running / profile doesn't match.
+    """
+    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
+    pid = probe_existing_chrome(port, profile_dir)
+    if pid is None:
+        return None, None
+
+    logger.info(
+        "[W%d] Existing Chrome on port %d (pid %d) — checking for interrupted job",
+        worker_id, port, pid,
+    )
+    add_event(f"[W{worker_id}] Reconnecting to existing Chrome (pid {pid})")
+
+    # Find the job this worker was applying to when the pipeline was killed.
+    # acquire_job() sets agent_id = "worker-{N}" when locking a job.
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT url, application_url, title FROM jobs "
+            "WHERE apply_status = 'in_progress' AND agent_id = ? "
+            "ORDER BY last_attempted_at DESC LIMIT 1",
+            (f"worker-{worker_id}",),
+        ).fetchone()
+        if row:
+            job_url = row["url"]
+            apply_url = row["application_url"] or row["url"]
+            title = row["title"] or apply_url
+            # Reset the lock so acquire_job() can re-acquire it normally
+            conn.execute(
+                "UPDATE jobs SET apply_status = NULL, agent_id = NULL WHERE url = ?",
+                (job_url,),
+            )
+            conn.commit()
+            add_event(
+                f"[W{worker_id}] Found interrupted job: {title[:40]} — will resume"
+            )
+            logger.info("[W%d] Interrupted job reset for reconnect: %s", worker_id, apply_url[:80])
+            return pid, apply_url
+        else:
+            add_event(f"[W{worker_id}] No interrupted job found — Chrome has next job")
+            return pid, None
+    except Exception as exc:
+        logger.warning("[W%d] Reconnect probe: could not look up interrupted job: %s", worker_id, exc)
+        return pid, None
+
+
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, max_score: int | None = None,
                 headless: bool = False,
                 model: str = "sonnet", dry_run: bool = False,
-                fresh_sessions: bool = False) -> tuple[int, int]:
+                fresh_sessions: bool = False,
+                total_workers: int = 1,
+                no_hitl: bool = False) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -1977,6 +2336,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         model: Claude model name.
         dry_run: Don't click Submit.
         fresh_sessions: Refresh Chrome session cookies before launching.
+        total_workers: Total concurrent workers (used for window tiling).
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -1994,7 +2354,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         return _worker_loop_body(
             worker_id, limit, target_url, min_score, max_score, headless,
             model, dry_run, fresh_sessions, applied, failed, continuous,
-            jobs_done, empty_polls, port,
+            jobs_done, empty_polls, port, total_workers, no_hitl=no_hitl,
         )
     finally:
         _stop_worker_listener(worker_id)
@@ -2006,8 +2366,15 @@ def _worker_loop_body(
     model: str, dry_run: bool, fresh_sessions: bool,
     applied: int, failed: int, continuous: bool,
     jobs_done: int, empty_polls: int, port: int,
+    total_workers: int = 1, no_hitl: bool = False,
 ) -> tuple[int, int]:
     """Main per-worker processing loop."""
+    # ── Reconnect probe ───────────────────────────────────────────────────────
+    # If a previous run was killed while Chrome was running, adopt the existing
+    # browser and resume the interrupted job rather than starting fresh.
+    _reconnect_pid, _reconnect_url = _probe_for_reconnect(worker_id, port)
+    # ─────────────────────────────────────────────────────────────────────────
+
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
             break
@@ -2015,8 +2382,12 @@ def _worker_loop_body(
         update_state(worker_id, status="idle", job_title="", company="",
                      last_action="waiting for job", actions=0)
 
-        job = acquire_job(target_url=target_url, min_score=min_score, max_score=max_score,
-                          worker_id=worker_id)
+        # On reconnect, prioritize the interrupted job URL for this iteration only
+        _effective_target = _reconnect_url or target_url
+        _reconnect_url = None  # clear after first use
+
+        job = acquire_job(target_url=_effective_target, min_score=min_score,
+                          max_score=max_score, worker_id=worker_id)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -2034,6 +2405,11 @@ def _worker_loop_body(
 
         empty_polls = 0
 
+        # Consume reconnect state for this job iteration (cleared after first use)
+        _this_reconnect_pid = _reconnect_pid
+        _this_had_interrupted_job = _effective_target is not None and _effective_target != target_url
+        _reconnect_pid = None
+
         chrome_proc = None
         was_skipped = False
         try:
@@ -2043,10 +2419,19 @@ def _worker_loop_body(
             if ats_slug:
                 add_event(f"[W{worker_id}] ATS: {ats_slug}")
 
-            add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless,
-                                        refresh_cookies=fresh_sessions,
-                                        ats_slug=ats_slug)
+            if _this_reconnect_pid is not None:
+                # Reuse the existing Chrome — skip launch entirely
+                add_event(f"[W{worker_id}] Reconnecting to Chrome (pid {_this_reconnect_pid})...")
+                chrome_proc = _AdoptedChromeProcess(_this_reconnect_pid)
+                with _chrome_lock:
+                    _chrome_procs[worker_id] = chrome_proc
+            else:
+                add_event(f"[W{worker_id}] Launching Chrome...")
+                chrome_proc = launch_chrome(worker_id, port=port, headless=headless,
+                                            refresh_cookies=fresh_sessions,
+                                            ats_slug=ats_slug,
+                                            total_workers=total_workers)
+
             with _worker_state_lock:
                 ws = _worker_state.get(worker_id)
             if ws is not None:
@@ -2061,10 +2446,27 @@ def _worker_loop_body(
             with _worker_state_lock:
                 ws = _worker_state.get(worker_id)
             if ws is not None:
-                ws.update({"job": job, "status": "applying", "reason": None, "instructions": None})
+                ws.update({"job": job, "status": "applying", "reason": None,
+                           "instructions": None, "saved_instruction": None})
 
-            result, duration_ms, screening_qs = run_job(job, port=port, worker_id=worker_id,
-                                                        model=model, dry_run=dry_run)
+            # On reconnect with interrupted job: don't reset tabs (form is mid-fill)
+            _reconnect_ctx = None
+            if _this_had_interrupted_job:
+                _reconnect_ctx = (
+                    "PIPELINE RESTART: The apply pipeline was killed while you were "
+                    "working on this application. The Chrome browser was left running "
+                    "with the form potentially partially filled. "
+                    "Take a browser_snapshot immediately to see the current page state, "
+                    "then continue filling and submitting the application. "
+                    "Do NOT navigate away from the current page unless it is completely blank."
+                )
+
+            result, duration_ms, screening_qs = run_job(
+                job, port=port, worker_id=worker_id,
+                model=model, dry_run=dry_run,
+                skip_tab_reset=_this_had_interrupted_job,
+                extra_context=_reconnect_ctx,
+            )
 
             # --- Relaunch sub-loop: handles Q&A, HITL, and takeover without closing Chrome ---
             relaunch = True
@@ -2073,7 +2475,7 @@ def _worker_loop_body(
 
                 if result == "skipped":
                     release_lock(job["url"])
-                    add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
+                    add_event(f"[W{worker_id}] Skipped: {(job.get('title') or '')[:30]}")
                     was_skipped = True
                     break
                 elif "credits_exhausted" in result:
@@ -2086,6 +2488,7 @@ def _worker_loop_body(
                     break
                 elif result == "applied":
                     mark_result(job["url"], "applied", duration_ms=duration_ms)
+                    _record_job_history(worker_id, job, result, duration_ms)
                     applied += 1
                     update_state(worker_id, jobs_applied=applied,
                                  jobs_done=applied + failed)
@@ -2098,7 +2501,7 @@ def _worker_loop_body(
                     # User clicked "Take Over" in the extension popup.
                     # The Claude proc was already killed by the takeover handler.
                     # Wait for the user to click "Give Back Control" (handback event).
-                    add_event(f"[W{worker_id}] PAUSED by user: {job['title'][:30]}")
+                    add_event(f"[W{worker_id}] PAUSED by user: {(job.get('title') or '')[:30]}")
                     update_state(worker_id, status="paused_by_user",
                                  last_action="paused by user")
                     _register_waiting(worker_id, "waiting_human")
@@ -2141,12 +2544,18 @@ def _worker_loop_body(
                     continue
 
                 elif result.startswith("needs_human:"):
-                    # Parse reason and URL
+                    # Parse reason and URL (optional |detail:... suffix from agent)
                     after = result[len("needs_human:"):]
                     if ":" in after:
                         nh_reason, nh_url = after.split(":", 1)
                     else:
                         nh_reason, nh_url = after, job.get("application_url") or job["url"]
+                    # Extract detail suffix: "https://url|detail:reason text"
+                    nh_detail = ""
+                    if "|detail:" in nh_url:
+                        nh_url, nh_detail = nh_url.split("|detail:", 1)
+                        nh_url = nh_url.strip()
+                        nh_detail = nh_detail.strip()
 
                     # --- Screening Q&A: interactive TUI answers + relaunch ---
                     if nh_reason == "screening_questions" and screening_qs:
@@ -2183,17 +2592,25 @@ def _worker_loop_body(
                     nh_instructions = _HITL_INSTRUCTIONS.get(
                         nh_reason, f"Human action required: {nh_reason}"
                     )
+                    if nh_detail:
+                        nh_instructions = f"{nh_instructions}\n\nAgent detail: {nh_detail}"
                     # Mark in DB so stale-lock cleanup won't steal this job
                     mark_needs_human(
                         job["url"], nh_reason, nh_url, nh_instructions, duration_ms
                     )
+
+                    if no_hitl:
+                        add_event(f"[W{worker_id}] --no-hitl: parking '{nh_reason}' and moving on")
+                        update_state(worker_id, last_action=f"parked: {nh_reason[:25]}")
+                        break
 
                     job_hash = hashlib.sha256(job["url"].encode()).hexdigest()[:12]
                     hitl_event = threading.Event()
                     hitl_port = _start_hitl_listener(worker_id, hitl_event, job_hash)
 
                     _inject_banner_for_worker(worker_id, port, job, nh_reason, hitl_port,
-                                             navigate_url=nh_url)
+                                             navigate_url=nh_url,
+                                             instructions=nh_instructions)
                     # Start background watcher: polls window.__ap_hitl_done via CDP
                     # and calls /api/done/{hash} from Node (bypasses page CSP).
                     from applypilot.apply.human_review import _start_done_watcher
@@ -2206,8 +2623,17 @@ def _worker_loop_body(
                     with _worker_state_lock:
                         ws = _worker_state.get(worker_id)
                     if ws is not None:
+                        _saved = None
+                        try:
+                            from applypilot.database import get_qa
+                            from applypilot.database import close_connection
+                            _saved = get_qa(f"HITL:{job.get('site', '')}:{nh_reason}")
+                            close_connection()
+                        except Exception:
+                            pass
                         ws.update({"status": "waiting_human", "reason": nh_reason,
                                    "instructions": nh_instructions,
+                                   "saved_instruction": _saved,
                                    "hitl_watcher_proc": _watcher})
                     _register_waiting(worker_id, "waiting_human")
 
@@ -2220,9 +2646,11 @@ def _worker_loop_body(
                             add_event(f"[W{worker_id}] Chrome crashed during HITL; relaunching...")
                             try:
                                 chrome_proc = launch_chrome(worker_id, port=port,
-                                                            headless=headless, ats_slug=ats_slug)
+                                                            headless=headless, ats_slug=ats_slug,
+                                                            total_workers=total_workers)
                                 _inject_banner_for_worker(worker_id, port, job, nh_reason,
-                                                          hitl_port, navigate_url=nh_url)
+                                                          hitl_port, navigate_url=nh_url,
+                                                          instructions=nh_instructions)
                             except Exception:
                                 logger.debug("Chrome relaunch during HITL failed", exc_info=True)
                     _stop_hitl_listener(worker_id)
@@ -2267,6 +2695,11 @@ def _worker_loop_body(
                             nh_instructions, duration_ms
                         )
 
+                        if no_hitl:
+                            add_event(f"[W{worker_id}] --no-hitl: parking 'login_required' and moving on")
+                            update_state(worker_id, last_action="parked: login_required")
+                            break
+
                         job_hash = hashlib.sha256(job["url"].encode()).hexdigest()[:12]
                         hitl_event = threading.Event()
                         hitl_port = _start_hitl_listener(worker_id, hitl_event, job_hash)
@@ -2282,8 +2715,16 @@ def _worker_loop_body(
                         with _worker_state_lock:
                             ws = _worker_state.get(worker_id)
                         if ws is not None:
+                            _saved = None
+                            try:
+                                from applypilot.database import get_qa, close_connection
+                                _saved = get_qa(f"HITL:{job.get('site', '')}:login_required")
+                                close_connection()
+                            except Exception:
+                                pass
                             ws.update({"status": "waiting_human", "reason": "login_required",
                                        "instructions": nh_instructions,
+                                       "saved_instruction": _saved,
                                        "hitl_watcher_proc": _watcher})
                         _register_waiting(worker_id, "waiting_human")
 
@@ -2335,6 +2776,11 @@ def _worker_loop_body(
                             job["url"], reason, nh_url, nh_instructions, duration_ms
                         )
 
+                        if no_hitl:
+                            add_event(f"[W{worker_id}] --no-hitl: parking '{reason}' and moving on")
+                            update_state(worker_id, last_action=f"parked: {reason[:25]}")
+                            break
+
                         job_hash = hashlib.sha256(job["url"].encode()).hexdigest()[:12]
                         hitl_event = threading.Event()
                         hitl_port = _start_hitl_listener(worker_id, hitl_event, job_hash)
@@ -2350,8 +2796,16 @@ def _worker_loop_body(
                         with _worker_state_lock:
                             ws = _worker_state.get(worker_id)
                         if ws is not None:
+                            _saved = None
+                            try:
+                                from applypilot.database import get_qa, close_connection
+                                _saved = get_qa(f"HITL:{job.get('site', '')}:{reason}")
+                                close_connection()
+                            except Exception:
+                                pass
                             ws.update({"status": "waiting_human", "reason": reason,
                                        "instructions": nh_instructions,
+                                       "saved_instruction": _saved,
                                        "hitl_watcher_proc": _watcher})
                         _register_waiting(worker_id, "waiting_human")
 
@@ -2397,6 +2851,7 @@ def _worker_loop_body(
                         mark_result(job["url"], "failed", reason,
                                     permanent=perm, duration_ms=duration_ms)
                         _log_failed_attempt(job, reason, worker_id, duration_ms, perm)
+                        _record_job_history(worker_id, job, result, duration_ms)
                         failed += 1
                         update_state(worker_id, jobs_failed=failed,
                                      jobs_done=applied + failed)
@@ -2480,7 +2935,8 @@ def main(limit: int = 1, target_url: str | None = None,
          headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
-         fresh_sessions: bool = False) -> None:
+         fresh_sessions: bool = False, no_hitl: bool = False,
+         no_focus: bool = False) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -2495,6 +2951,8 @@ def main(limit: int = 1, target_url: str | None = None,
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
         fresh_sessions: Refresh Chrome session cookies from user's real profile.
+        no_hitl: Skip human-in-the-loop waits; park jobs as needs_human and move on.
+        no_focus: Prevent Chrome windows from stealing keyboard focus (Linux/GNOME only).
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -2502,6 +2960,7 @@ def main(limit: int = 1, target_url: str | None = None,
 
     config.ensure_dirs()
     console = Console()
+    _prev_focus_mode: str | None = None  # set before workers start; restored in finally
 
     # Re-queue any jobs stuck in needs_human from a previous session.
     # Their Chrome windows are gone (killed by _kill_on_port() when workers start),
@@ -2587,6 +3046,11 @@ def main(limit: int = 1, target_url: str | None = None,
             else:
                 limits = [0] * workers  # continuous mode
 
+            # Prevent Chrome windows from stealing keyboard focus while workers run.
+            # Restores the previous GNOME focus-new-windows setting when done.
+            from applypilot.apply.chrome import prevent_focus_stealing, restore_focus_mode
+            _prev_focus_mode = prevent_focus_stealing() if (no_focus and not headless) else None
+
             with ThreadPoolExecutor(max_workers=workers,
                                     thread_name_prefix="apply-worker") as executor:
                 futures = {
@@ -2601,6 +3065,8 @@ def main(limit: int = 1, target_url: str | None = None,
                         model=model,
                         dry_run=dry_run,
                         fresh_sessions=fresh_sessions,
+                        total_workers=workers,
+                        no_hitl=no_hitl,
                     ): i
                     for i in range(workers)
                 }
@@ -2670,3 +3136,4 @@ def main(limit: int = 1, target_url: str | None = None,
         _stop_event.set()
         stop_health_checks()
         kill_all_chrome()
+        restore_focus_mode(_prev_focus_mode)

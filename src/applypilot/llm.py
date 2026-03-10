@@ -56,7 +56,6 @@ def _build_fallback_chain(primary_model: str, quality: bool = False) -> list[Mod
     # Gemini chains — use verified model IDs only
     if quality:
         gemini_models = [
-            "gemini-2.5-pro-preview-03-25",
             "gemini-2.5-pro",
             "gemini-2.5-flash",
             "gemini-2.0-flash",
@@ -322,7 +321,27 @@ class LLMClient:
 
                 resp.raise_for_status()
                 data = resp.json()
+                # Guard against malformed responses (null body, null choices, null content)
+                if not isinstance(data, dict) or not data.get("choices"):
+                    if not is_last:
+                        log.warning("%s/%s: malformed response (no choices), trying next",
+                                    entry.provider, entry.name)
+                        return None
+                    raise RuntimeError(
+                        f"Malformed response from {entry.provider}/{entry.name}: "
+                        f"no choices in {type(data).__name__}"
+                    )
                 text = data["choices"][0]["message"]["content"]
+                if text is None:
+                    # Model returned null content (refusal, tool_call, etc.)
+                    if not is_last:
+                        log.warning("%s/%s: null content in response, trying next",
+                                    entry.provider, entry.name)
+                        return None
+                    raise RuntimeError(
+                        f"Null content from {entry.provider}/{entry.name} "
+                        f"(refusal: {data['choices'][0]['message'].get('refusal', 'none')})"
+                    )
 
                 if entry.name != self.model:
                     log.info("Used fallback %s/%s (primary: %s)",

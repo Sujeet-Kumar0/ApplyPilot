@@ -5,17 +5,82 @@ pipeline stage are created up front so any stage can run independently
 without migration ordering issues.
 """
 
+import logging
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin
 
 from applypilot.config import DB_PATH
 
+_log = logging.getLogger(__name__)
+
 # Thread-local connection storage — each thread gets its own connection
 # (required for SQLite thread safety with parallel workers)
 _local = threading.local()
+
+
+def write_with_retry(
+    conn: sqlite3.Connection,
+    fn,
+    *args,
+    max_retries: int = 8,
+    base_delay: float = 0.25,
+    **kwargs,
+) -> None:
+    """Execute a write function (conn.execute calls) plus commit with retry on lock.
+
+    On 'database is locked': rolls back the partial transaction and retries
+    the entire batch from the start. Handles contention from concurrent
+    streaming stages and the apply process all writing simultaneously.
+    """
+    for attempt in range(max_retries):
+        try:
+            fn(*args, **kwargs)
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" not in str(e):
+                raise
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                _log.warning(
+                    "DB locked on write batch (attempt %d/%d), retry in %.2fs",
+                    attempt + 1, max_retries, delay,
+                )
+                time.sleep(delay)
+            else:
+                _log.error("DB write locked: giving up after %d attempts", max_retries)
+                raise
+
+
+def commit_with_retry(conn: sqlite3.Connection, max_retries: int = 8, base_delay: float = 0.25) -> None:
+    """Commit with exponential backoff on 'database is locked' errors.
+
+    The busy_timeout PRAGMA handles short-lived locks, but when concurrent
+    streaming stages all write at once, Python-level retry provides resilience
+    for longer contentions (e.g., the apply process holding a write lock).
+    """
+    for attempt in range(max_retries):
+        try:
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" not in str(e):
+                raise
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                _log.warning("DB locked on commit (attempt %d/%d), retry in %.2fs",
+                             attempt + 1, max_retries, delay)
+                time.sleep(delay)
+            else:
+                raise
 
 
 def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
@@ -227,10 +292,16 @@ _ALL_COLUMNS: dict[str, str] = {
     "application_url": "TEXT",
     "detail_scraped_at": "TEXT",
     "detail_error": "TEXT",
+    "detail_error_category": "TEXT",       # 'expired' | 'retriable' | 'permanent'
+    "detail_retry_count": "INTEGER DEFAULT 0",
+    "detail_next_retry_at": "TEXT",        # ISO timestamp — when to retry
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
     "scored_at": "TEXT",
+    "score_error": "TEXT",                 # set when all LLM providers failed; fit_score stays NULL
+    "score_retry_count": "INTEGER DEFAULT 0",
+    "score_next_retry_at": "TEXT",         # ISO timestamp — when to retry scoring
     # Tailoring
     "tailored_resume_path": "TEXT",
     "tailored_at": "TEXT",
@@ -570,13 +641,29 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "SELECT COUNT(*) FROM jobs WHERE apply_status = 'needs_human'"
     ).fetchone()[0]
 
-    # Apply category breakdown
-    cat_rows = conn.execute(
-        "SELECT apply_category, COUNT(*) as cnt FROM jobs "
-        "WHERE apply_category IS NOT NULL "
-        "GROUP BY apply_category ORDER BY cnt DESC"
-    ).fetchall()
-    stats["by_category"] = {row[0]: row[1] for row in cat_rows}
+    # Apply category breakdown with per-score counts
+    cat_rows = conn.execute("""
+        SELECT apply_category,
+               COUNT(*) AS total,
+               SUM(CASE WHEN fit_score = 10 THEN 1 ELSE 0 END) AS s10,
+               SUM(CASE WHEN fit_score = 9  THEN 1 ELSE 0 END) AS s9,
+               SUM(CASE WHEN fit_score = 8  THEN 1 ELSE 0 END) AS s8,
+               SUM(CASE WHEN fit_score = 7  THEN 1 ELSE 0 END) AS s7,
+               SUM(CASE WHEN fit_score = 6  THEN 1 ELSE 0 END) AS s6,
+               SUM(CASE WHEN fit_score < 6 OR fit_score IS NULL THEN 1 ELSE 0 END) AS s_low
+        FROM jobs
+        WHERE apply_category IS NOT NULL
+        GROUP BY apply_category
+        ORDER BY total DESC
+    """).fetchall()
+    stats["by_category"] = {
+        row[0]: {
+            "total": row[1],
+            "10": row[2], "9": row[3], "8": row[4],
+            "7": row[5], "6": row[6], "<6": row[7],
+        }
+        for row in cat_rows
+    }
 
     # Per-score funnel: breakdown of pipeline stage at each score level (6-10)
     funnel_rows = conn.execute("""
@@ -636,10 +723,16 @@ def extract_company(application_url: str | None) -> str | None:
             return host.split(".")[0].lower()
 
         # Greenhouse job boards: job-boards.greenhouse.io/hudl/... → hudl
-        if "greenhouse.io" in host and "/job_boards/" not in path:
-            parts = [p for p in path.split("/") if p]
-            if parts:
-                return parts[0].lower()
+        # Greenhouse embed:     job-boards.greenhouse.io/embed/job_app?for=coinbase → coinbase
+        if "greenhouse.io" in host:
+            from urllib.parse import parse_qs, urlparse as _urlparse
+            qs = parse_qs(_urlparse(application_url).query)
+            if "for" in qs:
+                return qs["for"][0].lower()
+            if "/job_boards/" not in path:
+                parts = [p for p in path.split("/") if p and p not in ("embed", "job_app")]
+                if parts:
+                    return parts[0].lower()
 
         # Lever: jobs.lever.co/LuminDigital/... → lumindigital
         if "lever.co" in host:
@@ -656,6 +749,38 @@ def extract_company(application_url: str | None) -> str | None:
         # Jobvite: jobs.jobvite.com/en/company/... → company
         if "jobvite.com" in host:
             parts = [p for p in path.split("/") if p and p != "en"]
+            if parts:
+                return parts[0].lower()
+
+        # Ashby: jobs.ashbyhq.com/{company-slug}/... → company-slug
+        if "ashbyhq.com" in host:
+            from urllib.parse import unquote
+            parts = [p for p in path.split("/") if p]
+            if parts:
+                return unquote(parts[0]).lower()
+
+        # Rippling ATS: ats.rippling.com/{company-slug}/jobs/... → company-slug
+        if "rippling.com" in host and host.startswith("ats."):
+            parts = [p for p in path.split("/") if p]
+            if parts:
+                return parts[0].lower()
+
+        # Workable: apply.workable.com/{company}/j/... → company
+        # (short-form apply.workable.com/j/CODE has no company name — skip those)
+        if "workable.com" in host:
+            parts = [p for p in path.split("/") if p]
+            if parts and parts[0] != "j":
+                return parts[0].lower()
+
+        # Recruitee: {company}.recruitee.com/... → company
+        if "recruitee.com" in host:
+            sub = host.split(".recruitee.com")[0]
+            if sub and sub not in ("www", "app", "jobs"):
+                return sub.lower()
+
+        # SmartRecruiters: careers.smartrecruiters.com/{Company}/... → company
+        if "smartrecruiters.com" in host:
+            parts = [p for p in path.split("/") if p]
             if parts:
                 return parts[0].lower()
 
@@ -788,10 +913,13 @@ def store_account(conn: sqlite3.Connection, account: dict,
 
     Args:
         conn: Database connection.
-        account: Dict with keys: site, domain, email, password.
+        account: Dict with keys: site, domain, email, password,
+                 and optionally login_method ('email' | 'linkedin').
         job_url: The job URL that triggered this account creation.
     """
     now = datetime.now(timezone.utc).isoformat()
+    # login_method is stored in notes so it shows up in the CLI and prompt
+    notes = account.get("notes") or account.get("login_method")
     conn.execute(
         "INSERT INTO accounts (site, domain, email, password, created_at, job_url, notes) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -802,30 +930,219 @@ def store_account(conn: sqlite3.Connection, account: dict,
             account.get("password", ""),
             now,
             job_url,
-            account.get("notes"),
+            notes,
         ),
     )
     conn.commit()
 
 
 def get_accounts_for_prompt(conn: sqlite3.Connection | None = None) -> dict[str, dict]:
-    """Return saved accounts as {domain: {email, password}} for prompt injection.
+    """Return saved accounts as {domain: {email, password, login_method}} for prompt injection.
 
-    Supports subdomain fallback: a query for 'fico.wd1.myworkdayjobs.com'
-    first checks for an exact match, then falls back to 'myworkdayjobs.com'.
+    Includes subdomain aliases so the agent sees both the exact stored domain
+    AND any shorter base-domain fallbacks.  For example, storing
+    'blueorigin.wd5.myworkdayjobs.com' also emits a 'myworkdayjobs.com' entry
+    (if no separate entry exists) so new Workday subdomains get a password hint.
+    The same fallback applies to iCIMS subdomains (careers-*.icims.com → icims.com).
+
+    login_method is stored in the notes column ('email' | 'linkedin' | None).
     """
     if conn is None:
         conn = get_connection()
     rows = conn.execute(
-        "SELECT domain, email, password FROM accounts ORDER BY created_at DESC"
+        "SELECT domain, email, password, notes FROM accounts ORDER BY created_at DESC"
     ).fetchall()
-    # Build lookup: most recent account per domain wins
+    # Most recent account per exact domain wins
     accounts: dict[str, dict] = {}
     for row in rows:
         domain = row["domain"]
         if domain not in accounts:
-            accounts[domain] = {"email": row["email"], "password": row["password"] or ""}
+            accounts[domain] = {
+                "email": row["email"],
+                "password": row["password"] or "",
+                "login_method": row["notes"] or "",
+            }
+
+    # Subdomain fallback: for multi-part domains (e.g. blueorigin.wd5.myworkdayjobs.com,
+    # careers-healthedge.icims.com) also register the base ATS domain so the agent can
+    # match new subdomains it hasn't seen before.
+    extras: dict[str, dict] = {}
+    for domain, creds in accounts.items():
+        parts = domain.split(".")
+        if len(parts) > 2:
+            base = ".".join(parts[-2:])          # e.g. "myworkdayjobs.com" or "icims.com"
+            if base not in accounts and base not in extras:
+                extras[base] = creds
+    accounts.update(extras)
     return accounts
+
+
+def get_all_accounts(conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Return all rows from the accounts table, newest first."""
+    if conn is None:
+        conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, site, domain, email, password, notes, created_at, job_url "
+        "FROM accounts ORDER BY created_at DESC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mine_accounts_from_logs(log_dir: str) -> list[dict]:
+    """Scan apply log files and extract credential hints.
+
+    Two strategies:
+    1. Structured: lines matching ``ACCOUNT_CREATED:{...}`` (current format).
+    2. Free-form: ATS subdomain URLs appearing within 60 lines of a
+       ``Password: XXXX`` line (older logs where the agent wrote prose).
+
+    Returns a list of dicts with keys: domain, email, password, source_file.
+    Duplicates (same domain) are collapsed, keeping the first occurrence.
+    """
+    import re
+    from pathlib import Path
+
+    log_path = Path(log_dir)
+    if not log_path.is_dir():
+        return []
+
+    # Regex patterns
+    account_created_re = re.compile(r'ACCOUNT_CREATED:\s*(\{.*\})')
+    password_re = re.compile(
+        r'(?:^|[-*\s])Password[:\s]+([A-Za-z0-9!@#$%^&*()\-_=+]{8,32})\s*$',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # ATS subdomain patterns worth capturing
+    domain_re = re.compile(
+        r'https?://([a-z0-9][\w.-]+\.'
+        r'(?:myworkdayjobs\.com|icims\.com|taleo\.net|successfactors\.com|'
+        r'greenhouse\.io|lever\.co|ashbyhq\.com|jobvite\.com))',
+        re.IGNORECASE,
+    )
+
+    results: dict[str, dict] = {}  # domain → entry
+
+    for log_file in sorted(log_path.glob("claude_*.txt")):
+        try:
+            text = log_file.read_text(errors="replace")
+        except OSError:
+            continue
+
+        lines = text.splitlines()
+
+        # Strategy 1: structured ACCOUNT_CREATED lines
+        for line in lines:
+            m = account_created_re.search(line)
+            if not m:
+                continue
+            try:
+                entry = json.loads(m.group(1))
+                domain = entry.get("domain", "").strip()
+                email  = entry.get("email", "").strip()
+                pwd    = entry.get("password", "").strip()
+                site   = entry.get("site", "").strip()
+                if domain and email and domain not in results:
+                    results[domain] = {
+                        "domain": domain, "email": email,
+                        "password": pwd, "site": site,
+                        "source": "structured", "source_file": log_file.name,
+                    }
+            except (json.JSONDecodeError, AttributeError):
+                continue
+
+        # Strategy 2: free-form — find password mentions near ATS domain URLs
+        # Build index: line_no → domain found on that line
+        domain_lines: list[tuple[int, str]] = []
+        for i, line in enumerate(lines):
+            dm = domain_re.search(line)
+            if dm:
+                domain_lines.append((i, dm.group(1).lower()))
+
+        if not domain_lines:
+            continue
+
+        # Find all password mentions with their line numbers
+        for pm in password_re.finditer(text):
+            pwd = pm.group(1).strip()
+            # Ignore template-like passwords from the prompt injection
+            if pwd in ("{personal", "personal.get", "password", "PASSWORD"):
+                continue
+            pwd_lineno = text[:pm.start()].count("\n")
+
+            # Find the nearest domain within a 60-line window
+            nearest = min(
+                domain_lines,
+                key=lambda t: abs(t[0] - pwd_lineno),
+                default=None,
+            )
+            if nearest is None or abs(nearest[0] - pwd_lineno) > 60:
+                continue
+            domain = nearest[1]
+            if domain in results:
+                continue  # structured entry takes priority
+
+            # Try to find the email on nearby lines
+            window = "\n".join(lines[max(0, pwd_lineno - 10): pwd_lineno + 10])
+            email_m = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', window)
+            email = email_m.group(0) if email_m else ""
+
+            results[domain] = {
+                "domain": domain, "email": email,
+                "password": pwd, "site": "",
+                "source": "free-form", "source_file": log_file.name,
+            }
+
+    return list(results.values())
+
+
+def upsert_account(domain: str, email: str, password: str | None,
+                   site: str | None = None, notes: str | None = None,
+                   conn: sqlite3.Connection | None = None) -> str:
+    """Insert or update a credential row for a domain.
+
+    If a row already exists for the domain, updates email/password/notes.
+    Returns "created" or "updated".
+    """
+    if conn is None:
+        conn = get_connection()
+    existing = conn.execute(
+        "SELECT id FROM accounts WHERE domain = ? ORDER BY created_at DESC LIMIT 1",
+        (domain,)
+    ).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        updates = ["email = ?", "password = ?"]
+        params: list = [email, password]
+        if notes is not None:
+            updates.append("notes = ?")
+            params.append(notes)
+        if site is not None:
+            updates.append("site = ?")
+            params.append(site)
+        params.append(existing["id"])
+        conn.execute(
+            f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?", params
+        )
+        conn.commit()
+        return "updated"
+    else:
+        conn.execute(
+            "INSERT INTO accounts (site, domain, email, password, notes, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (site or domain.split(".")[0], domain, email, password, notes, now),
+        )
+        conn.commit()
+        return "created"
+
+
+def delete_account(domain: str,
+                   conn: sqlite3.Connection | None = None) -> int:
+    """Delete all credential rows for a domain. Returns number of rows deleted."""
+    if conn is None:
+        conn = get_connection()
+    cursor = conn.execute("DELETE FROM accounts WHERE domain = ?", (domain,))
+    conn.commit()
+    return cursor.rowcount
 
 
 def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
@@ -848,9 +1165,21 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
 
     conditions = {
         "discovered": "1=1",
-        "pending_detail": "detail_scraped_at IS NULL",
+        "pending_detail": (
+            # Never scraped, OR a retriable error whose backoff window has elapsed
+            "detail_scraped_at IS NULL "
+            "OR (detail_error_category = 'retriable' "
+            "    AND (detail_next_retry_at IS NULL OR detail_next_retry_at <= datetime('now')))"
+        ),
         "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
+        "pending_score": (
+            # Unscored jobs, OR scoring failed but backoff window has elapsed
+            "full_description IS NOT NULL AND ("
+            "  (fit_score IS NULL AND score_error IS NULL) "
+            "  OR (score_error IS NOT NULL AND score_retry_count < 5 "
+            "      AND (score_next_retry_at IS NULL OR score_next_retry_at <= datetime('now')))"
+            ")"
+        ),
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
@@ -943,30 +1272,57 @@ def create_stub_job(email: dict, classification: str,
     """Create a minimal job entry from an unmatched application email.
 
     Used for manually applied jobs that aren't in the pipeline DB.
-    The URL is synthesized as 'manual://{sender_domain}/{hash}' to
-    serve as a unique key.
+    The URL is synthesized as 'manual://{sender_domain}/{hash}'.
+
+    Key strategy:
+    - When a company name can be extracted from the subject or snippet,
+      key on (domain_root, company_normalized) so all emails about the same
+      company via the same ATS share one stub (Honor via Greenhouse,
+      Honor re-confirmation, Honor security code, etc.).
+    - Fall back to (sender:subject) when no company is extractable — keeps
+      per-subject uniqueness for generic subjects like "We received your application".
 
     Args:
-        email: Normalized email dict with sender, subject, date, etc.
-        classification: The LLM classification (confirmation, rejection, etc.)
+        email: Normalized email dict with sender, subject, snippet, date, etc.
+        classification: The email classification (confirmation, rejection, etc.)
 
     Returns:
         The generated job URL (primary key).
     """
     import hashlib
+    from applypilot.tracking.matcher import (
+        extract_company_from_subject,
+        _extract_company_from_snippet,
+        normalize_company,
+    )
 
     if conn is None:
         conn = get_connection()
 
-    # Extract company from sender domain
     sender = email.get("sender", "")
     domain = sender.split("@")[-1] if "@" in sender else "unknown"
-    company = domain.split(".")[0] if "." in domain else domain
+    domain_root = ".".join(domain.split(".")[-2:]) if "." in domain else domain
 
-    # Build a stable synthetic URL
     subject = email.get("subject", "")
-    raw = f"{sender}:{subject}"
-    url_hash = hashlib.md5(raw.encode()).hexdigest()[:12]
+    snippet = email.get("snippet", "")
+
+    # Try to extract a real company name from subject then snippet
+    extracted_company = (
+        extract_company_from_subject(subject)
+        or _extract_company_from_snippet(snippet)
+    )
+
+    if extracted_company:
+        # Key on (domain_root, company_normalized) — all emails for the same
+        # company from the same ATS relay collapse to one stub
+        company = extracted_company
+        key = f"{domain_root}:{normalize_company(extracted_company)}"
+    else:
+        # Fallback: unique per sender+subject (safe for generic subjects)
+        company = ""  # Unknown — don't use ATS domain name as company (would attract all emails from that ATS)
+        key = f"{sender}:{subject}"
+
+    url_hash = hashlib.md5(key.encode()).hexdigest()[:12]
     url = f"manual://{domain}/{url_hash}"
 
     # Check if already exists
@@ -976,7 +1332,6 @@ def create_stub_job(email: dict, classification: str,
 
     # Infer a title from the subject line
     title = subject
-    # Strip common prefixes
     for prefix in ("Thank you for your application to ",
                    "Thank you for applying to ",
                    "Thank you for your interest in ",
@@ -992,10 +1347,12 @@ def create_stub_job(email: dict, classification: str,
 
     conn.execute(
         "INSERT INTO jobs (url, title, company, site, applied_at, apply_status, "
-        "                  discovered_at, tracking_status, tracking_updated_at) "
-        "VALUES (?, ?, ?, 'manual', ?, 'applied', ?, ?, ?)",
-        (url, title.strip() or "Unknown Position", company, email_date, now,
-         classification, now),
+        "                  discovered_at, tracking_status, tracking_updated_at, "
+        "                  detail_error, detail_error_category) "
+        "VALUES (?, ?, ?, 'manual', ?, 'applied', ?, ?, ?, "
+        "        'manual:// stub — not a real job listing', 'permanent')",
+        (url, title.strip() or extracted_company or "Unknown Position",
+         company, email_date, now, classification, now),
     )
     conn.commit()
     return url

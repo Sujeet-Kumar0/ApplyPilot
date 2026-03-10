@@ -244,6 +244,8 @@ async def search_application_emails(days: int = 14, limit: int = 100) -> list[di
         f"{base} {{from:greenhouse.io OR from:lever.co OR from:icims.com OR from:myworkdayjobs.com OR from:jobvite.com OR from:smartrecruiters.com}}",
         # Subject-line keywords
         f"{base} {{subject:application OR subject:interview OR subject:candidate OR subject:\"next steps\" OR subject:\"your application\"}}",
+        # Spam folder — job emails sometimes land here
+        f"in:spam {base} {{subject:application OR subject:interview OR subject:offer OR subject:candidate}}",
     ]
 
     all_emails: dict[str, dict] = {}  # Deduplicate by ID
@@ -257,7 +259,7 @@ async def search_application_emails(days: int = 14, limit: int = 100) -> list[di
                     try:
                         raw_text = await _call_tool_raw(
                             session, "search_emails",
-                            {"query": query, "max_results": limit},
+                            {"query": query, "maxResults": limit},
                         )
                     except asyncio.TimeoutError:
                         log.warning("Gmail search timed out: %s", query[:60])
@@ -327,6 +329,75 @@ async def read_email_bodies(email_ids: list[str]) -> dict[str, dict]:
 
     log.info("Read %d/%d email bodies", len(results), len(email_ids))
     return results
+
+
+async def _get_or_create_label(session, label_name: str) -> str | None:
+    """Return the Gmail label ID for label_name, creating it if missing.
+
+    Uses the MCP server's native get_or_create_label tool.
+    Returns None if label operations fail.
+    """
+    try:
+        raw = await _call_tool_raw(session, "get_or_create_label", {"name": label_name})
+        if raw.startswith("Error:"):
+            log.warning("Could not get/create Gmail label '%s': %s", label_name, raw[:100])
+            return None
+        m = re.search(r"Label_\w+", raw)
+        if m:
+            return m.group(0)
+        log.warning("Could not parse label ID from response: %s", raw[:100])
+        return None
+    except Exception as e:
+        log.warning("Gmail label operation failed: %s", e)
+        return None
+
+
+async def apply_label_to_emails(email_ids: list[str], label: str = "ap-track") -> int:
+    """Apply a Gmail label to a batch of email IDs using batch_modify_emails.
+
+    Best-effort: gracefully skips if label operations fail.
+
+    Args:
+        email_ids: Gmail message IDs to label.
+        label: Label name to apply (created if it doesn't exist).
+
+    Returns:
+        Count of emails submitted for labeling (batch operation).
+    """
+    if not email_ids:
+        return 0
+
+    from mcp import ClientSession
+
+    try:
+        async with await _create_mcp_client() as (read, write):
+            async with ClientSession(read, write) as session:
+                await asyncio.wait_for(session.initialize(), timeout=30)
+
+                label_id = await _get_or_create_label(session, label)
+                if label_id is None:
+                    return 0
+
+                # Chunk to avoid MCP client TaskGroup errors with large payloads
+                CHUNK = 50
+                total_labeled = 0
+                for i in range(0, len(email_ids), CHUNK):
+                    chunk = email_ids[i:i + CHUNK]
+                    raw = await _call_tool_raw(session, "batch_modify_emails", {
+                        "messageIds": chunk,
+                        "addLabelIds": [label_id],
+                    })
+                    if raw.startswith("Error:"):
+                        log.warning("batch_modify_emails failed (chunk %d): %s", i // CHUNK, raw[:100])
+                        continue
+                    total_labeled += len(chunk)
+
+                log.info("Applied '%s' label to %d emails", label, total_labeled)
+                return total_labeled
+
+    except Exception as e:
+        log.warning("Gmail label session failed: %s", e)
+        return 0
 
 
 async def fetch_application_emails(days: int = 14, limit: int = 100) -> list[dict]:

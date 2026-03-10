@@ -167,23 +167,42 @@ applypilot run enrich                          # Fetch full descriptions
 applypilot run score --limit 100               # AI scoring
 applypilot run tailor --limit 50               # Tailor resumes (score >= 7)
 applypilot run cover                           # Generate cover letters
-applypilot run score tailor cover --stream     # All stages concurrently
-applypilot status                              # Pipeline funnel stats
-applypilot dashboard                           # Generate HTML dashboard
+applypilot run pdf                             # Generate PDFs for tailored resumes/cover letters
+applypilot run score tailor cover --stream     # Multiple stages concurrently
+applypilot run discover enrich score tailor cover pdf --stream --workers 6 --min-score 9 --limit 50
+applypilot status                              # Pipeline funnel stats (by stage + by apply category)
+applypilot dashboard                           # Generate and open HTML dashboard
 
 # Tier 3 apply (uses Claude Code credits)
-applypilot apply --dry-run --url URL           # Test one job (no submit)
-applypilot apply                               # Auto-apply to cover_ready jobs
-applypilot human-review                        # HITL server for needs_human jobs
+applypilot apply                               # Auto-apply to cover_ready jobs (5 workers, continuous)
+applypilot apply --url URL --dry-run           # Test a single job without submitting
+applypilot apply --workers 3 --min-score 9     # Tune parallelism and score floor
+applypilot apply --reset-category blocked_technical   # Retry jobs in a category
+applypilot apply --reset-failed                # Retry all failed jobs
+applypilot apply --fresh-sessions              # Refresh Chrome cookies from real profile first
+applypilot apply --sessions                    # List saved ATS sessions
+applypilot apply --clear-session workday       # Clear a specific ATS session
+applypilot apply --mark-applied URL            # Manually mark a job as applied
+applypilot apply --mark-failed URL --fail-reason "reason"  # Manually mark a job failed
+applypilot human-review                        # HITL review server for needs_human jobs (port 7373)
 
 # Post-apply tracking
 applypilot track                               # Scan Gmail for responses, triage action items
 
 # Q&A knowledge base (screening questions)
-applypilot qa list                             # List known Q&A pairs
-applypilot qa stats                            # KB coverage stats
-applypilot qa export --output qa.yaml          # Export to YAML
-applypilot qa import --file qa.yaml            # Import from YAML
+applypilot qa list                             # List stored Q&A pairs
+applypilot qa stats                            # Coverage stats by source/outcome/ATS
+applypilot qa export --output qa.yaml          # Export to YAML for editing
+applypilot qa import qa.yaml                   # Import from YAML
+
+# Site credentials (usernames / passwords)
+applypilot creds list                          # List all saved credentials (passwords masked)
+applypilot creds show linkedin.com             # Show full unmasked credentials for a domain
+applypilot creds add linkedin.com -e user@example.com   # Add/update (password prompted)
+applypilot creds set linkedin.com -p newpass   # Update a field (prompts if nothing given)
+applypilot creds delete linkedin.com           # Delete with confirmation (-y to skip)
+applypilot creds import-logs                   # Scan apply logs for credentials and import
+applypilot creds import-logs --dry-run         # Preview without writing
 ```
 
 ---

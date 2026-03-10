@@ -101,11 +101,20 @@ if (typeof WORKER_CONFIG !== 'undefined' && WORKER_CONFIG.workerId !== null) {
   }
 }
 
-// Poll on alarm
-chrome.alarms.create('poll', { periodInMinutes: POLL_MS / 60000 });
+// Poll on alarm — 1-minute period (Chrome's minimum for alarms).
+// The setInterval below handles 3s polling while the SW is alive.
+// The alarm acts as a restart trigger: Chrome wakes the SW to fire the alarm,
+// at which point setInterval restarts from scratch in the new SW context.
+chrome.alarms.create('poll', { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'poll') pollAll();
 });
+
+// Keep the service worker alive by making a harmless runtime API call every 25s.
+// Chrome MV3 terminates idle SWs after ~30s; this extends the window so the
+// 3s setInterval below stays active during normal use. The 1-min alarm above
+// handles the case where the SW does get terminated between popup opens.
+setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 25000);
 
 // Also poll on install/startup
 chrome.runtime.onInstalled.addListener(pollAll);

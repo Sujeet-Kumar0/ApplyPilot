@@ -171,6 +171,8 @@ def apply(
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
     mark_applied: Optional[str] = typer.Option(None, "--mark-applied", help="Manually mark a job URL as applied."),
     fresh_sessions: bool = typer.Option(False, "--fresh-sessions", help="Refresh Chrome session cookies from your real profile before launching."),
+    no_hitl: bool = typer.Option(False, "--no-hitl", help="Skip HITL waits: park needs_human jobs and move on. Use for overnight runs."),
+    no_focus: bool = typer.Option(False, "--no-focus", help="Prevent Chrome windows from stealing keyboard focus (Linux/GNOME only). Windows stay visible but won't interrupt your active app."),
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
@@ -308,6 +310,8 @@ def apply(
         continuous=continuous,
         workers=workers,
         fresh_sessions=fresh_sessions,
+        no_hitl=no_hitl,
+        no_focus=no_focus,
     )
 
 
@@ -394,46 +398,85 @@ def status() -> None:
 
         console.print(funnel_table)
 
-    # Apply categories
+    # Apply categories with per-score breakdown
     by_cat = stats.get("by_category", {})
     if by_cat:
         cat_table = Table(title="\nApply Categories", show_header=True, header_style="bold blue")
         cat_table.add_column("Category", style="bold")
-        cat_table.add_column("Count", justify="right")
+        cat_table.add_column("Total", justify="right")
+        cat_table.add_column("10",  justify="right", style="bold green")
+        cat_table.add_column("9",   justify="right", style="green")
+        cat_table.add_column("8",   justify="right", style="yellow")
+        cat_table.add_column("7",   justify="right", style="yellow")
+        cat_table.add_column("6",   justify="right", style="dim")
+        cat_table.add_column("<6",  justify="right", style="dim")
         cat_table.add_column("Action")
 
         cat_display = {
-            "applied": ("green", "Done"),
-            "pending": ("white", "In queue"),
-            "in_progress": ("cyan", "Running now"),
-            "needs_human": ("magenta", "applypilot human-review"),
-            "blocked_auth": ("yellow", "Needs persistent sessions / HITL"),
-            "blocked_technical": ("yellow", "Retryable: --reset-category blocked_technical"),
-            "archived_ineligible": ("dim", "Location/salary/type mismatch"),
-            "archived_expired": ("dim", "Job no longer available"),
-            "archived_platform": ("red", "Unsupported platform"),
-            "archived_no_url": ("dim", "No application URL"),
-            "manual_only": ("dim", "Manual ATS (no automation)"),
+            "applied":             ("green",   "Done"),
+            "pending":             ("white",   "In queue"),
+            "in_progress":         ("cyan",    "Running now"),
+            "needs_human":         ("magenta", "applypilot human-review"),
+            "blocked_auth":        ("yellow",  "Needs persistent sessions / HITL"),
+            "blocked_technical":   ("yellow",  "Retryable: applypilot reset-category blocked_technical"),
+            "archived_ineligible": ("dim",     "Location/salary/type mismatch"),
+            "archived_expired":    ("dim",     "Job no longer available"),
+            "archived_platform":   ("red",     "Unsupported platform"),
+            "archived_no_url":     ("dim",     "No application URL"),
+            "manual_only":         ("dim",     "Manual ATS (no automation)"),
         }
 
-        # Show in a logical order
+        def _score_cell(d: dict, key: str) -> str:
+            """Format a score count cell — blank if zero."""
+            v = d.get(key, 0) if isinstance(d, dict) else 0
+            return str(v) if v else "[dim]—[/dim]"
+
         order = ["applied", "pending", "in_progress", "needs_human",
                  "blocked_auth", "blocked_technical",
                  "archived_ineligible", "archived_expired",
                  "archived_platform", "archived_no_url", "manual_only"]
         for cat in order:
-            cnt = by_cat.get(cat, 0)
-            if cnt == 0:
+            d = by_cat.get(cat)
+            if not d:
                 continue
+            total = d["total"] if isinstance(d, dict) else d
             color, action = cat_display.get(cat, ("white", ""))
-            cat_table.add_row(f"[{color}]{cat}[/{color}]", str(cnt), action)
+            cat_table.add_row(
+                f"[{color}]{cat}[/{color}]",
+                str(total),
+                _score_cell(d, "10"),
+                _score_cell(d, "9"),
+                _score_cell(d, "8"),
+                _score_cell(d, "7"),
+                _score_cell(d, "6"),
+                _score_cell(d, "<6"),
+                action,
+            )
 
         # Any unknown categories
-        for cat, cnt in sorted(by_cat.items(), key=lambda x: -x[1]):
-            if cat not in cat_display and cnt > 0:
-                cat_table.add_row(cat, str(cnt), "")
+        for cat, d in sorted(by_cat.items(), key=lambda x: -(x[1]["total"] if isinstance(x[1], dict) else x[1])):
+            if cat not in cat_display:
+                total = d["total"] if isinstance(d, dict) else d
+                if total > 0:
+                    cat_table.add_row(
+                        cat, str(total),
+                        _score_cell(d, "10"), _score_cell(d, "9"),
+                        _score_cell(d, "8"),  _score_cell(d, "7"),
+                        _score_cell(d, "6"),  _score_cell(d, "<6"),
+                        "",
+                    )
 
         console.print(cat_table)
+
+        # Retry hint for high-score retryable jobs
+        retryable_tech = by_cat.get("blocked_technical", {})
+        if isinstance(retryable_tech, dict):
+            high_score_retryable = retryable_tech.get("10", 0) + retryable_tech.get("9", 0)
+            if high_score_retryable > 0:
+                console.print(
+                    f"[bold yellow]  ↳ {high_score_retryable} score 9-10 jobs in blocked_technical are retryable.[/bold yellow]"
+                    f" Run: [bold]applypilot reset-category blocked_technical[/bold]"
+                )
 
     # By site (group all HN: * sites under "HackerNews")
     if stats["by_site"]:
@@ -461,6 +504,8 @@ def track(
     ghosted_days: int = typer.Option(7, "--ghosted-days", help="Days before marking as ghosted."),
     limit: int = typer.Option(100, "--limit", "-l", help="Max emails to fetch."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Fetch + classify but don't write DB/files."),
+    relabel: bool = typer.Option(False, "--relabel", help="Apply 'ap-track' label to all emails already in the DB (backfill)."),
+    remap_stubs: bool = typer.Option(False, "--remap-stubs", help="Re-match emails under multi-company stubs to correct per-company jobs."),
 ) -> None:
     """Track application responses from Gmail."""
     _bootstrap()
@@ -490,6 +535,16 @@ def track(
     if actions:
         from applypilot.tracking import show_action_items
         show_action_items()
+        return
+
+    if relabel:
+        from applypilot.tracking import relabel_all_tracked
+        relabel_all_tracked()
+        return
+
+    if remap_stubs:
+        from applypilot.tracking import remap_stubs as _remap_stubs
+        _remap_stubs()
         return
 
     from applypilot.tracking import run_tracking
@@ -670,6 +725,239 @@ def qa_import(
             count += 1
 
     console.print(f"[green]Imported {count} Q&A pair(s).[/green]")
+
+
+# ---------------------------------------------------------------------------
+# creds — site credential CRUD
+# ---------------------------------------------------------------------------
+
+creds_app = typer.Typer(name="creds", help="Manage saved site credentials (usernames / passwords).")
+app.add_typer(creds_app)
+
+
+@creds_app.command("list")
+def creds_list(
+    show: bool = typer.Option(False, "--show", "-s", help="Show passwords in plaintext."),
+) -> None:
+    """List all saved site credentials."""
+    _bootstrap()
+
+    from applypilot.database import get_all_accounts
+
+    rows = get_all_accounts()
+    if not rows:
+        console.print("[dim]No credentials saved yet. Use [bold]applypilot creds add[/bold] to add one.[/dim]")
+        return
+
+    t = Table(title=f"Site Credentials ({len(rows)} entries)", show_header=True, header_style="bold cyan")
+    t.add_column("Domain",   min_width=28)
+    t.add_column("Site",     min_width=12)
+    t.add_column("Email",    min_width=24)
+    t.add_column("Password", min_width=16)
+    t.add_column("Notes",    max_width=30)
+    t.add_column("Saved",    min_width=10)
+
+    for row in rows:
+        pwd = row["password"] or ""
+        pwd_display = pwd if show else (("*" * min(len(pwd), 8)) if pwd else "[dim]—[/dim]")
+        saved_date = (row["created_at"] or "")[:10]
+        t.add_row(
+            row["domain"],
+            row["site"] or "",
+            row["email"],
+            pwd_display,
+            row["notes"] or "",
+            saved_date,
+        )
+
+    console.print(t)
+    if not show:
+        console.print("[dim]Passwords are masked. Use [bold]--show[/bold] to reveal them.[/dim]")
+
+
+@creds_app.command("show")
+def creds_show(
+    domain: str = typer.Argument(..., help="Domain to show credentials for (e.g. linkedin.com)."),
+) -> None:
+    """Show full (unmasked) credentials for a single domain."""
+    _bootstrap()
+
+    from applypilot.database import get_all_accounts
+
+    rows = [r for r in get_all_accounts() if r["domain"] == domain]
+    if not rows:
+        console.print(f"[red]No credentials found for domain:[/red] {domain}")
+        raise typer.Exit(code=1)
+
+    row = rows[0]
+    console.print(f"\n  [bold]Domain:[/bold]   {row['domain']}")
+    console.print(f"  [bold]Site:[/bold]     {row['site'] or ''}")
+    console.print(f"  [bold]Email:[/bold]    {row['email']}")
+    console.print(f"  [bold]Password:[/bold] {row['password'] or '[dim](none)[/dim]'}")
+    if row["notes"]:
+        console.print(f"  [bold]Notes:[/bold]    {row['notes']}")
+    if row["job_url"]:
+        console.print(f"  [bold]Job URL:[/bold]  {row['job_url']}")
+    console.print(f"  [bold]Saved:[/bold]    {(row['created_at'] or '')[:19]}\n")
+
+
+@creds_app.command("add")
+def creds_add(
+    domain:   str = typer.Argument(..., help="Domain key (e.g. linkedin.com, myworkdayjobs.com)."),
+    email:    str = typer.Option(...,  "--email",    "-e", help="Login email / username."),
+    password: str = typer.Option(None, "--password", "-p", help="Password (prompted if omitted)."),
+    site:     str = typer.Option(None, "--site",     "-s", help="Human-readable site name."),
+    notes:    str = typer.Option(None, "--notes",    "-n", help="Optional notes."),
+) -> None:
+    """Add or update credentials for a site."""
+    _bootstrap()
+
+    from applypilot.database import upsert_account
+
+    if password is None:
+        password = typer.prompt(f"Password for {domain}", hide_input=True, confirmation_prompt=True)
+
+    action = upsert_account(domain, email, password, site=site, notes=notes)
+    verb = "[green]Created[/green]" if action == "created" else "[yellow]Updated[/yellow]"
+    console.print(f"{verb} credentials for [bold]{domain}[/bold] ({email})")
+
+
+@creds_app.command("set")
+def creds_set(
+    domain:   str = typer.Argument(..., help="Domain to update."),
+    email:    str = typer.Option(None, "--email",    "-e", help="New email / username."),
+    password: str = typer.Option(None, "--password", "-p", help="New password (prompted if --email not given either)."),
+    notes:    str = typer.Option(None, "--notes",    "-n", help="Update notes."),
+) -> None:
+    """Update one or more fields for an existing credential entry."""
+    _bootstrap()
+
+    from applypilot.database import get_all_accounts, upsert_account
+
+    existing = next((r for r in get_all_accounts() if r["domain"] == domain), None)
+    if not existing:
+        console.print(f"[red]No credentials found for:[/red] {domain}  (use [bold]add[/bold] to create one)")
+        raise typer.Exit(code=1)
+
+    new_email    = email    or existing["email"]
+    new_password = password or existing["password"]
+    new_notes    = notes    if notes is not None else existing["notes"]
+
+    if not email and not password and notes is None:
+        # Nothing specified — prompt for password at minimum
+        new_password = typer.prompt(f"New password for {domain}", hide_input=True, confirmation_prompt=True)
+
+    upsert_account(domain, new_email, new_password, site=existing["site"], notes=new_notes)
+    console.print(f"[green]Updated[/green] credentials for [bold]{domain}[/bold]")
+
+
+@creds_app.command("import-logs")
+def creds_import_logs(
+    log_dir: str = typer.Option(None, "--log-dir", help="Directory of apply logs. Defaults to ~/.applypilot/logs/."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be imported without writing."),
+    yes:     bool = typer.Option(False, "--yes", "-y", help="Skip per-entry confirmation for free-form entries."),
+) -> None:
+    """Scan apply logs for account credentials and import into the DB.
+
+    Handles both structured ACCOUNT_CREATED: lines (current format) and
+    older free-form log entries where the agent wrote the password as prose.
+    Already-known domains are skipped unless --yes is passed.
+    """
+    _bootstrap()
+
+    import os
+    from applypilot.database import mine_accounts_from_logs, upsert_account, get_all_accounts
+
+    if log_dir is None:
+        log_dir = os.path.expanduser("~/.applypilot/logs")
+
+    console.print(f"[dim]Scanning logs in {log_dir}…[/dim]")
+    found = mine_accounts_from_logs(log_dir)
+
+    if not found:
+        console.print("[dim]No credential hints found in logs.[/dim]")
+        return
+
+    existing_domains = {r["domain"] for r in get_all_accounts()}
+
+    imported = skipped = already = 0
+    for entry in found:
+        domain   = entry["domain"]
+        email    = entry["email"]
+        password = entry.get("password", "")
+        site     = entry.get("site", "")
+        source   = entry.get("source", "")
+        src_file = entry.get("source_file", "")
+        is_new   = domain not in existing_domains
+
+        status_tag = "[green]NEW[/green]" if is_new else "[dim]EXISTS[/dim]"
+        src_tag    = "[cyan]structured[/cyan]" if source == "structured" else "[yellow]free-form[/yellow]"
+        console.print(
+            f"  {status_tag} {src_tag}  {domain}  {email or '[dim](no email)[/dim]'}"
+            f"  pw={'***' if password else '[dim]none[/dim]'}  ({src_file})"
+        )
+
+        if not is_new:
+            already += 1
+            continue
+
+        if dry_run:
+            imported += 1
+            continue
+
+        # Free-form entries ask for confirmation (may be less reliable)
+        if source == "free-form" and not yes:
+            if not email or not password:
+                console.print(f"    [dim]Skipping — missing email or password. Add manually with: "
+                              f"applypilot creds add {domain}[/dim]")
+                skipped += 1
+                continue
+            confirmed = typer.confirm(f"    Import {domain} ({email} / {password[:4]}***)?")
+            if not confirmed:
+                skipped += 1
+                continue
+
+        if email and password:
+            upsert_account(domain, email, password, site=site or None,
+                           notes=f"auto-imported from log: {src_file}")
+            existing_domains.add(domain)
+            imported += 1
+        else:
+            console.print(f"    [dim]Skipping — missing {'email' if not email else 'password'}. "
+                          f"Add manually: applypilot creds add {domain}[/dim]")
+            skipped += 1
+
+    suffix = " [dim](dry run — nothing written)[/dim]" if dry_run else ""
+    console.print(
+        f"\n[green]Imported {imported}[/green]  "
+        f"[dim]already-known {already}  skipped {skipped}[/dim]{suffix}"
+    )
+
+
+@creds_app.command("delete")
+def creds_delete(
+    domain: str = typer.Argument(..., help="Domain whose credentials to delete."),
+    yes:    bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
+) -> None:
+    """Delete all saved credentials for a domain."""
+    _bootstrap()
+
+    from applypilot.database import delete_account, get_all_accounts
+
+    existing = [r for r in get_all_accounts() if r["domain"] == domain]
+    if not existing:
+        console.print(f"[red]No credentials found for:[/red] {domain}")
+        raise typer.Exit(code=1)
+
+    row = existing[0]
+    if not yes:
+        confirmed = typer.confirm(f"Delete credentials for {domain} ({row['email']})?")
+        if not confirmed:
+            console.print("[dim]Cancelled.[/dim]")
+            raise typer.Exit()
+
+    deleted = delete_account(domain)
+    console.print(f"[green]Deleted {deleted} credential row(s) for[/green] [bold]{domain}[/bold]")
 
 
 if __name__ == "__main__":

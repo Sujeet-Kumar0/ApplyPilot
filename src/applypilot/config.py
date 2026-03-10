@@ -27,6 +27,9 @@ CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
 SESSIONS_DIR = APP_DIR / "chrome-sessions"
 
+# Optional documents (profile photo, certs, ID, etc.)
+FILES_DIR = APP_DIR / "files"
+
 # Package-shipped config (YAML registries)
 PACKAGE_DIR = Path(__file__).parent
 CONFIG_DIR = PACKAGE_DIR / "config"
@@ -89,7 +92,7 @@ def get_chrome_user_data() -> Path:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, TRACKING_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR, SESSIONS_DIR]:
+    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, TRACKING_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR, SESSIONS_DIR, FILES_DIR]:
         d.mkdir(parents=True, exist_ok=True)
 
 

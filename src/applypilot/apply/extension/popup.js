@@ -36,9 +36,12 @@ async function apiCall(wid, path, opts = {}) {
   });
 }
 
+// Last serialized workers state — used to skip redundant re-renders.
+let _lastWorkersJson = '';
+
 // Fetch fresh status directly from all worker servers (bypass storage).
-// Used by the refresh button so the popup updates even when workers data
-// hasn't changed (chrome.storage.onChanged won't fire in that case).
+// Only re-renders if data actually changed, so open textareas aren't
+// interrupted by DOM rebuilds every 2s.
 async function refreshFromServers() {
   const results = await Promise.allSettled(
     Array.from({ length: MAX_WORKERS }, (_, i) =>
@@ -54,7 +57,14 @@ async function refreshFromServers() {
       ? { ...r.value, workerId: r.value.workerId ?? i }
       : null))
     .filter(Boolean);
-  renderAll(fresh);
+
+  const newJson = JSON.stringify(fresh);
+  if (newJson !== _lastWorkersJson) {
+    _lastWorkersJson = newJson;
+    renderAll(fresh);
+  }
+
+  _updateRefreshAge();
 }
 
 function esc(str) {
@@ -89,13 +99,14 @@ function renderAll(workerData) {
     return;
   }
 
-  // Sort: HITL first, then paused, then applying, then other
+  // Sort: HITL first, then resuming, then paused, then applying, then other
   const priority = w => {
     const s = w.status;
     if (s === 'waiting_human' || s === 'needs_human') return 0;
-    if (s === 'paused_by_user') return 1;
-    if (s === 'applying') return 2;
-    return 3;
+    if (s === 'resuming') return 1;
+    if (s === 'paused_by_user') return 2;
+    if (s === 'applying') return 3;
+    return 4;
   };
 
   list.innerHTML = [...workers]
@@ -150,6 +161,9 @@ function renderCard(w) {
   } else if (s === 'waiting_human' || s === 'needs_human') {
     dotClass = 'dot-purple'; statusText = 'Human Review Needed'; statusClass = 'c-purple';
     borderClass = 'card-hitl';
+  } else if (s === 'resuming') {
+    dotClass = 'dot-purple'; statusText = 'Agent Taking Over…';  statusClass = 'c-purple';
+    borderClass = 'card-hitl';
   } else {
     dotClass = 'dot-gray';   statusText = s;                    statusClass = 'c-gray';
   }
@@ -184,6 +198,15 @@ function renderCard(w) {
         <div class="divider"></div>
         <button class="btn btn-handback" style="width:100%"
           data-action="handback" data-wid="${wid}">⏭ Give Back Control</button>
+      </div>`;
+
+  } else if (s === 'resuming') {
+    bodyHtml = `
+      <div class="card-body">
+        <div class="hitl-instructions">Agent is taking over the browser…</div>
+        <div class="btn-row">
+          <button class="btn btn-done flex1" disabled style="opacity:0.6;cursor:default">⏳ Resuming…</button>
+        </div>
       </div>`;
 
   } else if (s === 'waiting_human' || s === 'needs_human') {
@@ -410,6 +433,23 @@ function closeStream(wid) {
 
 // ── Add to Pipeline ───────────────────────────────────────────────────────────
 
+/**
+ * POST the given URL+title to the job capture endpoint on any live worker.
+ * Returns the parsed JSON response.
+ */
+async function captureJobUrl(url, title) {
+  for (const w of workers) {
+    try {
+      const resp = await apiCall(w.workerId, '/api/add-job', {
+        method: 'POST',
+        body: JSON.stringify({ url, title }),
+      });
+      if (resp.ok) return resp.json();
+    } catch { /* skip */ }
+  }
+  throw new Error('No active workers. Run: applypilot apply');
+}
+
 document.getElementById('btn-add-job').addEventListener('click', async () => {
   const btn = document.getElementById('btn-add-job');
   const fb  = document.getElementById('add-feedback');
@@ -428,19 +468,7 @@ document.getElementById('btn-add-job').addEventListener('click', async () => {
       return;
     }
 
-    if (!workers.length) {
-      fb.className = 'feedback error';
-      fb.textContent = 'No workers online';
-      btn.disabled = false;
-      return;
-    }
-
-    // Send to first responding worker (shared DB — any worker works)
-    const resp = await apiCall(workers[0].workerId, '/api/add-job', {
-      method: 'POST',
-      body: JSON.stringify({ url, title }),
-    });
-    const data = await resp.json();
+    const data = await captureJobUrl(url, title);
 
     if (data.status === 'queued') {
       fb.className = 'feedback success';
@@ -454,7 +482,7 @@ document.getElementById('btn-add-job').addEventListener('click', async () => {
     }
   } catch (err) {
     fb.className = 'feedback error';
-    fb.textContent = `Error: ${err.message}`;
+    fb.textContent = err.message;
     btn.disabled = false;
   }
 });
@@ -465,9 +493,30 @@ function triggerPoll() {
   chrome.runtime.sendMessage({ type: 'poll' });
 }
 
+// ── Live refresh indicator ─────────────────────────────────────────────────────
+
+let _lastRefreshAt = 0;
+
+function _updateRefreshAge() {
+  _lastRefreshAt = Date.now();
+  const el = document.getElementById('btn-refresh');
+  if (el) el.title = 'Auto-refreshing every 2s (last: just now)';
+}
+
+// Updates the refresh button tooltip with the elapsed time since last fetch.
+// Called every second so the "Ns ago" label stays current.
+setInterval(() => {
+  if (!_lastRefreshAt) return;
+  const el = document.getElementById('btn-refresh');
+  if (!el) return;
+  const secs = Math.round((Date.now() - _lastRefreshAt) / 1000);
+  el.title = secs <= 1
+    ? 'Auto-refreshing every 2s (last: just now)'
+    : `Auto-refreshing every 2s (last: ${secs}s ago)`;
+}, 1000);
+
 document.getElementById('btn-refresh').addEventListener('click', async () => {
-  // Directly fetch from worker servers so the popup refreshes even when the
-  // workers array is unchanged (chrome.storage.onChanged won't fire in that case).
+  // Manual refresh: bypass the 2s timer and fetch immediately.
   await refreshFromServers();
   triggerPoll(); // also tell background to update its storage cache
 });
@@ -484,6 +533,165 @@ chrome.storage.onChanged.addListener(changes => {
 
 // Initial load — read both worker state and own worker ID
 chrome.storage.local.get(['workers', 'myWorkerId'], data => {
-  myWorkerId = data.myWorkerId ?? null;
+  // Only update myWorkerId from storage if it has a value — don't overwrite
+  // the WORKER_CONFIG sync fast-path with null if background.js hasn't run yet.
+  if (data.myWorkerId != null) myWorkerId = data.myWorkerId;
   renderAll(data.workers);
 });
+
+// ── Auto-refresh while popup is open ──────────────────────────────────────────
+// Poll directly from worker servers every 2s, bypassing chrome.storage and the
+// background service worker entirely. Chrome MV3 service workers are killed
+// after ~30s of inactivity, so relying on storage.onChanged for live updates is
+// unreliable. This loop keeps the popup always current regardless of SW state.
+// Smart re-render (above) ensures textareas are not interrupted mid-typing.
+refreshFromServers();                    // immediate fresh fetch when popup opens
+setInterval(refreshFromServers, 2000);  // keep refreshing every 2s
+
+// ── Jobs tab ───────────────────────────────────────────────────────────────────
+
+let activeTab = 'workers';
+
+function setTab(name) {
+  activeTab = name;
+  document.getElementById('tab-workers').classList.toggle('active', name === 'workers');
+  document.getElementById('tab-jobs').classList.toggle('active', name === 'jobs');
+  document.getElementById('workers-panel').style.display = name === 'workers' ? '' : 'none';
+  document.getElementById('jobs-panel').style.display    = name === 'jobs'    ? '' : 'none';
+  if (name === 'jobs') loadJobs();
+}
+
+document.getElementById('tab-workers').addEventListener('click', () => setTab('workers'));
+document.getElementById('tab-jobs').addEventListener('click',    () => setTab('jobs'));
+
+// Stage badge helper
+function stageBadge(job) {
+  const cat = job.apply_category || '';
+  const st  = job.apply_status   || '';
+  const hasResume = !!job.tailored_resume_path;
+  const hasCover  = !!job.cover_letter_path;
+
+  if (cat === 'needs_human' || st === 'needs_human')
+    return ['stage-hitl', 'HITL'];
+  if (cat === 'blocked_auth' || cat === 'blocked_technical')
+    return ['stage-blocked', 'Blocked'];
+  if (st === 'failed' || cat.startsWith('archived'))
+    return ['stage-error', 'Error'];
+  if (hasResume && hasCover)
+    return ['stage-ready', 'Ready'];
+  if (hasResume)
+    return ['stage-pending', 'Tailored'];
+  return ['stage-pending', 'Pending'];
+}
+
+function renderJobCard(job) {
+  const [badgeCls, badgeTxt] = stageBadge(job);
+  const score = job.fit_score ? `${job.fit_score}/10` : '?';
+  const company = job.company || job.site || '';
+  const errNote = job.apply_error
+    ? `<div class="job-card-meta" style="color:#fca5a5">${esc(job.apply_error.slice(0, 60))}</div>` : '';
+  const encodedUrl = encodeURIComponent(job.url);
+  return `
+    <div class="job-card" id="jcard-${encodedUrl}">
+      <div class="job-card-top">
+        <div class="job-card-info">
+          <div class="job-card-title">
+            <a href="${esc(job.url)}" target="_blank">${esc(job.title || 'Unknown')}</a>
+          </div>
+          <div class="job-card-meta">${esc(company)}</div>
+          ${errNote}
+        </div>
+        <div class="score-badge">${esc(score)}</div>
+        <span class="stage-badge ${badgeCls}">${badgeTxt}</span>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-sm btn-applied flex1" data-job-action="applied" data-url="${esc(job.url)}">✓ Applied</button>
+        <button class="btn btn-sm btn-skip    flex1" data-job-action="skip"    data-url="${esc(job.url)}">✕ Skip</button>
+        <button class="btn btn-sm btn-reset   flex1" data-job-action="reset"   data-url="${esc(job.url)}">↺ Reset</button>
+        <button class="btn btn-sm btn-error   flex1" data-job-action="error"   data-url="${esc(job.url)}">⚠ Error</button>
+      </div>
+      <div id="jfb-${encodedUrl}" class="job-feedback"></div>
+    </div>`;
+}
+
+async function loadJobs() {
+  const list = document.getElementById('job-list');
+  list.innerHTML = '<div class="jobs-loading">Loading…</div>';
+  try {
+    let resp = null;
+    for (const w of workers) {
+      try {
+        const r = await apiCall(w.workerId, '/api/jobs?limit=50');
+        if (r.ok) { resp = r; break; }
+      } catch { /* skip */ }
+    }
+    if (!resp) throw new Error('No active workers. Run: applypilot apply');
+    const data = await resp.json();
+    const jobs = data.jobs || [];
+    if (!jobs.length) {
+      list.innerHTML = '<div class="jobs-empty">No actionable jobs found.<br><code>applypilot run score tailor cover</code></div>';
+    } else {
+      list.innerHTML = jobs.map(renderJobCard).join('');
+      list.querySelectorAll('[data-job-action]').forEach(btn => {
+        btn.addEventListener('click', handleJobAction);
+      });
+    }
+  } catch (err) {
+    list.innerHTML = `<div class="jobs-empty">Could not load jobs.<br><code>applypilot apply</code><br><span style="color:#475569;font-size:10px">${esc(err.message)}</span></div>`;
+  }
+}
+
+async function handleJobAction(e) {
+  const btn    = e.currentTarget;
+  const action = btn.dataset.jobAction;
+  const url    = btn.dataset.url;
+  const encodedUrl = encodeURIComponent(url);
+  const card   = document.getElementById(`jcard-${encodedUrl}`);
+  const fb     = document.getElementById(`jfb-${encodedUrl}`);
+
+  // Disable all buttons on this card while the request is in flight
+  card.querySelectorAll('[data-job-action]').forEach(b => b.disabled = true);
+
+  const labels = { applied: 'Applied ✓', skip: 'Skipped', reset: 'Reset ↺', error: 'Marked Error' };
+  const colors = { applied: '#6ee7b7', skip: '#fca5a5', reset: '#93c5fd', error: '#fcd34d' };
+
+  try {
+    let ok = false;
+    for (const w of workers) {
+      try {
+        const r = await apiCall(w.workerId, '/api/jobs/mark', {
+          method: 'POST',
+          body: JSON.stringify({ url, action }),
+        });
+        if (r.ok) { ok = true; break; }
+      } catch { /* skip */ }
+    }
+
+    if (!ok) throw new Error('No active workers. Run: applypilot apply');
+
+    // Visual feedback — hide card after brief delay for destructive actions
+    if (fb) {
+      fb.textContent = labels[action] || action;
+      fb.style.color = colors[action] || '#e2e8f0';
+      fb.style.background = 'rgba(255,255,255,0.05)';
+      fb.classList.add('visible');
+    }
+    if (action !== 'reset') {
+      setTimeout(() => { if (card) card.style.display = 'none'; }, 1200);
+    } else {
+      // Reset: re-enable buttons so user can take another action
+      setTimeout(() => {
+        card.querySelectorAll('[data-job-action]').forEach(b => b.disabled = false);
+        if (fb) fb.classList.remove('visible');
+      }, 1500);
+    }
+  } catch (err) {
+    if (fb) {
+      fb.textContent = `Error: ${err.message}`;
+      fb.style.color = '#fca5a5';
+      fb.style.background = 'rgba(255,0,0,0.1)';
+      fb.classList.add('visible');
+    }
+    card.querySelectorAll('[data-job-action]').forEach(b => b.disabled = false);
+  }
+}

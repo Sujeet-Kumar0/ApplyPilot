@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 import httpx
 
 from applypilot import config
-from applypilot.database import get_connection, init_db
+from applypilot.database import commit_with_retry, get_connection, init_db
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
@@ -208,7 +208,7 @@ def _store_hn_job(conn: sqlite3.Connection, job: dict, thread_title: str) -> boo
             (url, title, salary, description, location,
              f"HN: {company}", "hackernews", now, description, now),
         )
-        conn.commit()
+        commit_with_retry(conn)
         return True
     except sqlite3.IntegrityError:
         return False

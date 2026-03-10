@@ -9,15 +9,17 @@ is always code-injected, never LLM-generated. Each retry starts a fresh conversa
 to avoid apologetic spirals.
 """
 
+import hashlib
 import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
-from applypilot.database import get_connection, get_jobs_by_stage
+from applypilot.database import commit_with_retry, get_connection, get_jobs_by_stage, write_with_retry
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
     FABRICATION_WATCHLIST,
@@ -447,12 +449,58 @@ def tailor_resume(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_tailoring(min_score: int = 7, limit: int = 20) -> dict:
+def _tailor_one_job(job: dict, resume_text: str, profile: dict) -> dict:
+    """Tailor resume for a single job. Safe to call from multiple threads."""
+    tailored, report = tailor_resume(resume_text, job, profile)
+
+    safe_title = re.sub(r"[^\w\s-]", "", job.get("title") or "untitled")[:50].strip().replace(" ", "_")
+    safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
+    url_hash = hashlib.md5(job["url"].encode()).hexdigest()[:8]
+    prefix = f"{safe_site}_{safe_title}_{url_hash}"
+
+    txt_path = TAILORED_DIR / f"{prefix}.txt"
+    txt_path.write_text(tailored, encoding="utf-8")
+
+    job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
+    job_desc = (
+        f"Title: {job['title']}\n"
+        f"Company: {job['site']}\n"
+        f"Location: {job.get('location', 'N/A')}\n"
+        f"Score: {job.get('fit_score', 'N/A')}\n"
+        f"URL: {job['url']}\n\n"
+        f"{job.get('full_description', '')}"
+    )
+    job_path.write_text(job_desc, encoding="utf-8")
+
+    report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    pdf_path = None
+    if report["status"] == "approved":
+        try:
+            from applypilot.scoring.pdf import convert_to_pdf
+            pdf_path = str(convert_to_pdf(txt_path))
+        except Exception:
+            log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+
+    return {
+        "url": job["url"],
+        "path": str(txt_path),
+        "pdf_path": pdf_path,
+        "title": job["title"],
+        "site": job["site"],
+        "status": report["status"],
+        "attempts": report["attempts"],
+    }
+
+
+def run_tailoring(min_score: int = 7, limit: int = 20, workers: int = 1) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
         min_score: Minimum fit_score to tailor for.
         limit: Maximum jobs to process.
+        workers: Parallel LLM threads (default 1 = sequential).
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
@@ -469,98 +517,82 @@ def run_tailoring(min_score: int = 7, limit: int = 20) -> dict:
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
-    log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
+    log.info("Tailoring resumes for %d jobs (score >= %d, workers=%d)...", len(jobs), min_score, workers)
     t0 = time.time()
     completed = 0
     results: list[dict] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
 
-    for job in jobs:
-        completed += 1
-        try:
-            tailored, report = tailor_resume(resume_text, job, profile)
-
-            # Build safe filename prefix (include URL hash to avoid collisions)
-            import hashlib
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            url_hash = hashlib.md5(job["url"].encode()).hexdigest()[:8]
-            prefix = f"{safe_site}_{safe_title}_{url_hash}"
-
-            # Save tailored resume text
-            txt_path = TAILORED_DIR / f"{prefix}.txt"
-            txt_path.write_text(tailored, encoding="utf-8")
-
-            # Save job description for traceability
-            job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
-            job_desc = (
-                f"Title: {job['title']}\n"
-                f"Company: {job['site']}\n"
-                f"Location: {job.get('location', 'N/A')}\n"
-                f"Score: {job.get('fit_score', 'N/A')}\n"
-                f"URL: {job['url']}\n\n"
-                f"{job.get('full_description', '')}"
-            )
-            job_path.write_text(job_desc, encoding="utf-8")
-
-            # Save validation report
-            report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
-            report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
-            # Generate PDF for approved resumes (best-effort)
-            pdf_path = None
-            if report["status"] == "approved":
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_tailor_one_job, job, resume_text, profile): job for job in jobs}
+            for future in as_completed(futures):
+                job = futures[future]
+                completed += 1
                 try:
-                    from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                    result = future.result()
+                except Exception as e:
+                    result = {
+                        "url": job["url"], "title": job["title"], "site": job["site"],
+                        "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+                    }
+                    log.error("[ERROR] %s -- %s", (job.get("title") or "")[:40], e)
 
-            result = {
-                "url": job["url"],
-                "path": str(txt_path),
-                "pdf_path": pdf_path,
-                "title": job["title"],
-                "site": job["site"],
-                "status": report["status"],
-                "attempts": report["attempts"],
-            }
-        except Exception as e:
-            result = {
-                "url": job["url"], "title": job["title"], "site": job["site"],
-                "status": "error", "attempts": 0, "path": None, "pdf_path": None,
-            }
-            log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs), job["title"][:40], e)
+                results.append(result)
+                stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+                elapsed = time.time() - t0
+                rate = completed / elapsed if elapsed > 0 else 0
+                log.info(
+                    "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
+                    completed, len(jobs), result["status"].upper(),
+                    result.get("attempts", "?"), rate * 60,
+                    (result.get("title") or "")[:40],
+                )
+    else:
+        for job in jobs:
+            completed += 1
+            try:
+                result = _tailor_one_job(job, resume_text, profile)
+            except Exception as e:
+                result = {
+                    "url": job["url"], "title": job.get("title") or "", "site": job["site"],
+                    "status": "error", "attempts": 0, "path": None, "pdf_path": None,
+                }
+                log.error("%d/%d [ERROR] %s -- %s", completed, len(jobs),
+                          (job.get("title") or "")[:40], e)
 
-        results.append(result)
-        stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
-
-        elapsed = time.time() - t0
-        rate = completed / elapsed if elapsed > 0 else 0
-        log.info(
-            "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
-            completed, len(jobs),
-            result["status"].upper(),
-            result.get("attempts", "?"),
-            rate * 60,
-            result["title"][:40],
-        )
+            results.append(result)
+            stats[result.get("status", "error")] = stats.get(result.get("status", "error"), 0) + 1
+            elapsed = time.time() - t0
+            rate = completed / elapsed if elapsed > 0 else 0
+            log.info(
+                "%d/%d [%s] attempts=%s | %.1f jobs/min | %s",
+                completed, len(jobs), result["status"].upper(),
+                result.get("attempts", "?"), rate * 60,
+                (result.get("title") or "")[:40],
+            )
 
     # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        if r["status"] == "approved":
-            conn.execute(
-                "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
-                "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["path"], now, r["url"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
-                (r["url"],),
-            )
-    conn.commit()
+
+    def _flush_tailor_results(conn, results, now):
+        for r in results:
+            if r["status"] == "approved":
+                conn.execute(
+                    "UPDATE jobs SET tailored_resume_path=?, tailored_at=?, "
+                    "tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                    (r["path"], now, r["url"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET tailor_attempts=COALESCE(tailor_attempts,0)+1 WHERE url=?",
+                    (r["url"],),
+                )
+
+    try:
+        write_with_retry(conn, _flush_tailor_results, conn, results, now)
+    except Exception as flush_err:
+        log.exception("DB flush failed for tailor batch: %s", flush_err)
 
     elapsed = time.time() - t0
     log.info(

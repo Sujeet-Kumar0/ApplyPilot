@@ -4,14 +4,17 @@ Handles launching an isolated Chrome instance with remote debugging,
 worker profile setup/cloning, and cross-platform process cleanup.
 """
 
+import glob as _glob
 import json
 import logging
+import os
 import platform
 import random
 import shutil
 import subprocess
 import threading
 import time
+import urllib.request as _ureq
 from pathlib import Path
 
 from applypilot import config
@@ -28,6 +31,35 @@ HITL_WORKER_ID = 99
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
+
+
+class _AdoptedChromeProcess:
+    """Stub that wraps an already-running Chrome process adopted for reconnect.
+
+    Provides the same .pid and .poll() interface as subprocess.Popen so that
+    the rest of worker_loop() (HITL relaunch, cleanup_worker, etc.) works
+    identically whether Chrome was freshly launched or reconnected.
+    """
+
+    def __init__(self, pid: int | None) -> None:
+        self.pid: int = pid or 0
+        self._pid = pid
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+
+    def poll(self) -> int | None:
+        """Return None if the process is alive, non-None if it has exited."""
+        if not self._pid:
+            return None  # Unknown PID — assume alive
+        try:
+            os.kill(self._pid, 0)
+            return None  # Process exists and is reachable
+        except (ProcessLookupError, OSError):
+            return 1  # Dead
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0  # No-op; we don't manage lifecycle here
 _chrome_lock = threading.Lock()
 
 # Persistent ATS session storage
@@ -35,15 +67,37 @@ SESSIONS_DIR = config.APP_DIR / "chrome-sessions"
 
 # ATS domain → slug mapping for persistent session management
 ATS_DOMAINS: dict[str, str] = {
+    # --- high-volume (seen in DB) ---
     "myworkdayjobs.com": "workday",
     "greenhouse.io": "greenhouse",
+    "grnh.se": "greenhouse",       # Greenhouse short-link redirector
     "lever.co": "lever",
+    "ashbyhq.com": "ashby",        # 143 jobs in DB
+    "rippling.com": "rippling",    # 38 jobs in DB (ats.rippling.com)
+    "workable.com": "workable",    # 14 jobs in DB (apply.workable.com)
+    "recruitee.com": "recruitee",  # 12 jobs in DB
+    "adp.com": "adp",              # 6 jobs in DB (workforcenow.adp.com)
     "icims.com": "icims",
     "jobvite.com": "jobvite",
     "oraclecloud.com": "oracle",
     "smartrecruiters.com": "smartrecruiters",
     "ultipro.com": "ultipro",
+    "ukg.com": "ultipro",          # UKG acquired Ultipro
     "taleo.net": "taleo",
+    # --- common enterprise / mid-market ---
+    "successfactors.com": "successfactors",
+    "successfactors.eu": "successfactors",
+    "csod.com": "cornerstone",
+    "bamboohr.com": "bamboohr",
+    "dayforcehcm.com": "dayforce",
+    "jazzhr.com": "jazzhr",
+    "breezy.hr": "breezy",
+    "teamtailor.com": "teamtailor",
+    "pinpointhq.com": "pinpoint",
+    "comeet.com": "comeet",
+    "personio.com": "personio",
+    "personio.de": "personio",
+    "newtonsoftware.com": "newton",
 }
 
 
@@ -471,21 +525,71 @@ def _suppress_restore_nag(profile_dir: Path, worker_id: int | None = None) -> No
             "profile_enabled": False,
         })
 
-        # Enable developer mode so --load-extension can load unpacked extensions
-        prefs.setdefault("extensions", {}).setdefault("ui", {})["developer_mode"] = True
-        # Remove web-store extension entries whose files live inside the profile's
-        # Default/Extensions/ dir.  Chrome re-downloads any extension still listed
-        # in extensions.settings even after we wipe its files — so we remove those
-        # entries here.  We keep entries whose path is OUTSIDE the profile dir
-        # (our --load-extension extension, Chrome built-ins) so their pin state
-        # and toolbar position survive restarts.
-        ext_settings = prefs.get("extensions", {}).get("settings")
-        if ext_settings:
-            profile_ext_prefix = str(prefs_file.parent / "Extensions")
-            stale = [k for k, v in ext_settings.items()
-                     if str(v.get("path", "")).startswith(profile_ext_prefix)]
-            for k in stale:
-                del ext_settings[k]
+        # --- 4. Extension registration and pinning ---
+        # APPLYPILOT_EXT_ID is derived from the RSA key in manifest.json ("key" field).
+        # sha256(base64decode(key))[:16bytes] mapped nibble→a-p.
+        # Verified: base64.b64decode(key) | sha256 | first 32 hex nibbles → a-p
+        APPLYPILOT_EXT_ID = "almfihgbaclbghnagbfecfpppmjfmlnp"
+
+        ext_dir = prefs.setdefault("extensions", {})
+
+        # Enable developer mode so --load-extension works
+        ext_dir.setdefault("ui", {})["developer_mode"] = True
+
+        # Whitelist-clean extensions.settings: keep only Chrome built-ins,
+        # our known ApplyPilot extension ID, and worker-specific ext dirs.
+        # Removes: web-store extensions, stale source-dir entries, relative paths.
+        ext_settings = ext_dir.setdefault("settings", {})
+        worker_ext_prefix = str(config.CHROME_WORKER_DIR / "extensions")
+        keep_prefixes = ("/opt/google/chrome/", worker_ext_prefix)
+        stale = [
+            k for k, v in ext_settings.items()
+            if k != APPLYPILOT_EXT_ID and
+            not any(str(v.get("path", "")).startswith(p) for p in keep_prefixes)
+        ]
+        for k in stale:
+            del ext_settings[k]
+
+        # Inject/update the ApplyPilot extension entry so Chrome loads it from
+        # the correct worker-specific dir with developer-mode trust.
+        if worker_id is not None:
+            worker_ext_path = str(config.CHROME_WORKER_DIR / "extensions" / f"worker-{worker_id}")
+            entry = ext_settings.get(APPLYPILOT_EXT_ID, {})
+            entry.update({
+                "path": worker_ext_path,
+                "location": 4,          # COMMAND_LINE — trusted, no update check
+                "from_webstore": False,
+                "disable_reasons": 0,   # no disable reasons → extension stays enabled
+                # active_permissions must be present or Chrome treats the extension as
+                # "not yet installed" and blocks access to its resources (ERR_BLOCKED_BY_CLIENT).
+                # These values must exactly match manifest.json permissions/host_permissions.
+                "active_permissions": {
+                    "api": ["activeTab", "alarms", "storage"],
+                    "explicit_host": ["http://localhost/*"],
+                    "manifest_permissions": [],
+                    "scriptable_host": [],
+                },
+            })
+            ext_settings[APPLYPILOT_EXT_ID] = entry
+
+        # Ensure ApplyPilot is pinned (visible in toolbar, not hidden behind puzzle icon).
+        # Also forcibly delete known bad IDs from ext_settings — these IDs can point to the
+        # same directory as the correct ID, causing Chrome to refuse to load the correct one
+        # (Chrome won't load the same extension directory twice under different IDs).
+        _EXTRA_STALE = {
+            "eloakdpcfbnnadhnohionnmicpmedapk",  # old path-derived source-dir ID (no key)
+            "lafmhibgcablhganbgeffcppmpfjlmpn",  # previously computed wrong key-derived ID
+        }
+        # Delete from settings unconditionally (the keep_prefix check would have spared these
+        # since they pointed to the worker ext dir, causing the duplicate-dir loading bug).
+        for bad_id in _EXTRA_STALE:
+            ext_settings.pop(bad_id, None)
+        remove_from_pinned = set(stale) | _EXTRA_STALE
+        pinned = [p for p in ext_dir.get("pinned_extensions", [])
+                  if p not in remove_from_pinned]
+        if APPLYPILOT_EXT_ID not in pinned:
+            pinned.append(APPLYPILOT_EXT_ID)
+        ext_dir["pinned_extensions"] = pinned
 
         prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
     except Exception:
@@ -537,6 +641,123 @@ _VIEWPORT_POOL = [
 ]
 
 _worker_viewports: dict[int, tuple[int, int]] = {}
+
+# Approximate GNOME top-panel height (px).  Used when computing tile Y offsets.
+# macOS: menu bar is 25px.  Windows: taskbar is usually at the bottom.
+_PANEL_H = {
+    "Linux": 36,
+    "Darwin": 25,
+    "Windows": 0,
+}.get(platform.system(), 36)
+
+
+def _get_screen_size() -> tuple[int, int]:
+    """Return (width, height) of the total desktop area across all monitors.
+
+    Linux: reads via GTK/GDK monitor geometry — works correctly under XWayland
+    where the deprecated Screen.get_width/height() returns logical/scaled sizes.
+    macOS / Windows: falls back to a reasonable default.
+    """
+    if platform.system() == "Linux":
+        try:
+            import gi  # type: ignore
+            gi.require_version("Gdk", "3.0")
+            from gi.repository import Gdk  # type: ignore
+            d = Gdk.Display.get_default()
+            max_w, max_h = 0, 0
+            for i in range(d.get_n_monitors()):
+                m = d.get_monitor(i)
+                g = m.get_geometry()
+                max_w = max(max_w, g.x + g.width)
+                max_h = max(max_h, g.y + g.height)
+            if max_w > 0 and max_h > 0:
+                return max_w, max_h
+        except Exception:
+            pass
+    return 1920, 1080  # safe fallback
+
+
+def compute_tile(worker_id: int, total_workers: int) -> tuple[int, int, int, int]:
+    """Return (x, y, width, height) for a tiled Chrome window.
+
+    Layout on a 2560×1440 screen (panel_h = 36):
+      1 worker : left ~62 % of screen, full height (leaves room for terminal)
+      2 workers: side-by-side half-width columns, full height
+      3 workers: 2×2 grid, bottom-right quadrant left empty for terminal
+      4 workers: 2×2 grid, all quadrants filled
+
+    On other OSes the same math applies using the detected screen size.
+    """
+    sw, sh = _get_screen_size()
+    top  = _PANEL_H
+    usable_h = sh - top
+
+    if total_workers == 1:
+        # Leave the right third free for the terminal
+        w = int(sw * 0.62)
+        return 0, top, w, usable_h
+
+    if total_workers == 2:
+        w = sw // 2
+        x = worker_id * w
+        return x, top, w, usable_h
+
+    # 3–4 workers: 2×2 grid
+    col = worker_id % 2
+    row = worker_id // 2
+    w = sw // 2
+    h = usable_h // 2
+    return col * w, top + row * h, w, h
+
+
+def prevent_focus_stealing() -> str | None:
+    """Stop new windows from stealing keyboard focus (Linux/GNOME only).
+
+    Sets org.gnome.desktop.wm.preferences focus-new-windows to 'strict'
+    so Chrome windows launched by workers don't interrupt the user.
+    Returns the previous value so it can be restored later.
+
+    On non-Linux or when gsettings is unavailable, returns None (no-op).
+
+    macOS note: System Preferences > Mission Control > "When switching to an
+    application, switch to a Space with open windows" controls similar
+    behavior; no programmatic API exists.
+    Windows note: no equivalent; Chrome launch flags can request no-activate
+    but this is not reliable.
+    """
+    if platform.system() != "Linux":
+        return None
+    try:
+        prev = subprocess.run(
+            ["gsettings", "get",
+             "org.gnome.desktop.wm.preferences", "focus-new-windows"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip().strip("'")
+        subprocess.run(
+            ["gsettings", "set",
+             "org.gnome.desktop.wm.preferences", "focus-new-windows", "strict"],
+            check=True, timeout=3,
+        )
+        logger.info("Focus-steal prevention: set focus-new-windows=strict (was '%s')", prev)
+        return prev
+    except Exception as e:
+        logger.debug("prevent_focus_stealing: %s", e)
+        return None
+
+
+def restore_focus_mode(prev: str | None) -> None:
+    """Restore the focus-new-windows setting saved by prevent_focus_stealing()."""
+    if not prev or platform.system() != "Linux":
+        return
+    try:
+        subprocess.run(
+            ["gsettings", "set",
+             "org.gnome.desktop.wm.preferences", "focus-new-windows", prev],
+            check=True, timeout=3,
+        )
+        logger.info("Focus mode restored to '%s'", prev)
+    except Exception as e:
+        logger.debug("restore_focus_mode: %s", e)
 
 
 def _pick_viewport() -> tuple[int, int]:
@@ -779,11 +1000,68 @@ def bring_to_foreground_pid(pid: int) -> None:
         pass  # Best-effort only
 
 
+def _find_chrome_pid_for_port(port: int) -> int | None:
+    """Find the PID of a Chrome/Chromium process listening on the given CDP port.
+
+    Scans /proc/*/cmdline (Linux only). Returns None on non-Linux or if not found.
+    """
+    target = f"--remote-debugging-port={port}"
+    for path in _glob.glob("/proc/*/cmdline"):
+        try:
+            with open(path, "rb") as fh:
+                cmdline = fh.read().decode("utf-8", errors="replace").replace("\x00", " ")
+            if target in cmdline and ("chrome" in cmdline or "chromium" in cmdline):
+                return int(path.split("/")[2])
+        except (OSError, ValueError, IndexError):
+            pass
+    return None
+
+
+def probe_existing_chrome(port: int, expected_profile_dir: Path) -> int | None:
+    """Check if a usable Chrome instance is already running on the given CDP port.
+
+    Verifies the instance belongs to the expected worker profile by inspecting
+    the process cmdline. Only works on Linux (requires /proc filesystem).
+
+    Returns:
+        Chrome PID if a verified Chrome is running on this port, None otherwise.
+    """
+    # Step 1: Does CDP respond?
+    try:
+        _ureq.urlopen(f"http://localhost:{port}/json", timeout=2).read()
+    except Exception:
+        return None  # Nothing (or wrong thing) on this port
+
+    # Step 2: Find the Chrome PID via /proc cmdline scan
+    pid = _find_chrome_pid_for_port(port)
+    if pid is None:
+        logger.debug("Chrome detected on port %d but PID not found in /proc", port)
+        return None
+
+    # Step 3: Verify it's using our expected profile directory
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            cmdline = fh.read().decode("utf-8", errors="replace")
+        if str(expected_profile_dir) not in cmdline:
+            logger.debug(
+                "Chrome on port %d (pid %d) uses a different profile — not ours",
+                port, pid,
+            )
+            return None
+    except OSError:
+        # /proc entry disappeared — process exited between steps
+        return None
+
+    logger.info("Verified existing Chrome on port %d (pid %d)", port, pid)
+    return pid
+
+
 def launch_chrome(worker_id: int, port: int | None = None,
                   headless: bool = False,
                   refresh_cookies: bool = False,
-                  minimized: bool = True,
-                  ats_slug: str | None = None) -> subprocess.Popen:
+                  minimized: bool = False,
+                  ats_slug: str | None = None,
+                  total_workers: int = 1) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
@@ -791,11 +1069,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
         refresh_cookies: Re-copy session files from user's Chrome profile.
-        minimized: Start Chrome minimized (default True). When False,
-            positions the window at 0,0 for HITL (human-review) use.
+        minimized: Start Chrome minimized. Defaults to False — windows are
+            tiled on the desktop using compute_tile(). Pass True to override
+            and start hidden (useful for background/CI runs).
         ats_slug: Optional ATS platform slug. If a persistent session
             exists for this ATS, its auth files are overlaid on the
             worker profile.
+        total_workers: Total number of concurrent workers, used to compute
+            the tile layout position. Defaults to 1.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -820,6 +1101,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
     vp = _pick_viewport()
     _worker_viewports[worker_id] = vp
 
+    # Tile position for this worker (ignored when headless or minimized)
+    tile_x, tile_y, tile_w, tile_h = compute_tile(worker_id, total_workers)
+
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
@@ -828,10 +1112,14 @@ def launch_chrome(worker_id: int, port: int | None = None,
         "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
-        f"--window-size={vp[0]},{vp[1]}",
+        f"--window-size={tile_w},{tile_h}",
         "--disable-session-crashed-bubble",
         "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding,"
-        "SyncDisabledWithNoNetwork,ChromeSignin,Sync",
+        "SyncDisabledWithNoNetwork,ChromeSignin,Sync,"
+        # Bypass XDG portal for file dialogs — portal routes through Nautilus which
+        # hangs when the saved last-directory path doesn't exist on this machine.
+        # GtkFileDialogPortal disables portal; FileSystemAccessAPI keeps upload working.
+        "GtkFileDialogPortal",
         "--hide-crash-restore-bubble",
         "--noerrdialogs",
         "--password-store=basic",
@@ -858,7 +1146,8 @@ def launch_chrome(worker_id: int, port: int | None = None,
     elif minimized:
         cmd.append("--start-minimized")
     else:
-        cmd.append("--window-position=0,0")
+        # Position the window in its designated tile slot
+        cmd.append(f"--window-position={tile_x},{tile_y}")
 
     # On Unix, start in a new process group so we can kill the whole tree
     kwargs: dict = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -882,10 +1171,14 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
 
     Args:
         worker_id: Numeric worker identifier.
-        process: The Popen handle returned by launch_chrome.
+        process: The Popen handle (or _AdoptedChromeProcess) from launch_chrome.
     """
     if process and process.poll() is None:
-        _kill_process_tree(process.pid)
+        if process.pid:
+            _kill_process_tree(process.pid)
+        else:
+            # Adopted process with unknown PID — fall back to port-based kill
+            _kill_on_port(BASE_CDP_PORT + worker_id)
     with _chrome_lock:
         _chrome_procs.pop(worker_id, None)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
@@ -902,7 +1195,10 @@ def kill_all_chrome() -> None:
 
     for wid, proc in procs.items():
         if proc.poll() is None:
-            _kill_process_tree(proc.pid)
+            if proc.pid:
+                _kill_process_tree(proc.pid)
+            else:
+                _kill_on_port(BASE_CDP_PORT + wid)
         _kill_on_port(BASE_CDP_PORT + wid)
 
     # Sweep base port in case of zombies

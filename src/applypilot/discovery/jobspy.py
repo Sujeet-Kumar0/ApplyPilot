@@ -51,7 +51,7 @@ except Exception:
     pass  # If patching fails, fall back to original behavior
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import commit_with_retry, get_connection, init_db, store_jobs
 
 log = logging.getLogger(__name__)
 
@@ -214,7 +214,7 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         except sqlite3.IntegrityError:
             existing += 1
 
-    conn.commit()
+    commit_with_retry(conn)
     return new, existing
 
 
@@ -485,7 +485,7 @@ def _full_crawl(
 
 # -- Public entry point ------------------------------------------------------
 
-def run_discovery(cfg: dict | None = None) -> dict:
+def run_discovery(cfg: dict | None = None, sites_override: list[str] | None = None) -> dict:
     """Main entry point for JobSpy-based job discovery.
 
     Loads search queries and locations from the user's search config YAML,
@@ -494,6 +494,8 @@ def run_discovery(cfg: dict | None = None) -> dict:
     Args:
         cfg: Override the search configuration dict. If None, loads from
              the user's searches.yaml file.
+        sites_override: If provided, use these sites instead of the config's
+             sites key. Used to run a specific board (e.g. ["dice"]).
 
     Returns:
         Dict with stats: new, existing, errors, db_total, queries.
@@ -506,7 +508,7 @@ def run_discovery(cfg: dict | None = None) -> dict:
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
     proxy = cfg.get("proxy")
-    sites = cfg.get("sites")
+    sites = sites_override or cfg.get("sites")
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
     hours_old = cfg.get("defaults", {}).get("hours_old", 72)
     tiers = cfg.get("tiers")
