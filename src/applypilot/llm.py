@@ -38,6 +38,8 @@ _TIMEOUT = 120
 _DEFAULT_MAX_TOKENS = 4096
 _EXHAUSTION_COOLDOWN_SECONDS = 300
 _STREAMING_TRUE_VALUES = {"1", "true", "yes"}
+_OPENROUTER_FREE_MIN_INTERVAL_SECONDS = 3.5
+_OPENROUTER_RATE_LIMIT_COOLDOWN_SECONDS = 20.0
 _PROVIDER_API_KEYS = {
     "gemini": "GEMINI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
@@ -395,6 +397,9 @@ class LLMClient:
         kwargs.update(options.get("extra", {}))
 
         try:
+            model_name = self._entry_model(entry)
+            _respect_openrouter_cooldown(model_name)
+            _apply_openrouter_pacing(model_name)
             if self._use_streaming:
                 kwargs["stream"] = True
                 response = litellm.completion(**kwargs)
@@ -405,6 +410,7 @@ class LLMClient:
         except Exception as exc:
             message = str(exc).lower()
             if any(token in message for token in ("429", "rate limit", "quota", "resource has been exhausted", "payment required")):
+                _note_openrouter_rate_limit(self._entry_model(entry))
                 self._exhausted[entry.name] = time.time()
                 if not is_last:
                     return None
@@ -454,6 +460,9 @@ class LLMClient:
 _instance: LLMClient | None = None
 _quality_instance: LLMClient | None = None
 _instance_lock = threading.Lock()
+_openrouter_lock = threading.Lock()
+_openrouter_next_allowed_at = 0.0
+_openrouter_last_call_at = 0.0
 
 
 def get_client(quality: bool = False) -> LLMClient:
@@ -480,3 +489,39 @@ def get_client(quality: bool = False) -> LLMClient:
                 else:
                     _instance = target
     return target
+
+
+def _is_openrouter_free_model(model_name: str) -> bool:
+    return model_name.startswith("openrouter/") and model_name.endswith(":free")
+
+
+def _apply_openrouter_pacing(model_name: str) -> None:
+    """Serialize free-tier OpenRouter calls to avoid per-minute bursts."""
+    global _openrouter_last_call_at
+    if not _is_openrouter_free_model(model_name):
+        return
+    with _openrouter_lock:
+        now = time.time()
+        wait_seconds = max(0.0, _openrouter_last_call_at + _OPENROUTER_FREE_MIN_INTERVAL_SECONDS - now)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        _openrouter_last_call_at = time.time()
+
+
+def _respect_openrouter_cooldown(model_name: str) -> None:
+    """Block until shared cooldown expires after a free-tier 429 burst."""
+    if not _is_openrouter_free_model(model_name):
+        return
+    with _openrouter_lock:
+        now = time.time()
+        if now < _openrouter_next_allowed_at:
+            time.sleep(_openrouter_next_allowed_at - now)
+
+
+def _note_openrouter_rate_limit(model_name: str) -> None:
+    """Move all free-tier OpenRouter callers into a short cooldown window."""
+    global _openrouter_next_allowed_at
+    if not _is_openrouter_free_model(model_name):
+        return
+    with _openrouter_lock:
+        _openrouter_next_allowed_at = max(_openrouter_next_allowed_at, time.time() + _OPENROUTER_RATE_LIMIT_COOLDOWN_SECONDS)

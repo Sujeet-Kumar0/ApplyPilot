@@ -66,3 +66,4 @@ CLAUDE.md
 resume.json
 
 .applypilot
+.venv.broken/*
