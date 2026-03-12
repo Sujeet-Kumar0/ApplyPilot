@@ -181,6 +181,24 @@ def _parse_score_response(response: str) -> dict:
         elif line.startswith("REASONING:"):
             reasoning = line.replace("REASONING:", "").strip()
 
+    # Fallback: some providers return free-form text like "score maybe 6"
+    # even when we request strict output.
+    if score == 0:
+        fallback_match = (
+            re.search(r"(?im)^\s*score\s*[:=-]?\s*(10|[1-9])\b", response)
+            or re.search(
+                r"(?i)\bscore\s*[:=-]?\s*(?:is|of|maybe|around|approx(?:imately)?|~)?\s*(10|[1-9])\b",
+                response,
+            )
+        )
+        if fallback_match:
+            score = int(fallback_match.group(1))
+
+    if not keywords:
+        keyword_match = re.search(r"(?im)^\s*keywords?\s*[:=-]\s*(.+)$", response)
+        if keyword_match:
+            keywords = keyword_match.group(1).strip()
+
     return {"score": score, "keywords": keywords, "reasoning": reasoning}
 
 

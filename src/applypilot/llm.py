@@ -450,18 +450,15 @@ class LLMClient:
         if not choices:
             return ""
         message = choices[0].message
-        content = getattr(message, "content", "")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            text_parts = []
-            for part in content:
-                if isinstance(part, str):
-                    text_parts.append(part)
-                elif isinstance(part, dict) and "text" in part:
-                    text_parts.append(str(part["text"]))
-            return "".join(text_parts).strip()
-        return str(content).strip()
+        content = getattr(message, "content", None)
+        text = LLMClient._coerce_text(content)
+        if text:
+            return text
+        reasoning_content = getattr(message, "reasoning_content", None)
+        text = LLMClient._coerce_text(reasoning_content)
+        if text:
+            return text
+        return ""
 
     @staticmethod
     def _consume_stream(response: Any) -> str:
@@ -474,9 +471,32 @@ class LLMClient:
             if delta is None:
                 continue
             content = getattr(delta, "content", None)
-            if content:
-                parts.append(content)
+            text = LLMClient._coerce_text(content)
+            if text:
+                parts.append(text)
+            reasoning_content = getattr(delta, "reasoning_content", None)
+            text = LLMClient._coerce_text(reasoning_content)
+            if text:
+                parts.append(text)
         return "".join(parts).strip()
+
+    @staticmethod
+    def _coerce_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            text_parts: list[str] = []
+            for part in value:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                elif isinstance(part, dict):
+                    text = part.get("text")
+                    if text is not None:
+                        text_parts.append(str(text))
+            return "".join(text_parts).strip()
+        return str(value).strip()
 
 
 _instance: LLMClient | None = None

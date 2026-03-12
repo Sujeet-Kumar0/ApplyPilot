@@ -29,6 +29,16 @@ def _mock_response(content: str = "hello") -> SimpleNamespace:
     )
 
 
+def _mock_reasoning_response(reasoning_content: str = "Score maybe 6") -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=None, reasoning_content=reasoning_content),
+            )
+        ]
+    )
+
+
 def test_chat_passes_defaults_without_temperature(monkeypatch) -> None:
     client = LLMClient(
         LLMConfig(
@@ -91,6 +101,22 @@ def test_chat_supports_temperature_and_typed_extra(monkeypatch) -> None:
     assert captured["top_p"] == 0.9
     assert captured["stop"] == ["\n\n"]
     assert captured["response_format"] == {"type": "json_object"}
+
+
+def test_chat_extracts_reasoning_content_when_content_is_none(monkeypatch) -> None:
+    client = LLMClient(
+        LLMConfig(
+            provider="openrouter",
+            api_base=None,
+            model="openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+            api_key="router-key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+    )
+
+    monkeypatch.setattr(llm_module.litellm, "completion", lambda **_: _mock_reasoning_response("SCORE: 6"))
+    response = client.chat([{"role": "user", "content": "hello"}], max_output_tokens=64)
+    assert response == "SCORE: 6"
 
 
 def test_chat_sets_local_api_base_and_api_key(monkeypatch) -> None:

@@ -5,6 +5,17 @@ import sqlite3
 import applypilot.scoring.scorer as scorer
 
 
+def test_parse_score_response_accepts_free_form_score_hint() -> None:
+    parsed = scorer._parse_score_response(
+        "The candidate appears to be a moderate match. Score maybe 6 based on the requirements."
+    )
+    assert parsed["score"] == 6
+    parsed_colon = scorer._parse_score_response(
+        "Detailed analysis follows. Score: maybe 8 for this role."
+    )
+    assert parsed_colon["score"] == 8
+
+
 def _make_jobs_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
