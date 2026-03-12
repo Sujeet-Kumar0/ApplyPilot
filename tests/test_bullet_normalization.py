@@ -5,7 +5,11 @@
 """
 
 import pytest
-from applypilot.scoring.tailor import _normalize_bullet, assemble_resume_text
+from applypilot.scoring.tailor import (
+    _normalize_bullet,
+    _strip_disallowed_watchlist_skills,
+    assemble_resume_text,
+)
 
 
 class TestNormalizeBullet:
@@ -162,3 +166,33 @@ class TestAssembleResumeTextWithJsonBullets:
         assert "- Built API" in result
         assert "- Led team" in result
         assert "- Reduced costs" in result
+
+
+class TestWatchlistSkillStripping:
+    """Test stripping disallowed watchlist skills from generated payloads."""
+
+    def test_strips_unapproved_watchlist_skills(self):
+        profile = {"skills": [{"name": "Languages", "keywords": ["Python", "JavaScript"]}]}
+        data = {
+            "skills": {
+                "Languages": "Python, Rust, JavaScript, Vue.js",
+                "Frameworks": "React, Django, FastAPI",
+            }
+        }
+
+        removed = _strip_disallowed_watchlist_skills(data, profile)
+
+        assert "Rust" in removed
+        assert "Vue.js" in removed
+        assert "Django" in removed
+        assert data["skills"]["Languages"] == "Python, JavaScript"
+        assert data["skills"]["Frameworks"] == "React, FastAPI"
+
+    def test_strips_watchlist_skill_even_if_profile_mentions_it(self):
+        profile = {"skills": [{"name": "Languages", "keywords": ["Python", "Rust"]}]}
+        data = {"skills": {"Languages": "Python, Rust"}}
+
+        removed = _strip_disallowed_watchlist_skills(data, profile)
+
+        assert removed == ["Rust"]
+        assert data["skills"]["Languages"] == "Python"

@@ -30,6 +30,7 @@ from applypilot.resume_json import (
 )
 from applypilot.scoring.validator import (
     BANNED_WORDS,
+    FABRICATION_WATCHLIST,
     sanitize_text,
     validate_json_fields,
 )
@@ -265,6 +266,57 @@ def _normalize_bullet(bullet: Any) -> str:
     return bullet_str
 
 
+def _strip_disallowed_watchlist_skills(data: dict, profile: dict) -> list[str]:
+    """Remove watchlist skills from generated skill output."""
+
+    skills = data.get("skills")
+    if not isinstance(skills, dict):
+        return []
+
+    def _normalize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    # Keep function signature aligned with profile-aware sanitizers even though
+    # watchlist terms are always stripped to match validator behavior.
+    del profile
+    watchlist_norm: set[str] = set()
+    for skill in FABRICATION_WATCHLIST:
+        if len(skill) <= 2:
+            continue
+        normalized_skill = _normalize(skill)
+        if not normalized_skill:
+            continue
+        # Avoid collapsing values like "c++" to single-character tokens ("c").
+        if len(normalized_skill.replace(" ", "")) <= 2:
+            continue
+        watchlist_norm.add(normalized_skill)
+
+    removed: list[str] = []
+
+    for key, value in list(skills.items()):
+        if isinstance(value, str):
+            entries = [part.strip() for part in value.split(",") if part.strip()]
+        elif isinstance(value, list):
+            entries = [str(part).strip() for part in value if str(part).strip()]
+        else:
+            entries = [str(value).strip()] if str(value).strip() else []
+
+        kept: list[str] = []
+        for entry in entries:
+            entry_norm = _normalize(entry)
+            if not entry_norm:
+                continue
+            is_watchlist = any(w in entry_norm for w in watchlist_norm)
+            if is_watchlist:
+                removed.append(entry)
+                continue
+            kept.append(entry)
+
+        skills[key] = ", ".join(kept)
+
+    return removed
+
+
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
 def assemble_resume_text(data: dict, profile: dict) -> str:
@@ -462,6 +514,14 @@ def tailor_resume(
             avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
             continue
 
+        removed_skills = _strip_disallowed_watchlist_skills(data, profile)
+        if removed_skills:
+            log.info(
+                "Attempt %d removed disallowed watchlist skills: %s",
+                attempt + 1,
+                ", ".join(removed_skills[:5]),
+            )
+
         # Layer 1: Validate JSON fields
         validation = validate_json_fields(data, profile, mode=validation_mode)
         report["validator"] = validation
@@ -509,13 +569,13 @@ def tailor_resume(
 
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
-def run_tailoring(min_score: int = 7, limit: int = 20,
+def run_tailoring(min_score: int = 7, limit: int = 0,
                   validation_mode: str = "normal") -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
         min_score:       Minimum fit_score to tailor for.
-        limit:           Maximum jobs to process.
+        limit:           Maximum jobs to process (0 = all eligible jobs).
         validation_mode: "strict", "normal", or "lenient".
 
     Returns:

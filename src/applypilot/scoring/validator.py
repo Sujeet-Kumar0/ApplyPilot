@@ -150,10 +150,19 @@ def _check_mechanism_required(text: str, role_type: str, config: dict) -> bool:
 def _company_is_present(experience_entry: dict, company: str) -> bool:
     """Return whether a profile company appears in an experience entry."""
 
-    company_lower = company.lower()
-    header = str(experience_entry.get("header", "")).lower()
-    entry_company = str(experience_entry.get("company", "")).lower()
-    return company_lower in header or company_lower in entry_company
+    def _normalize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    company_norm = _normalize(company)
+    if not company_norm:
+        return False
+
+    entry_text = " ".join(
+        str(experience_entry.get(key, ""))
+        for key in ("header", "company", "subtitle")
+    )
+    entry_norm = _normalize(entry_text)
+    return company_norm in entry_norm
 
 
 # ── JSON Field Validation ─────────────────────────────────────────────────

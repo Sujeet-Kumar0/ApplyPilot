@@ -81,6 +81,26 @@ def test_normal_mode_requires_at_least_one_profile_company():
     assert any("No profile companies found in experience" in error for error in res["errors"])
 
 
+def test_normal_mode_accepts_company_in_subtitle():
+    profile = make_profile("Senior Software Engineer", companies=["Watson Creative", "Old Company"])
+    data = {
+        "title": "Senior Software Engineer",
+        "summary": "Experienced engineer.",
+        "skills": {"Languages": "Python"},
+        "experience": [{
+            "header": "Principal Developer",
+            "subtitle": "Watson Creative | 2022-09 - 2026-02",
+            "bullets": ["Did work"],
+        }],
+        "projects": [{"header": "Project Alpha", "subtitle": "Python | 2023", "bullets": ["Built X"]}],
+        "education": "Acme University | B.S. Computer Science",
+    }
+
+    res = validate_json_fields(data, profile, mode="normal")
+    assert res["passed"], f"Expected subtitle company match in normal mode, got errors: {res['errors']}"
+    assert not any("No profile companies found in experience" in error for error in res["errors"])
+
+
 def test_strict_mode_still_requires_all_companies():
     profile = make_profile("Senior Software Engineer", companies=["Acme Corp", "Old Company"])
     data = {

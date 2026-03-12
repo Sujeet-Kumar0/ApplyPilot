@@ -240,7 +240,7 @@ def _run_score(workers: int = 1) -> dict:
 
 def _run_tailor(
     min_score: int = 7,
-    limit: int = 20,
+    limit: int = 0,
     workers: int = 1,
     validation_mode: str = "normal",
 ) -> dict:
@@ -256,7 +256,7 @@ def _run_tailor(
 
 def _run_cover(
     min_score: int = 7,
-    limit: int = 20,
+    limit: int = 0,
     workers: int = 1,
     validation_mode: str = "normal",
 ) -> dict:
@@ -388,7 +388,7 @@ def _run_stage_streaming(
     tracker: _StageTracker,
     stop_event: threading.Event,
     min_score: int = 7,
-    limit: int = 20,
+    limit: int = 0,
     workers: int = 1,
     validation_mode: str = "normal",
     sources: list[str] | None = None,
@@ -468,7 +468,7 @@ def _run_stage_streaming(
 def _run_sequential(
     ordered: list[str],
     min_score: int,
-    limit: int = 20,
+    limit: int = 0,
     workers: int = 1,
     validation_mode: str = "normal",
     sources: list[str] | None = None,
@@ -530,7 +530,7 @@ def _run_sequential(
 def _run_streaming(
     ordered: list[str],
     min_score: int,
-    limit: int = 20,
+    limit: int = 0,
     workers: int = 1,
     validation_mode: str = "normal",
     sources: list[str] | None = None,
@@ -610,7 +610,8 @@ def run_pipeline(
     Args:
         stages: List of stage names, or None / ["all"] for full pipeline.
         min_score: Minimum fit score for tailor/cover stages.
-        limit: Max jobs per batch for tailor/cover stages. Default: 20.
+        limit: Max jobs per batch for tailor/cover stages. Default: all eligible jobs.
+               Pass 0 (or omit) for no batch cap.
         dry_run: If True, preview stages without executing.
         stream: If True, run stages concurrently (streaming mode).
         workers: Number of parallel threads for discovery/enrichment stages.
@@ -628,7 +629,7 @@ def run_pipeline(
     if stages is None:
         stages = ["all"]
     ordered = _resolve_stages(stages)
-    effective_limit = limit if limit is not None else 20
+    effective_limit = limit if limit is not None else 0
 
     # Banner
     mode = "streaming" if stream else "sequential"
@@ -640,7 +641,8 @@ def run_pipeline(
         )
     )
     console.print(f"  Min score:  {min_score}")
-    console.print(f"  Limit:      {effective_limit} jobs/batch")
+    limit_label = f"{effective_limit} jobs/batch" if effective_limit > 0 else "all eligible jobs"
+    console.print(f"  Limit:      {limit_label}")
     console.print(f"  Workers:    {workers}")
     console.print(f"  Validation: {validation_mode}")
     console.print(f"  Stages:     {' -> '.join(ordered)}")

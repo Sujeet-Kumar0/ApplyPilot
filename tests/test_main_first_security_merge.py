@@ -164,6 +164,25 @@ def test_run_tailoring_returns_safe_summary_when_resume_is_missing(monkeypatch, 
     assert result == {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
 
+def test_run_tailoring_defaults_to_unbounded_limit(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+
+    monkeypatch.setattr(tailor, "load_profile", lambda: {"personal": {}, "skills": [], "work": [], "education": []})
+    monkeypatch.setattr(tailor, "load_resume_text", lambda: "base resume")
+    monkeypatch.setattr(tailor, "get_connection", lambda: object())
+
+    def _fake_get_jobs_by_stage(**kwargs):  # noqa: ANN003
+        captured["limit"] = kwargs["limit"]
+        return []
+
+    monkeypatch.setattr(tailor, "get_jobs_by_stage", _fake_get_jobs_by_stage)
+
+    result = tailor.run_tailoring()
+
+    assert captured["limit"] == 0
+    assert result == {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
+
+
 def test_get_client_initializes_singleton_once_under_concurrency(monkeypatch) -> None:
     created: list[object] = []
     registered: list[object] = []
