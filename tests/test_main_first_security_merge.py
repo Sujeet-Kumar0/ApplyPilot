@@ -152,7 +152,7 @@ def test_run_scoring_returns_safe_summary_when_resume_is_missing(monkeypatch, tm
 
     result = scorer.run_scoring()
 
-    assert result == {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": [], "excluded": 0}
+    assert result == {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": [], "excluded": 0, "auto_healed": 0}
 
 
 def test_run_tailoring_returns_safe_summary_when_resume_is_missing(monkeypatch, tmp_path: Path) -> None:

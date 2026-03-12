@@ -132,7 +132,7 @@ Still supported for LLM-facing resume text when `resume.json` is absent.
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_AGENT_PRIORITY`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_AGENT_PRIORITY`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional), `APPLYPILOT_SCORE_TRACE` (optional, set `1` for per-job scoring rationale logs).
 
 ## Two AI Layers
 
@@ -160,7 +160,13 @@ Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrap
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
 
 ### Score
-AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
+ApplyPilot uses a two-step scorer:
+1. Deterministic baseline (0-10) from title similarity, skill overlap, seniority fit, and domain alignment.
+2. LLM calibration with strict JSON output (`score`, `confidence`, `matched_skills`, `missing_requirements`, `reasoning`) and bounded score deltas around the baseline.
+
+This improves consistency on near-identical titles while keeping outputs auditable. `LLM_FAILED` means the model/parsing step failed and the job remains retryable (`fit_score` stays `NULL`), which is different from a valid low-fit score.
+
+Score bands: 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
 
 ### Tailor
 Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Company names, project names, education, and verified metrics are derived from your canonical `resume.json`, so the AI reorganizes but never fabricates.

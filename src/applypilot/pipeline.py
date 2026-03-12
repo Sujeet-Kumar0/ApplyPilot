@@ -350,7 +350,7 @@ _PENDING_SQL: dict[str, str] = {
     "score": (
         "SELECT COUNT(*) FROM jobs WHERE full_description IS NOT NULL AND ("
         "  (fit_score IS NULL AND score_error IS NULL) "
-        "  OR (score_error IS NOT NULL AND score_retry_count < 5 "
+        "  OR (score_error IS NOT NULL "
         "      AND (score_next_retry_at IS NULL OR score_next_retry_at <= datetime('now')))"
         ")"
     ),

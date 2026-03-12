@@ -1200,7 +1200,7 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
             # Unscored jobs, OR scoring failed but backoff window has elapsed
             "full_description IS NOT NULL AND ("
             "  (fit_score IS NULL AND score_error IS NULL) "
-            "  OR (score_error IS NOT NULL AND score_retry_count < 5 "
+            "  OR (score_error IS NOT NULL "
             "      AND (score_next_retry_at IS NULL OR score_next_retry_at <= datetime('now')))"
             ")"
         ),

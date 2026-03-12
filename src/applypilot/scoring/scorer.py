@@ -1,46 +1,218 @@
-"""Job fit scoring: LLM-powered evaluation of candidate-job match quality.
+"""Job fit scoring with deterministic baseline + calibrated LLM reranking."""
 
-Scores jobs on a 1-10 scale by comparing the user's resume against each
-job description. All personal data is loaded at runtime from the user's
-profile and resume file.
-"""
+from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import time
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
-from applypilot.config import RESUME_JSON_PATH, RESUME_PATH, load_resume_text
+from applypilot.config import RESUME_JSON_PATH, RESUME_PATH, load_profile, load_resume_text
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
+from applypilot.resume_json import get_profile_skill_keywords
 
 log = logging.getLogger(__name__)
-MAX_SCORE_RETRIES = 5
+MAX_SCORE_ATTEMPTS_PER_JOB = 3
+SCORE_ATTEMPT_BACKOFF_SECONDS = 1.0
 _LEGACY_SCORE_ERROR_PATTERN = "%LLM error:%"
+_MODEL_RESPONSE_SNIPPET_LIMIT = 320
+_SCORE_TRACE_ENABLED = os.environ.get("APPLYPILOT_SCORE_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-# ── Scoring Prompt ────────────────────────────────────────────────────────
+SCORE_PROMPT = """You are a job-fit scoring calibrator.
 
-SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume and a job description, score how well the candidate fits the role.
+You will receive:
+1) Candidate resume profile and resume text.
+2) Job posting context focused on requirements and responsibilities.
+3) Deterministic baseline signals from an offline scorer.
 
-SCORING CRITERIA:
-- 9-10: Perfect match. Candidate has direct experience in nearly all required skills and qualifications.
-- 7-8: Strong match. Candidate has most required skills, minor gaps easily bridged.
-- 5-6: Moderate match. Candidate has some relevant skills but missing key requirements.
-- 3-4: Weak match. Significant skill gaps, would need substantial ramp-up.
-- 1-2: Poor match. Completely different field or experience level.
+Your job:
+- Re-evaluate fit quality and provide a calibrated score.
+- Respect evidence in requirements over generic title matching.
+- Keep reasoning concise and grounded in the provided content.
 
-IMPORTANT FACTORS:
-- Weight technical skills heavily (programming languages, frameworks, tools)
-- Consider transferable experience (automation, scripting, API work)
-- Factor in the candidate's project experience
-- Be realistic about experience level vs. job requirements (years of experience, seniority)
+Return JSON ONLY with this schema:
+{
+  "score": 1-10 integer,
+  "confidence": 0.0-1.0 number,
+  "matched_skills": ["..."],
+  "missing_requirements": ["..."],
+  "reasoning": "short explanation"
+}
+"""
 
-RESPOND IN EXACTLY THIS FORMAT (no other text):
-SCORE: [1-10]
-KEYWORDS: [comma-separated ATS keywords from the job description that match or could match the candidate]
-REASONING: [2-3 sentences explaining the score]"""
 
+SCORING_RESPONSE_FORMAT = {"type": "json_object"}
+
+
+_TITLE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "of",
+    "the",
+    "to",
+    "with",
+    "at",
+    "ii",
+    "iii",
+    "iv",
+    "sr",
+    "senior",
+    "principal",
+    "staff",
+    "lead",
+    "l4",
+    "l5",
+    "l6",
+    "l7",
+}
+
+_JOB_CONTEXT_PRIORITIES: list[tuple[int, tuple[str, ...]]] = [
+    (4, ("requirements", "minimum qualifications", "must have", "qualifications")),
+    (3, ("preferred qualifications", "nice to have", "preferred", "bonus points")),
+    (3, ("responsibilities", "what you'll do", "what you will do", "day to day")),
+    (2, ("about the role", "role overview", "about this role")),
+]
+
+_ROLE_FAMILY_PATTERNS: dict[str, tuple[str, ...]] = {
+    "software_engineering": (
+        r"\bsoftware\b",
+        r"\bengineer\b",
+        r"\bdeveloper\b",
+        r"\bbackend\b",
+        r"\bfront[\s-]?end\b",
+        r"\bfull[\s-]?stack\b",
+        r"\bplatform\b",
+        r"\bdevops\b",
+        r"\bsre\b",
+    ),
+    "data_ai": (
+        r"\bdata\b",
+        r"\bmachine learning\b",
+        r"\bml\b",
+        r"\bai\b",
+        r"\bllm\b",
+        r"\bresearch engineer\b",
+        r"\bapplied scientist\b",
+    ),
+    "design": (
+        r"\bdesigner\b",
+        r"\bux\b",
+        r"\bui\b",
+        r"\bproduct design\b",
+        r"\bvisual design\b",
+    ),
+    "marketing": (
+        r"\bmarketing\b",
+        r"\baudience\b",
+        r"\bdemand gen\b",
+        r"\bseo\b",
+        r"\bcontent strategy\b",
+    ),
+    "sales": (
+        r"\bsales\b",
+        r"\baccount executive\b",
+        r"\bbusiness development\b",
+        r"\bsdr\b",
+    ),
+    "operations": (
+        r"\boperations\b",
+        r"\bprogram manager\b",
+        r"\bproject manager\b",
+    ),
+    "finance": (
+        r"\bfinance\b",
+        r"\baccounting\b",
+        r"\bcpa\b",
+        r"\bcontroller\b",
+    ),
+}
+
+_RELATED_ROLE_FAMILY_PAIRS: set[tuple[str, str]] = {
+    ("software_engineering", "data_ai"),
+    ("data_ai", "software_engineering"),
+}
+
+_SENIORITY_PATTERNS: list[tuple[int, tuple[str, ...]]] = [
+    (0, ("intern", "internship")),
+    (1, ("junior", "jr", "entry", "new grad", "graduate")),
+    (2, ("engineer", "developer", "analyst", "specialist", "mid", "associate")),
+    (3, ("senior", "sr", "lead")),
+    (4, ("staff", "principal", "architect")),
+    (5, ("manager", "head of", "director", "vp", "vice president")),
+]
+
+_HARD_MISMATCH_TERMS = (
+    "clearance",
+    "active license",
+    "board certification",
+    "bar admission",
+    "registered nurse",
+    "rn license",
+    "medical doctor",
+    "cpa required",
+    "citizenship required",
+)
+
+_SKILL_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("python", re.compile(r"\bpython\b", re.IGNORECASE)),
+    ("java", re.compile(r"\bjava\b", re.IGNORECASE)),
+    ("javascript", re.compile(r"\bjavascript\b|\bnode\.?js\b", re.IGNORECASE)),
+    ("typescript", re.compile(r"\btypescript\b", re.IGNORECASE)),
+    ("c#", re.compile(r"\bc#\b|\bcsharp\b|\b\.net\b|\basp\.?net\b", re.IGNORECASE)),
+    ("c++", re.compile(r"\bc\+\+\b", re.IGNORECASE)),
+    ("go", re.compile(r"\bgolang\b", re.IGNORECASE)),
+    ("rust", re.compile(r"\brust\b", re.IGNORECASE)),
+    ("ruby", re.compile(r"\bruby\b", re.IGNORECASE)),
+    ("php", re.compile(r"\bphp\b", re.IGNORECASE)),
+    ("scala", re.compile(r"\bscala\b", re.IGNORECASE)),
+    ("kotlin", re.compile(r"\bkotlin\b", re.IGNORECASE)),
+    ("swift", re.compile(r"\bswift\b", re.IGNORECASE)),
+    ("react", re.compile(r"\breact\b", re.IGNORECASE)),
+    ("angular", re.compile(r"\bangular\b", re.IGNORECASE)),
+    ("vue", re.compile(r"\bvue(?:\.js)?\b", re.IGNORECASE)),
+    ("next.js", re.compile(r"\bnext\.?js\b", re.IGNORECASE)),
+    ("django", re.compile(r"\bdjango\b", re.IGNORECASE)),
+    ("flask", re.compile(r"\bflask\b", re.IGNORECASE)),
+    ("fastapi", re.compile(r"\bfastapi\b", re.IGNORECASE)),
+    ("spring", re.compile(r"\bspring\b", re.IGNORECASE)),
+    ("rails", re.compile(r"\brails\b", re.IGNORECASE)),
+    ("graphql", re.compile(r"\bgraphql\b", re.IGNORECASE)),
+    ("rest api", re.compile(r"\brest(?:ful)?\b|\bapi\b", re.IGNORECASE)),
+    ("microservices", re.compile(r"\bmicroservices?\b", re.IGNORECASE)),
+    ("sql", re.compile(r"\bsql\b|\bpostgres\b|\bmysql\b", re.IGNORECASE)),
+    ("nosql", re.compile(r"\bnosql\b|\bmongodb\b|\bredis\b|\bcassandra\b", re.IGNORECASE)),
+    ("aws", re.compile(r"\baws\b|\bamazon web services\b", re.IGNORECASE)),
+    ("gcp", re.compile(r"\bgcp\b|\bgoogle cloud\b", re.IGNORECASE)),
+    ("azure", re.compile(r"\bazure\b", re.IGNORECASE)),
+    ("docker", re.compile(r"\bdocker\b", re.IGNORECASE)),
+    ("kubernetes", re.compile(r"\bkubernetes\b|\bk8s\b", re.IGNORECASE)),
+    ("terraform", re.compile(r"\bterraform\b", re.IGNORECASE)),
+    ("ci/cd", re.compile(r"\bci/?cd\b|\bjenkins\b|\bgithub actions\b", re.IGNORECASE)),
+    ("spark", re.compile(r"\bspark\b", re.IGNORECASE)),
+    ("hadoop", re.compile(r"\bhadoop\b", re.IGNORECASE)),
+    ("airflow", re.compile(r"\bairflow\b", re.IGNORECASE)),
+    ("machine learning", re.compile(r"\bmachine learning\b|\bml\b", re.IGNORECASE)),
+    ("deep learning", re.compile(r"\bdeep learning\b", re.IGNORECASE)),
+    ("tensorflow", re.compile(r"\btensorflow\b", re.IGNORECASE)),
+    ("pytorch", re.compile(r"\bpytorch\b", re.IGNORECASE)),
+    ("llm", re.compile(r"\bllm\b|\blarge language model\b|\bgenerative ai\b", re.IGNORECASE)),
+    ("nlp", re.compile(r"\bnlp\b|\bnatural language processing\b", re.IGNORECASE)),
+]
+
+
+class ScoreResponseParseError(ValueError):
+    """Raised when LLM score response does not satisfy the scoring JSON schema."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
 
 
 # ── Deterministic Exclusion Gate ──────────────────────────────────────────
@@ -70,44 +242,487 @@ EXCLUSION_RULES: list[dict] = [
 
 
 def _tokenize(text: str) -> list[str]:
-    """Tokenize text on non-alphanumeric boundaries, lowercased.
+    """Tokenize text on non-alphanumeric boundaries, lowercased."""
 
-    Follows task-8 contract: tokenization on non-alphanumeric characters,
-    matching performed on tokens normalized to lower-case.
-    """
     return re.findall(r"[a-zA-Z0-9]+", text.lower())
 
 
-def _exclusion_result(rule: dict, matched_value: str) -> dict:
-    """Build a blocked scoring result for an excluded job.
+def _tokenize_set(text: str) -> set[str]:
+    return {token for token in _tokenize(text) if token and token not in _TITLE_STOPWORDS}
 
-    Returns a dict with score fields plus audit metadata:
-      - exclusion_reason_code: stable reason code from the rule
-      - exclusion_rule_id: rule identifier for traceability
-    """
+
+def _title_key(title: str) -> str:
+    tokens = [token for token in _tokenize(title) if token and token not in _TITLE_STOPWORDS]
+    if not tokens:
+        return "untitled"
+    return " ".join(tokens[:8])
+
+
+def _coerce_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _coerce_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value in (None, ""):
+        return []
+    return [str(value).strip()]
+
+
+def _to_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"\d+(?:\.\d+)?", str(value))
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _safe_response_snippet(text: str, limit: int = _MODEL_RESPONSE_SNIPPET_LIMIT) -> str:
+    snippet = (text or "").replace("\n", "\\n")
+    if len(snippet) <= limit:
+        return snippet
+    return snippet[: limit - 3] + "..."
+
+
+def _compact_values(values: list[str], limit: int = 4) -> str:
+    items = [item.strip() for item in values if item and item.strip()]
+    if not items:
+        return "-"
+    shown = items[:limit]
+    remainder = len(items) - len(shown)
+    if remainder > 0:
+        return f"{', '.join(shown)} (+{remainder})"
+    return ", ".join(shown)
+
+
+def _compact_reasoning(text: str, limit: int = 180) -> str:
+    compact = re.sub(r"\s+", " ", (text or "")).strip()
+    if not compact:
+        return "-"
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _build_score_trace(result: dict) -> str:
+    outcome = str(result.get("outcome") or "")
+    if outcome == "excluded":
+        return f"trace excluded reason={_compact_reasoning(str(result.get('reasoning') or ''), limit=120)}"
+
+    if outcome == "llm_failed":
+        category = str(result.get("parse_error_category") or "unknown")
+        baseline = result.get("baseline_score")
+        return (
+            f"trace failed category={category} baseline={baseline if baseline is not None else '-'} "
+            f"error={_compact_reasoning(str(result.get('reasoning') or ''), limit=140)}"
+        )
+
+    baseline = result.get("baseline_score")
+    llm_score = result.get("llm_score")
+    confidence = result.get("llm_confidence")
+    delta = result.get("score_delta")
+    matched = _compact_values(_coerce_list(result.get("matched_skills")), limit=4)
+    missing = _compact_values(_coerce_list(result.get("missing_requirements")), limit=3)
+    reasoning = _compact_reasoning(str(result.get("reasoning") or ""), limit=140)
+    confidence_text = f"{float(confidence):.2f}" if isinstance(confidence, (int, float)) else "-"
+    delta_text = f"{int(delta):+d}" if isinstance(delta, int) else "-"
+    return (
+        f"trace baseline={baseline if baseline is not None else '-'} "
+        f"llm={llm_score if llm_score is not None else '-'} "
+        f"conf={confidence_text} delta={delta_text} "
+        f"match=[{matched}] missing=[{missing}] why={reasoning}"
+    )
+
+
+def _contains_phrase(text_lower: str, phrase: str) -> bool:
+    candidate = phrase.lower().strip()
+    if not candidate:
+        return False
+    if re.search(r"[+#./]", candidate):
+        return candidate in text_lower
+    pattern = r"\b" + re.escape(candidate).replace(r"\ ", r"\s+") + r"\b"
+    return re.search(pattern, text_lower) is not None
+
+
+def _extract_known_skills(text: str) -> set[str]:
+    found: set[str] = set()
+    for canonical, pattern in _SKILL_PATTERNS:
+        if pattern.search(text):
+            found.add(canonical)
+    return found
+
+
+def _infer_role_family(text: str) -> str:
+    haystack = (text or "").lower()
+    for family, patterns in _ROLE_FAMILY_PATTERNS.items():
+        if any(re.search(pattern, haystack) for pattern in patterns):
+            return family
+    return "unknown"
+
+
+def _seniority_from_text(text: str) -> int:
+    lowered = (text or "").lower()
+    for score, terms in reversed(_SENIORITY_PATTERNS):
+        if any(term in lowered for term in terms):
+            return score
+    return 2
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
+def _extract_requirement_focused_text(description: str, max_chars: int = 6000) -> str:
+    """Prefer requirements/qualifications/responsibilities when truncating long JDs."""
+
+    cleaned = (description or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", cleaned) if block.strip()]
+    if not blocks:
+        return cleaned[:max_chars]
+
+    scored: list[tuple[int, int, str]] = []
+    for index, block in enumerate(blocks):
+        lowered = block.lower()
+        score = 1 if index == 0 else 0
+        for weight, terms in _JOB_CONTEXT_PRIORITIES:
+            if any(term in lowered for term in terms):
+                score += weight
+        if re.search(r"\b(required|must|minimum|experience|skills?)\b", lowered):
+            score += 1
+        if block.count("\n-") + block.count("\n*") > 2:
+            score += 1
+        scored.append((score, index, block))
+
+    selected_indexes: list[int] = []
+    total = 0
+    for _, index, block in sorted(scored, key=lambda item: (-item[0], item[1])):
+        projected = total + len(block) + 2
+        if projected > max_chars and selected_indexes:
+            continue
+        selected_indexes.append(index)
+        total = projected
+        if total >= max_chars:
+            break
+
+    selected_indexes = sorted(set(selected_indexes))
+    sections = [blocks[index] for index in selected_indexes]
+    focused = "\n\n".join(sections).strip()
+    if len(focused) <= max_chars:
+        return focused
+    return focused[:max_chars]
+
+
+def _build_scoring_profile(profile: dict) -> dict:
+    experience = profile.get("experience", {}) if isinstance(profile.get("experience"), dict) else {}
+    target_role = _coerce_text(experience.get("target_role"))
+    years_total = _to_float(experience.get("years_of_experience_total")) or 0.0
+    work_entries = profile.get("work", []) if isinstance(profile.get("work"), list) else []
+
+    current_titles: list[str] = []
+    for item in work_entries[:4]:
+        if not isinstance(item, dict):
+            continue
+        title = _coerce_text(item.get("position"))
+        if title and title not in current_titles:
+            current_titles.append(title)
+
+    profile_skills = [skill.lower() for skill in get_profile_skill_keywords(profile)]
+    for item in work_entries:
+        if not isinstance(item, dict):
+            continue
+        for tech in _coerce_list(item.get("technologies")):
+            lower = tech.lower()
+            if lower and lower not in profile_skills:
+                profile_skills.append(lower)
+
+    profile_known_skills = set()
+    for skill in profile_skills:
+        matched = _extract_known_skills(skill)
+        if matched:
+            profile_known_skills.update(matched)
+        elif skill:
+            profile_known_skills.add(skill)
+
+    role_text = " ".join([target_role, *current_titles]).strip()
+    role_family = _infer_role_family(role_text)
+    seniority_from_titles = _seniority_from_text(role_text)
+    seniority_from_years = 1
+    if years_total >= 11:
+        seniority_from_years = 4
+    elif years_total >= 7:
+        seniority_from_years = 3
+    elif years_total >= 3:
+        seniority_from_years = 2
+    profile_seniority = max(seniority_from_titles, seniority_from_years)
+
+    return {
+        "target_role": target_role,
+        "years_total": years_total,
+        "current_titles": current_titles,
+        "skills": profile_skills,
+        "known_skills": sorted(profile_known_skills),
+        "role_tokens": _tokenize_set(role_text),
+        "role_family": role_family,
+        "seniority": profile_seniority,
+    }
+
+
+def _load_scoring_profile() -> dict:
+    try:
+        profile = load_profile()
+        return _build_scoring_profile(profile)
+    except Exception as exc:
+        log.warning("Falling back to minimal scoring profile because profile load failed: %s", exc)
+        return {
+            "target_role": "",
+            "years_total": 0.0,
+            "current_titles": [],
+            "skills": [],
+            "known_skills": [],
+            "role_tokens": set(),
+            "role_family": "unknown",
+            "seniority": 2,
+        }
+
+
+def _compute_deterministic_baseline(scoring_profile: dict, job: dict) -> dict:
+    title = _coerce_text(job.get("title"))
+    description = _coerce_text(job.get("full_description") or job.get("description"))
+    focused_description = _extract_requirement_focused_text(description, max_chars=7000)
+    job_text = f"{title}\n{focused_description}".strip()
+    job_text_lower = job_text.lower()
+
+    title_tokens = _tokenize_set(title)
+    role_tokens = scoring_profile.get("role_tokens", set()) or set()
+    title_similarity = _jaccard_similarity(title_tokens, role_tokens)
+
+    profile_known_skills = set(scoring_profile.get("known_skills") or [])
+    job_known_skills = _extract_known_skills(job_text)
+    matched_known_skills = sorted(job_known_skills & profile_known_skills)
+    missing_requirements = sorted(job_known_skills - profile_known_skills)
+
+    profile_custom_skills = [
+        skill
+        for skill in scoring_profile.get("skills", [])
+        if skill not in profile_known_skills and len(skill) >= 3
+    ]
+    matched_custom_skills = sorted(
+        skill for skill in profile_custom_skills if _contains_phrase(job_text_lower, skill)
+    )
+
+    if job_known_skills:
+        skill_overlap = len(matched_known_skills) / max(1, len(job_known_skills))
+    else:
+        skill_overlap = min(1.0, len(matched_custom_skills) / 4.0)
+
+    profile_family = _coerce_text(scoring_profile.get("role_family") or "unknown")
+    job_family = _infer_role_family(job_text)
+    domain_mismatch_penalty = 0.0
+    if profile_family != "unknown" and job_family != "unknown" and profile_family != job_family:
+        if (profile_family, job_family) in _RELATED_ROLE_FAMILY_PAIRS:
+            domain_mismatch_penalty = 0.5
+        else:
+            domain_mismatch_penalty = 3.0 if profile_family == "software_engineering" else 1.5
+
+    profile_seniority = int(scoring_profile.get("seniority") or 2)
+    job_seniority = _seniority_from_text(title)
+    seniority_gap = job_seniority - profile_seniority
+    if seniority_gap >= 3:
+        seniority_component = -2.0
+    elif seniority_gap == 2:
+        seniority_component = -1.0
+    elif seniority_gap <= -3:
+        seniority_component = -0.5
+    else:
+        seniority_component = 0.8
+
+    role_family_bonus = (
+        1.0
+        if profile_family == job_family and profile_family in {"software_engineering", "data_ai"}
+        else 0.0
+    )
+
+    raw_score = (
+        1.5
+        + 3.0 * title_similarity
+        + 4.0 * skill_overlap
+        + seniority_component
+        + role_family_bonus
+        - domain_mismatch_penalty
+    )
+    if title_similarity >= 0.3 and skill_overlap >= 0.3:
+        raw_score += 0.7
+    if job_known_skills and not matched_known_skills:
+        raw_score -= 0.6
+
+    baseline_score = int(round(max(0.0, min(10.0, raw_score))))
+    matched_skills = sorted(set(matched_known_skills + matched_custom_skills))[:12]
+    is_software_engineering_role = job_family == "software_engineering"
+
+    return {
+        "score": baseline_score,
+        "title_similarity": round(title_similarity, 3),
+        "skill_overlap": round(skill_overlap, 3),
+        "matched_skills": matched_skills,
+        "missing_requirements": missing_requirements[:10],
+        "seniority_gap": seniority_gap,
+        "profile_role_family": profile_family,
+        "job_role_family": job_family,
+        "domain_mismatch_penalty": domain_mismatch_penalty,
+        "is_software_engineering_role": is_software_engineering_role,
+        "focused_description": focused_description,
+        "normalized_title": _title_key(title),
+    }
+
+
+def _extract_json_object(text: str) -> dict:
+    payload = (text or "").strip()
+    if not payload:
+        raise ScoreResponseParseError("empty_response", "LLM returned an empty response.")
+
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", payload, re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        payload = fenced_match.group(1).strip()
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        object_match = re.search(r"\{.*\}", payload, re.DOTALL)
+        if not object_match:
+            raise ScoreResponseParseError("missing_json_object", "No JSON object found in model response.")
+        try:
+            parsed = json.loads(object_match.group(0))
+        except json.JSONDecodeError as exc:
+            raise ScoreResponseParseError(
+                "invalid_json",
+                f"Could not parse JSON object: {exc.msg} at line {exc.lineno}, column {exc.colno}",
+            ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ScoreResponseParseError("invalid_shape", "JSON response must be an object.")
+    return parsed
+
+
+def _parse_score_response(response: str) -> dict:
+    """Parse and validate the strict scoring JSON schema."""
+
+    data = _extract_json_object(response)
+    if "score" not in data:
+        raise ScoreResponseParseError("missing_score", "Response JSON did not include a 'score' field.")
+
+    try:
+        score = int(round(float(data["score"])))
+    except (TypeError, ValueError) as exc:
+        raise ScoreResponseParseError("invalid_score_type", "Score must be numeric.") from exc
+    score = max(1, min(10, score))
+
+    confidence_raw = data.get("confidence", 0.5)
+    try:
+        confidence = float(confidence_raw)
+    except (TypeError, ValueError):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
+
+    matched_skills = _coerce_list(data.get("matched_skills"))
+    missing_requirements = _coerce_list(data.get("missing_requirements"))
+    reasoning = _coerce_text(data.get("reasoning")) or "No reasoning provided by model."
+
+    return {
+        "score": score,
+        "confidence": confidence,
+        "matched_skills": matched_skills[:12],
+        "missing_requirements": missing_requirements[:12],
+        "reasoning": reasoning,
+    }
+
+
+def _has_hard_mismatch_evidence(baseline: dict, missing_requirements: list[str], job_text: str) -> bool:
+    if float(baseline.get("domain_mismatch_penalty") or 0.0) >= 3.0:
+        return True
+    evidence_blob = " ".join(missing_requirements + [job_text]).lower()
+    return any(term in evidence_blob for term in _HARD_MISMATCH_TERMS)
+
+
+def _apply_score_calibration(
+    baseline: dict,
+    llm_score: int,
+    confidence: float,
+    matched_skills: list[str],
+    missing_requirements: list[str],
+    job_context: str,
+) -> tuple[int, int]:
+    baseline_score = int(baseline.get("score", 0))
+    bounded_llm_score = max(1, min(10, int(llm_score)))
+    bounded_confidence = max(0.0, min(1.0, float(confidence)))
+
+    max_delta = 2
+    if bounded_confidence >= 0.85 and (len(matched_skills) >= 5 or len(missing_requirements) >= 4):
+        max_delta = 3
+
+    delta = bounded_llm_score - baseline_score
+    delta = max(-max_delta, min(max_delta, delta))
+    calibrated = max(1, min(10, baseline_score + delta))
+
+    hard_mismatch = _has_hard_mismatch_evidence(baseline, missing_requirements, job_context)
+    if hard_mismatch and bounded_confidence >= 0.8 and bounded_llm_score <= 2:
+        calibrated = min(calibrated, 2)
+
+    strong_eng_overlap = (
+        baseline.get("is_software_engineering_role")
+        and baseline.get("profile_role_family") in {"software_engineering", "data_ai"}
+        and float(baseline.get("skill_overlap") or 0.0) >= 0.35
+        and float(baseline.get("title_similarity") or 0.0) >= 0.2
+    )
+    if strong_eng_overlap and calibrated <= 2 and not _has_hard_mismatch_evidence(
+        baseline, missing_requirements, job_context
+    ):
+        calibrated = 3
+
+    return calibrated, calibrated - baseline_score
+
+
+def _format_scoring_profile_for_prompt(scoring_profile: dict) -> str:
+    return (
+        f"Target role: {scoring_profile.get('target_role') or 'N/A'}\n"
+        f"Years experience: {scoring_profile.get('years_total') or 0}\n"
+        f"Recent titles: {', '.join(scoring_profile.get('current_titles') or []) or 'N/A'}\n"
+        f"Skills: {', '.join((scoring_profile.get('known_skills') or [])[:40]) or 'N/A'}"
+    )
+
+
+def _exclusion_result(rule: dict, matched_value: str) -> dict:
+    """Build a blocked scoring result for an excluded job."""
+
     reason_code = rule["reason_code"]
     return {
         "score": 0,
         "keywords": "",
-        "reasoning": f"EXCLUDED: {reason_code} \u2014 matched '{matched_value}' (rule {rule['id']})",
+        "reasoning": f"EXCLUDED: {reason_code} — matched '{matched_value}' (rule {rule['id']})",
         "exclusion_reason_code": reason_code,
         "exclusion_rule_id": rule["id"],
     }
 
 
 def evaluate_exclusion(job: dict) -> dict | None:
-    """Evaluate deterministic exclusion rules against a job.
+    """Evaluate deterministic exclusion rules against a job."""
 
-    Returns exclusion result dict if job is excluded, None if job passes.
-    Uses case-insensitive exact/prefix token matching per task-8 contract.
-    No LLM calls, no network, fully deterministic.
-
-    Args:
-        job: Job dict with keys: title, site, full_description.
-
-    Returns:
-        {"score": 0, "keywords": "", "reasoning": "EXCLUDED: ..."} or None.
-    """
     title = job.get("title") or ""
     description = job.get("full_description") or job.get("description") or ""
     site = job.get("site") or ""
@@ -124,113 +739,154 @@ def evaluate_exclusion(job: dict) -> dict | None:
         match_scope = rule.get("match_scope", "title+description")
         match_type = rule.get("match_type", "exact")
 
-        # Site-scoped matching: substring/exact against raw site field
         if match_scope == "site":
             field_lower = site.lower()
             for val in values:
                 val_lower = val.lower()
                 if match_type == "substring" and val_lower in field_lower:
                     return _exclusion_result(rule, val)
-                elif match_type == "exact" and val_lower == field_lower:
+                if match_type == "exact" and val_lower == field_lower:
                     return _exclusion_result(rule, val)
             continue
 
-        # Select tokens based on scope
         if match_scope == "title":
             tokens = title_tokens
         elif match_scope == "description":
             tokens = desc_tokens
-        else:  # title+description (default)
+        else:
             tokens = combined_tokens
 
-        # Token-based matching
         for val in values:
             val_lower = val.lower()
             if match_type == "exact":
                 if val_lower in tokens:
                     return _exclusion_result(rule, val)
             elif match_type == "prefix":
-                if any(t.startswith(val_lower) for t in tokens):
+                if any(token.startswith(val_lower) for token in tokens):
                     return _exclusion_result(rule, val)
 
     return None
 
-def _parse_score_response(response: str) -> dict:
-    """Parse the LLM's score response into structured data.
 
-    Args:
-        response: Raw LLM response text.
+def score_job(resume_text: str, job: dict, scoring_profile: dict) -> dict:
+    """Score a single job against the resume."""
 
-    Returns:
-        {"score": int, "keywords": str, "reasoning": str}
-    """
-    score = 0
-    keywords = ""
-    reasoning = response
+    baseline = _compute_deterministic_baseline(scoring_profile, job)
+    focused_description = baseline.get("focused_description", "")
 
-    for line in response.split("\n"):
-        line = line.strip()
-        if line.startswith("SCORE:"):
-            try:
-                score = int(re.search(r"\d+", line).group())
-                score = max(1, min(10, score))
-            except (AttributeError, ValueError):
-                score = 0
-        elif line.startswith("KEYWORDS:"):
-            keywords = line.replace("KEYWORDS:", "").strip()
-        elif line.startswith("REASONING:"):
-            reasoning = line.replace("REASONING:", "").strip()
-
-    # Fallback: some providers return free-form text like "score maybe 6"
-    # even when we request strict output.
-    if score == 0:
-        fallback_match = (
-            re.search(r"(?im)^\s*score\s*[:=-]?\s*(10|[1-9])\b", response)
-            or re.search(
-                r"(?i)\bscore\s*[:=-]?\s*(?:is|of|maybe|around|approx(?:imately)?|~)?\s*(10|[1-9])\b",
-                response,
-            )
-        )
-        if fallback_match:
-            score = int(fallback_match.group(1))
-
-    if not keywords:
-        keyword_match = re.search(r"(?im)^\s*keywords?\s*[:=-]\s*(.+)$", response)
-        if keyword_match:
-            keywords = keyword_match.group(1).strip()
-
-    return {"score": score, "keywords": keywords, "reasoning": reasoning}
-
-
-def score_job(resume_text: str, job: dict) -> dict:
-    """Score a single job against the resume.
-
-    Args:
-        resume_text: The candidate's full resume text.
-        job: Job dict with keys: title, site, location, full_description.
-
-    Returns:
-        {"score": int, "keywords": str, "reasoning": str}
-    """
     job_text = (
-        f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"TITLE: {job.get('title', '')}\n"
+        f"COMPANY: {job.get('site', '')}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
-        f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
+        f"DESCRIPTION (REQUIREMENT-FOCUSED):\n{focused_description}"
     )
+
+    baseline_context = {
+        "baseline_score": baseline["score"],
+        "title_similarity": baseline["title_similarity"],
+        "skill_overlap": baseline["skill_overlap"],
+        "matched_skills": baseline["matched_skills"],
+        "missing_requirements": baseline["missing_requirements"],
+        "seniority_gap": baseline["seniority_gap"],
+        "profile_role_family": baseline["profile_role_family"],
+        "job_role_family": baseline["job_role_family"],
+        "domain_mismatch_penalty": baseline["domain_mismatch_penalty"],
+    }
 
     messages = [
         {"role": "system", "content": SCORE_PROMPT},
-        {"role": "user", "content": f"RESUME:\n{resume_text}\n\n---\n\nJOB POSTING:\n{job_text}"},
+        {
+            "role": "user",
+            "content": (
+                f"RESUME PROFILE:\n{_format_scoring_profile_for_prompt(scoring_profile)}\n\n"
+                f"RESUME TEXT:\n{resume_text[:12000]}\n\n---\n\n"
+                f"JOB POSTING:\n{job_text}\n\n---\n\n"
+                f"DETERMINISTIC BASELINE SIGNALS:\n{json.dumps(baseline_context, ensure_ascii=False)}"
+            ),
+        },
     ]
 
-    try:
-        client = get_client()
-        response = client.chat(messages, max_output_tokens=512)
-        return _parse_score_response(response)
-    except Exception as e:
-        log.error("LLM error scoring job '%s': %s", job.get("title", "?"), e)
-        return {"score": 0, "keywords": "", "reasoning": f"LLM error: {e}"}
+    client = get_client()
+    final_failure: dict | None = None
+    for attempt in range(1, MAX_SCORE_ATTEMPTS_PER_JOB + 1):
+        raw_response = ""
+        try:
+            raw_response = client.chat(
+                messages,
+                max_output_tokens=768,
+                temperature=0,
+                response_format=SCORING_RESPONSE_FORMAT,
+            )
+            parsed = _parse_score_response(raw_response)
+
+            llm_score = int(parsed["score"])
+            llm_confidence = float(parsed["confidence"])
+            matched_skills = parsed["matched_skills"] or baseline["matched_skills"]
+            missing_requirements = parsed["missing_requirements"] or baseline["missing_requirements"]
+            final_score, delta = _apply_score_calibration(
+                baseline=baseline,
+                llm_score=llm_score,
+                confidence=llm_confidence,
+                matched_skills=matched_skills,
+                missing_requirements=missing_requirements,
+                job_context=job_text,
+            )
+
+            return {
+                "score": final_score,
+                "keywords": ", ".join(matched_skills[:12]),
+                "reasoning": (
+                    f"Baseline={baseline['score']} LLM={llm_score} Confidence={llm_confidence:.2f} Delta={delta}. "
+                    f"{parsed['reasoning']}"
+                ),
+                "matched_skills": matched_skills[:12],
+                "missing_requirements": missing_requirements[:12],
+                "baseline_score": baseline["score"],
+                "llm_score": llm_score,
+                "llm_confidence": round(llm_confidence, 3),
+                "score_delta": delta,
+                "normalized_title": baseline["normalized_title"],
+            }
+        except ScoreResponseParseError as exc:
+            snippet = _safe_response_snippet(raw_response)
+            final_failure = {
+                "score": 0,
+                "keywords": "",
+                "reasoning": f"LLM parse error [{exc.category}]: {exc}. raw='{snippet}'",
+                "parse_error_category": exc.category,
+                "raw_response_snippet": snippet,
+                "baseline_score": baseline["score"],
+                "normalized_title": baseline["normalized_title"],
+            }
+        except Exception as exc:
+            final_failure = {
+                "score": 0,
+                "keywords": "",
+                "reasoning": f"LLM error: {exc}",
+                "parse_error_category": "llm_request_error",
+                "baseline_score": baseline["score"],
+                "normalized_title": baseline["normalized_title"],
+            }
+
+        if attempt < MAX_SCORE_ATTEMPTS_PER_JOB:
+            category = final_failure.get("parse_error_category", "unknown") if final_failure else "unknown"
+            log.warning(
+                "Retrying score for '%s' after %s (attempt %d/%d)",
+                job.get("title", "?"),
+                category,
+                attempt + 1,
+                MAX_SCORE_ATTEMPTS_PER_JOB,
+            )
+            time.sleep(SCORE_ATTEMPT_BACKOFF_SECONDS * attempt)
+
+    return final_failure or {
+        "score": 0,
+        "keywords": "",
+        "reasoning": "LLM error: unknown scoring failure",
+        "parse_error_category": "unknown",
+        "baseline_score": baseline["score"],
+        "normalized_title": baseline["normalized_title"],
+    }
 
 
 def _compose_score_reasoning(result: dict) -> str:
@@ -250,10 +906,9 @@ def _normalize_llm_error(reasoning: str) -> str:
     return f"LLM error: {text}"
 
 
-def _next_score_retry_at_iso(current_retry_count: int) -> str | None:
-    if current_retry_count >= MAX_SCORE_RETRIES:
-        return None
-    delay_minutes = min(5 * (4 ** current_retry_count), 24 * 60)
+def _next_score_retry_at_iso(current_retry_count: int) -> str:
+    # Keep exponential spacing early, cap to daily retries for persistent failures.
+    delay_minutes = min(5 * (4 ** min(current_retry_count, 8)), 24 * 60)
     next_retry = datetime.now(timezone.utc) + timedelta(minutes=delay_minutes)
     return next_retry.isoformat()
 
@@ -293,8 +948,7 @@ def _autoheal_legacy_llm_failures(conn) -> int:
         retry_count = int(row[2] or 0)
         error_text = _normalize_llm_error(score_reasoning)
 
-        # Preserve evidence of a prior failure while ensuring these jobs are retryable.
-        next_retry_count = min(max(retry_count, 1), MAX_SCORE_RETRIES - 1)
+        next_retry_count = max(retry_count, 1)
         conn.execute(
             "UPDATE jobs SET fit_score = NULL, score_reasoning = NULL, scored_at = NULL, "
             "score_error = ?, score_retry_count = ?, score_next_retry_at = NULL, "
@@ -319,24 +973,54 @@ def _load_scoring_resume_text() -> str:
         return load_resume_text()
 
 
+def _score_telemetry_summary(
+    baseline_distribution: Counter,
+    delta_distribution: Counter,
+    parse_failures: Counter,
+    title_scores: dict[str, list[int]],
+) -> None:
+    if baseline_distribution:
+        log.info("Scoring telemetry: baseline_distribution=%s", dict(sorted(baseline_distribution.items(), reverse=True)))
+    if delta_distribution:
+        log.info("Scoring telemetry: llm_delta_distribution=%s", dict(sorted(delta_distribution.items())))
+    if parse_failures:
+        log.info("Scoring telemetry: parse_failures=%s", dict(sorted(parse_failures.items())))
+
+    volatility_rows: list[tuple[str, int, int, int, int]] = []
+    for title_key, scores in title_scores.items():
+        if len(scores) < 2:
+            continue
+        minimum = min(scores)
+        maximum = max(scores)
+        spread = maximum - minimum
+        volatility_rows.append((title_key, spread, len(scores), minimum, maximum))
+    if volatility_rows:
+        volatility_rows.sort(key=lambda row: (-row[1], -row[2], row[0]))
+        top_rows = volatility_rows[:10]
+        log.info(
+            "Scoring telemetry: title_volatility(top10)=%s",
+            [
+                {
+                    "title": title,
+                    "spread": spread,
+                    "count": count,
+                    "min": minimum,
+                    "max": maximum,
+                }
+                for title, spread, count, minimum, maximum in top_rows
+            ],
+        )
+
+
 def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
-    """Score unscored jobs that have full descriptions.
-    Jobs are first evaluated against deterministic exclusion rules. Excluded
-    jobs bypass the LLM and receive score=0 with an EXCLUDED reason marker.
+    """Score unscored jobs that have full descriptions."""
 
-    Args:
-        limit: Maximum number of jobs to score in this run.
-        rescore: If True, re-score all jobs (not just unscored ones).
-
-    Returns:
-        {"scored": int, "errors": int, "elapsed": float, "distribution": list,
-         "excluded": int, "auto_healed": int}
-    """
     try:
         resume_text = _load_scoring_resume_text()
     except FileNotFoundError:
         log.error("Resume file not found. Run 'applypilot init' first.")
         return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": [], "excluded": 0, "auto_healed": 0}
+    scoring_profile = _load_scoring_profile()
     conn = get_connection()
     auto_healed = _autoheal_legacy_llm_failures(conn)
     if auto_healed:
@@ -352,9 +1036,15 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
 
     if not jobs:
         log.info("No unscored jobs with descriptions found.")
-        return {"scored": 0, "errors": 0, "elapsed": 0.0, "distribution": [], "excluded": 0, "auto_healed": auto_healed}
+        return {
+            "scored": 0,
+            "errors": 0,
+            "elapsed": 0.0,
+            "distribution": [],
+            "excluded": 0,
+            "auto_healed": auto_healed,
+        }
 
-    # Convert sqlite3.Row to dicts if needed
     if jobs and not isinstance(jobs[0], dict):
         columns = jobs[0].keys()
         jobs = [dict(zip(columns, row)) for row in jobs]
@@ -365,32 +1055,57 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
     errors = 0
     excluded_count = 0
     results: list[dict] = []
+    baseline_distribution: Counter = Counter()
+    llm_delta_distribution: Counter = Counter()
+    parse_failures: Counter = Counter()
+    title_scores: dict[str, list[int]] = defaultdict(list)
+
     for job in jobs:
-        # Deterministic exclusion gate: check before LLM scoring
         exclusion = evaluate_exclusion(job)
         if exclusion is not None:
             result = exclusion
             excluded_count += 1
         else:
-            result = score_job(resume_text, job)
+            result = score_job(resume_text, job, scoring_profile)
+
+        baseline_score = result.get("baseline_score")
+        if isinstance(baseline_score, int):
+            baseline_distribution[baseline_score] += 1
+        if isinstance(result.get("score_delta"), int):
+            llm_delta_distribution[int(result["score_delta"])] += 1
+        if result.get("parse_error_category"):
+            parse_failures[str(result["parse_error_category"])] += 1
+
         result["outcome"] = _classify_score_outcome(result)
         result["url"] = job["url"]
         result["score_retry_count"] = int(job.get("score_retry_count") or 0)
         completed += 1
         if result["outcome"] == "llm_failed":
             errors += 1
+        else:
+            title_key = str(result.get("normalized_title") or _title_key(job.get("title", "")))
+            title_scores[title_key].append(int(result.get("score", 0)))
         results.append(result)
-        marker = " [EXCLUDED]" if result["outcome"] == "excluded" else (" [LLM_FAILED]" if result["outcome"] == "llm_failed" else "")
+
+        marker = (
+            " [EXCLUDED]"
+            if result["outcome"] == "excluded"
+            else (" [LLM_FAILED]" if result["outcome"] == "llm_failed" else "")
+        )
         log.info(
             "[%d/%d] score=%d  %s%s",
-            completed, len(jobs), int(result.get("score", 0)), job.get("title", "?")[:60],
+            completed,
+            len(jobs),
+            int(result.get("score", 0)),
+            job.get("title", "?")[:60],
             marker,
         )
+        if _SCORE_TRACE_ENABLED or result["outcome"] == "llm_failed":
+            log.info("          %s", _build_score_trace(result))
 
-    # Write scores to DB
     now = datetime.now(timezone.utc).isoformat()
-    for r in results:
-        outcome = r.get("outcome")
+    for result in results:
+        outcome = result.get("outcome")
         if outcome == "excluded":
             conn.execute(
                 "UPDATE jobs SET fit_score = ?, score_reasoning = ?, scored_at = ?, "
@@ -399,12 +1114,12 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
                 "WHERE url = ?",
                 (
                     0,
-                    _compose_score_reasoning(r),
+                    _compose_score_reasoning(result),
                     now,
-                    r.get("exclusion_reason_code"),
-                    r.get("exclusion_rule_id"),
+                    result.get("exclusion_reason_code"),
+                    result.get("exclusion_rule_id"),
                     now,
-                    r["url"],
+                    result["url"],
                 ),
             )
             continue
@@ -416,36 +1131,50 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
                 "score_error = NULL, score_retry_count = 0, score_next_retry_at = NULL "
                 "WHERE url = ?",
                 (
-                    int(r["score"]),
-                    _compose_score_reasoning(r),
+                    int(result["score"]),
+                    _compose_score_reasoning(result),
                     now,
-                    r["url"],
+                    result["url"],
                 ),
             )
             continue
 
-        retry_count = int(r.get("score_retry_count") or 0)
-        next_retry_count = min(retry_count + 1, MAX_SCORE_RETRIES)
-        next_retry_at = _next_score_retry_at_iso(retry_count) if retry_count < MAX_SCORE_RETRIES else None
-        error_text = _normalize_llm_error(str(r.get("reasoning") or ""))
+        retry_count = int(result.get("score_retry_count") or 0)
+        next_retry_count = retry_count + 1
+        next_retry_at = _next_score_retry_at_iso(retry_count)
+        error_text = _normalize_llm_error(str(result.get("reasoning") or ""))
         conn.execute(
             "UPDATE jobs SET fit_score = NULL, score_reasoning = ?, scored_at = NULL, "
             "exclusion_reason_code = NULL, exclusion_rule_id = NULL, excluded_at = NULL, "
             "score_error = ?, score_retry_count = ?, score_next_retry_at = ? "
             "WHERE url = ?",
-            (error_text, error_text, next_retry_count, next_retry_at, r["url"]),
+            (error_text, error_text, next_retry_count, next_retry_at, result["url"]),
         )
     conn.commit()
 
     elapsed = time.time() - t0
-    log.info("Done: %d scored (%d excluded) in %.1fs (%.1f jobs/sec)", len(results), excluded_count, elapsed, len(results) / elapsed if elapsed > 0 else 0)
+    jobs_per_second = len(results) / elapsed if elapsed > 0 else 0.0
+    log.info(
+        "Done: %d scored (%d excluded) in %.1fs (%.1f jobs/sec)",
+        len(results),
+        excluded_count,
+        elapsed,
+        jobs_per_second,
+    )
+    _score_telemetry_summary(
+        baseline_distribution=baseline_distribution,
+        delta_distribution=llm_delta_distribution,
+        parse_failures=parse_failures,
+        title_scores=title_scores,
+    )
 
-    # Score distribution
-    dist = conn.execute("""
+    dist = conn.execute(
+        """
         SELECT fit_score, COUNT(*) FROM jobs
         WHERE fit_score IS NOT NULL
         GROUP BY fit_score ORDER BY fit_score DESC
-    """).fetchall()
+        """
+    ).fetchall()
     distribution = [(row[0], row[1]) for row in dist]
 
     return {

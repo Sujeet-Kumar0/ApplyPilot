@@ -2,18 +2,29 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 import applypilot.scoring.scorer as scorer
 
 
-def test_parse_score_response_accepts_free_form_score_hint() -> None:
-    parsed = scorer._parse_score_response(
-        "The candidate appears to be a moderate match. Score maybe 6 based on the requirements."
-    )
-    assert parsed["score"] == 6
-    parsed_colon = scorer._parse_score_response(
-        "Detailed analysis follows. Score: maybe 8 for this role."
-    )
-    assert parsed_colon["score"] == 8
+def _sample_profile() -> dict:
+    return {
+        "experience": {
+            "target_role": "Senior Software Engineer",
+            "years_of_experience_total": "8",
+        },
+        "work": [
+            {
+                "position": "Senior Software Engineer",
+                "technologies": ["Python", "React", "AWS", "Kubernetes"],
+            }
+        ],
+        "skills": [
+            {"name": "Languages", "keywords": ["Python", "Java", "TypeScript"]},
+            {"name": "Frameworks", "keywords": ["React", "FastAPI", "Angular"]},
+            {"name": "Cloud", "keywords": ["AWS", "Docker", "Kubernetes"]},
+        ],
+    }
 
 
 def _make_jobs_conn() -> sqlite3.Connection:
@@ -57,12 +68,175 @@ def _insert_job(conn: sqlite3.Connection, url: str = "https://example.com/job/1"
     conn.commit()
 
 
+def test_parse_score_response_requires_valid_json_object() -> None:
+    with pytest.raises(scorer.ScoreResponseParseError) as exc:
+        scorer._parse_score_response("Score maybe 6 based on requirements")
+    assert exc.value.category in {"missing_json_object", "invalid_json"}
+
+
+def test_parse_score_response_accepts_strict_json_schema() -> None:
+    parsed = scorer._parse_score_response(
+        """
+        {
+          "score": 8,
+          "confidence": 0.84,
+          "matched_skills": ["python", "react"],
+          "missing_requirements": ["graphql"],
+          "reasoning": "Strong overlap with backend stack."
+        }
+        """
+    )
+    assert parsed["score"] == 8
+    assert parsed["confidence"] == pytest.approx(0.84)
+    assert parsed["matched_skills"] == ["python", "react"]
+    assert parsed["missing_requirements"] == ["graphql"]
+
+
+def test_score_job_retries_inline_until_it_gets_valid_json(monkeypatch) -> None:
+    class _FakeClient:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.responses = [
+                "this is not json",
+                '{"score": 8, "confidence": 0.9, "matched_skills": ["python"], "missing_requirements": [], "reasoning": "Strong fit"}',
+            ]
+
+        def chat(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.calls += 1
+            return self.responses.pop(0)
+
+    fake_client = _FakeClient()
+    monkeypatch.setattr(scorer, "get_client", lambda: fake_client)
+    monkeypatch.setattr(scorer, "SCORE_ATTEMPT_BACKOFF_SECONDS", 0.0)
+
+    scoring_profile = scorer._build_scoring_profile(_sample_profile())
+    result = scorer.score_job(
+        resume_text="Senior software engineer with Python and React.",
+        job={
+            "title": "Senior Backend Engineer",
+            "site": "ExampleCo",
+            "location": "Remote",
+            "full_description": "Requirements: Python, REST APIs, AWS.",
+        },
+        scoring_profile=scoring_profile,
+    )
+
+    assert fake_client.calls == 2
+    assert result["score"] > 0
+    assert "parse_error_category" not in result
+
+
+def test_engineering_fit_guardrail_blocks_bottom_bucket_without_hard_mismatch() -> None:
+    scoring_profile = scorer._build_scoring_profile(_sample_profile())
+    job = {
+        "title": "Senior Full-Stack Engineer (Java + React/Angular)",
+        "full_description": (
+            "Requirements: 5+ years software engineering experience. "
+            "Strong Java, Python, React, AWS, and Kubernetes."
+        ),
+    }
+
+    baseline = scorer._compute_deterministic_baseline(scoring_profile, job)
+    final_score, _ = scorer._apply_score_calibration(
+        baseline=baseline,
+        llm_score=1,
+        confidence=0.95,
+        matched_skills=baseline["matched_skills"],
+        missing_requirements=[],
+        job_context=job["full_description"],
+    )
+
+    assert baseline["score"] >= 4
+    assert final_score >= 3
+
+
+def test_hard_mismatch_evidence_can_allow_bottom_bucket() -> None:
+    scoring_profile = scorer._build_scoring_profile(_sample_profile())
+    job = {
+        "title": "Senior Full-Stack Engineer",
+        "full_description": (
+            "Requirements: Active TS/SCI clearance and U.S. citizenship required. "
+            "5+ years Java and React."
+        ),
+    }
+
+    baseline = scorer._compute_deterministic_baseline(scoring_profile, job)
+    final_score, _ = scorer._apply_score_calibration(
+        baseline=baseline,
+        llm_score=1,
+        confidence=0.95,
+        matched_skills=baseline["matched_skills"],
+        missing_requirements=["Active TS/SCI clearance required"],
+        job_context=job["full_description"],
+    )
+
+    assert final_score <= 2
+
+
+def test_non_fit_role_baseline_and_calibrated_score_stay_low() -> None:
+    scoring_profile = scorer._build_scoring_profile(_sample_profile())
+    job = {
+        "title": "Director of Marketing + Audience Development",
+        "full_description": (
+            "Lead demand generation, audience growth, SEO strategy, and content operations."
+        ),
+    }
+
+    baseline = scorer._compute_deterministic_baseline(scoring_profile, job)
+    final_score, _ = scorer._apply_score_calibration(
+        baseline=baseline,
+        llm_score=3,
+        confidence=0.6,
+        matched_skills=[],
+        missing_requirements=["SEO", "demand generation"],
+        job_context=job["full_description"],
+    )
+
+    assert baseline["score"] <= 3
+    assert final_score <= 4
+
+
+def test_near_identical_titles_have_bounded_baseline_and_calibrated_variance() -> None:
+    scoring_profile = scorer._build_scoring_profile(_sample_profile())
+    job_a = {
+        "title": "Senior Full-Stack Engineer (Java + React/Angular)",
+        "full_description": "Build APIs in Java/Python with React and AWS.",
+    }
+    job_b = {
+        "title": "Senior Full Stack Engineer - Java React Angular",
+        "full_description": "Build APIs in Java and Python with React on AWS.",
+    }
+
+    baseline_a = scorer._compute_deterministic_baseline(scoring_profile, job_a)
+    baseline_b = scorer._compute_deterministic_baseline(scoring_profile, job_b)
+    assert abs(baseline_a["score"] - baseline_b["score"]) <= 1
+
+    low_score, _ = scorer._apply_score_calibration(
+        baseline=baseline_a,
+        llm_score=1,
+        confidence=0.4,
+        matched_skills=baseline_a["matched_skills"],
+        missing_requirements=[],
+        job_context=job_a["full_description"],
+    )
+    high_score, _ = scorer._apply_score_calibration(
+        baseline=baseline_a,
+        llm_score=10,
+        confidence=0.4,
+        matched_skills=baseline_a["matched_skills"],
+        missing_requirements=[],
+        job_context=job_a["full_description"],
+    )
+    assert abs(high_score - low_score) <= 4
+
+
 def test_llm_failure_writes_retry_metadata_and_keeps_fit_score_null(monkeypatch) -> None:
     conn = _make_jobs_conn()
     _insert_job(conn)
 
     monkeypatch.setattr(scorer, "get_connection", lambda: conn)
     monkeypatch.setattr(scorer, "_load_scoring_resume_text", lambda: "resume")
+    monkeypatch.setattr(scorer, "_load_scoring_profile", lambda: scorer._build_scoring_profile(_sample_profile()))
     monkeypatch.setattr(
         scorer,
         "get_jobs_by_stage",
@@ -81,7 +255,12 @@ def test_llm_failure_writes_retry_metadata_and_keeps_fit_score_null(monkeypatch)
     monkeypatch.setattr(
         scorer,
         "score_job",
-        lambda *_: {"score": 0, "keywords": "", "reasoning": "LLM error: request failed"},
+        lambda *_: {
+            "score": 0,
+            "keywords": "",
+            "reasoning": "LLM parse error [invalid_json]: malformed payload",
+            "parse_error_category": "invalid_json",
+        },
     )
 
     result = scorer.run_scoring()
@@ -92,7 +271,7 @@ def test_llm_failure_writes_retry_metadata_and_keeps_fit_score_null(monkeypatch)
     ).fetchone()
     assert result["errors"] == 1
     assert row["fit_score"] is None
-    assert row["score_error"].startswith("LLM error:")
+    assert "invalid_json" in row["score_error"]
     assert row["score_retry_count"] == 1
     assert row["score_next_retry_at"] is not None
 
@@ -108,6 +287,7 @@ def test_success_clears_retry_and_error_fields(monkeypatch) -> None:
 
     monkeypatch.setattr(scorer, "get_connection", lambda: conn)
     monkeypatch.setattr(scorer, "_load_scoring_resume_text", lambda: "resume")
+    monkeypatch.setattr(scorer, "_load_scoring_profile", lambda: scorer._build_scoring_profile(_sample_profile()))
     monkeypatch.setattr(
         scorer,
         "get_jobs_by_stage",
@@ -153,6 +333,7 @@ def test_exclusions_remain_score_zero_and_clear_retry_fields(monkeypatch) -> Non
 
     monkeypatch.setattr(scorer, "get_connection", lambda: conn)
     monkeypatch.setattr(scorer, "_load_scoring_resume_text", lambda: "resume")
+    monkeypatch.setattr(scorer, "_load_scoring_profile", lambda: scorer._build_scoring_profile(_sample_profile()))
     monkeypatch.setattr(
         scorer,
         "get_jobs_by_stage",
