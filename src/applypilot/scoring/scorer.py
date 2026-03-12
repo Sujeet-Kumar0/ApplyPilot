@@ -10,6 +10,8 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
+from rich.console import Console
+
 from applypilot.config import RESUME_JSON_PATH, RESUME_PATH, load_profile, load_resume_text
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
@@ -21,6 +23,7 @@ SCORE_ATTEMPT_BACKOFF_SECONDS = 1.0
 _LEGACY_SCORE_ERROR_PATTERN = "%LLM error:%"
 _MODEL_RESPONSE_SNIPPET_LIMIT = 320
 _SCORE_TRACE_ENABLED = os.environ.get("APPLYPILOT_SCORE_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
+_TRACE_CONSOLE = Console(stderr=True, highlight=False, soft_wrap=True)
 
 
 SCORE_PROMPT = """You are a job-fit scoring calibrator.
@@ -132,11 +135,6 @@ _ROLE_FAMILY_PATTERNS: dict[str, tuple[str, ...]] = {
         r"\bcpa\b",
         r"\bcontroller\b",
     ),
-}
-
-_RELATED_ROLE_FAMILY_PAIRS: set[tuple[str, str]] = {
-    ("software_engineering", "data_ai"),
-    ("data_ai", "software_engineering"),
 }
 
 _SENIORITY_PATTERNS: list[tuple[int, tuple[str, ...]]] = [
@@ -293,18 +291,25 @@ def _safe_response_snippet(text: str, limit: int = _MODEL_RESPONSE_SNIPPET_LIMIT
     return snippet[: limit - 3] + "..."
 
 
-def _compact_values(values: list[str], limit: int = 4) -> str:
+def _truncate_piece(text: str, limit: int = 28) -> str:
+    normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _compact_values(values: list[str], limit: int = 3, item_limit: int = 28) -> str:
     items = [item.strip() for item in values if item and item.strip()]
     if not items:
         return "-"
-    shown = items[:limit]
+    shown = [_truncate_piece(item, item_limit) for item in items[:limit]]
     remainder = len(items) - len(shown)
     if remainder > 0:
-        return f"{', '.join(shown)} (+{remainder})"
+        return f"{', '.join(shown)}, +{remainder}"
     return ", ".join(shown)
 
 
-def _compact_reasoning(text: str, limit: int = 180) -> str:
+def _compact_reasoning(text: str, limit: int = 110) -> str:
     compact = re.sub(r"\s+", " ", (text or "")).strip()
     if not compact:
         return "-"
@@ -313,34 +318,51 @@ def _compact_reasoning(text: str, limit: int = 180) -> str:
     return compact[: limit - 3] + "..."
 
 
-def _build_score_trace(result: dict) -> str:
+def _emit_score_trace(result: dict) -> None:
     outcome = str(result.get("outcome") or "")
+    prefix = "          [bright_black]└─[/bright_black] "
+
     if outcome == "excluded":
-        return f"trace excluded reason={_compact_reasoning(str(result.get('reasoning') or ''), limit=120)}"
+        reason = _compact_reasoning(str(result.get("reasoning") or ""), limit=120)
+        _TRACE_CONSOLE.print(f"{prefix}[yellow]excluded[/yellow] [dim]{reason}[/dim]")
+        return
 
     if outcome == "llm_failed":
-        category = str(result.get("parse_error_category") or "unknown")
+        category = _truncate_piece(str(result.get("parse_error_category") or "unknown"), limit=24)
         baseline = result.get("baseline_score")
-        return (
-            f"trace failed category={category} baseline={baseline if baseline is not None else '-'} "
-            f"error={_compact_reasoning(str(result.get('reasoning') or ''), limit=140)}"
+        error = _compact_reasoning(str(result.get("reasoning") or ""), limit=120)
+        _TRACE_CONSOLE.print(
+            f"{prefix}[red]failed[/red] [bold]cat[/bold]=[red]{category}[/red] "
+            f"[bold]b[/bold]=[yellow]{baseline if baseline is not None else '-'}[/yellow]"
         )
+        _TRACE_CONSOLE.print(f"{prefix}[bright_black]why[/bright_black] [dim]{error}[/dim]")
+        return
 
     baseline = result.get("baseline_score")
     llm_score = result.get("llm_score")
     confidence = result.get("llm_confidence")
     delta = result.get("score_delta")
-    matched = _compact_values(_coerce_list(result.get("matched_skills")), limit=4)
-    missing = _compact_values(_coerce_list(result.get("missing_requirements")), limit=3)
-    reasoning = _compact_reasoning(str(result.get("reasoning") or ""), limit=140)
+    matched = _compact_values(_coerce_list(result.get("matched_skills")), limit=3, item_limit=22)
+    missing = _compact_values(_coerce_list(result.get("missing_requirements")), limit=2, item_limit=28)
+    full_reasoning = str(result.get("llm_reasoning_full") or result.get("reasoning") or "")
+    reasoning = _compact_reasoning(full_reasoning, limit=120)
     confidence_text = f"{float(confidence):.2f}" if isinstance(confidence, (int, float)) else "-"
-    delta_text = f"{int(delta):+d}" if isinstance(delta, int) else "-"
-    return (
-        f"trace baseline={baseline if baseline is not None else '-'} "
-        f"llm={llm_score if llm_score is not None else '-'} "
-        f"conf={confidence_text} delta={delta_text} "
-        f"match=[{matched}] missing=[{missing}] why={reasoning}"
+    delta_value = int(delta) if isinstance(delta, int) else 0
+    delta_style = "green" if delta_value > 0 else ("red" if delta_value < 0 else "yellow")
+    delta_text = f"{delta_value:+d}" if isinstance(delta, int) else "-"
+
+    _TRACE_CONSOLE.print(
+        f"{prefix}[cyan]trace[/cyan] "
+        f"[bold]b[/bold]=[yellow]{baseline if baseline is not None else '-'}[/yellow] "
+        f"[bold]l[/bold]=[magenta]{llm_score if llm_score is not None else '-'}[/magenta] "
+        f"[bold]c[/bold]=[blue]{confidence_text}[/blue] "
+        f"[bold]Δ[/bold]=[{delta_style}]{delta_text}[/{delta_style}] "
+        f"[bold]m[/bold]=[green]{matched}[/green] "
+        f"[bold]x[/bold]=[red]{missing}[/red]"
     )
+    _TRACE_CONSOLE.print(f"{prefix}[bright_black]why[/bright_black] [dim]{reasoning}[/dim]")
+    if full_reasoning and full_reasoning.strip() and reasoning.strip() != full_reasoning.strip():
+        _TRACE_CONSOLE.print(f"{prefix}[bright_black]full[/bright_black] [dim]{full_reasoning.strip()}[/dim]")
 
 
 def _contains_phrase(text_lower: str, phrase: str) -> bool:
@@ -532,14 +554,32 @@ def _compute_deterministic_baseline(scoring_profile: dict, job: dict) -> dict:
     else:
         skill_overlap = min(1.0, len(matched_custom_skills) / 4.0)
 
+    matched_skill_count = len(set(matched_known_skills + matched_custom_skills))
+    missing_requirement_count = len(missing_requirements)
+    if matched_skill_count + missing_requirement_count > 0:
+        requirement_coverage = matched_skill_count / (matched_skill_count + missing_requirement_count)
+    else:
+        requirement_coverage = skill_overlap
+
     profile_family = _coerce_text(scoring_profile.get("role_family") or "unknown")
     job_family = _infer_role_family(job_text)
-    domain_mismatch_penalty = 0.0
+    domain_mismatch_penalty_raw = 0.0
     if profile_family != "unknown" and job_family != "unknown" and profile_family != job_family:
-        if (profile_family, job_family) in _RELATED_ROLE_FAMILY_PAIRS:
-            domain_mismatch_penalty = 0.5
-        else:
-            domain_mismatch_penalty = 3.0 if profile_family == "software_engineering" else 1.5
+        domain_mismatch_penalty_raw = 2.0
+
+    # Generic evidence score: avoids hardcoded role exceptions while rewarding demonstrable overlap.
+    evidence_strength = max(
+        0.0,
+        min(
+            1.0,
+            0.45 * skill_overlap
+            + 0.30 * min(1.0, matched_skill_count / 6.0)
+            + 0.20 * requirement_coverage
+            + 0.05 * title_similarity,
+        ),
+    )
+    domain_penalty_scale = max(0.35, 1.0 - 0.70 * evidence_strength)
+    domain_mismatch_penalty = domain_mismatch_penalty_raw * domain_penalty_scale
 
     profile_seniority = int(scoring_profile.get("seniority") or 2)
     job_seniority = _seniority_from_text(title)
@@ -582,6 +622,10 @@ def _compute_deterministic_baseline(scoring_profile: dict, job: dict) -> dict:
         "skill_overlap": round(skill_overlap, 3),
         "matched_skills": matched_skills,
         "missing_requirements": missing_requirements[:10],
+        "matched_skill_count": matched_skill_count,
+        "missing_requirement_count": missing_requirement_count,
+        "requirement_coverage": round(requirement_coverage, 3),
+        "evidence_strength": round(evidence_strength, 3),
         "seniority_gap": seniority_gap,
         "profile_role_family": profile_family,
         "job_role_family": job_family,
@@ -671,6 +715,14 @@ def _apply_score_calibration(
     baseline_score = int(baseline.get("score", 0))
     bounded_llm_score = max(1, min(10, int(llm_score)))
     bounded_confidence = max(0.0, min(1.0, float(confidence)))
+    matched_count = int(baseline.get("matched_skill_count") or len(matched_skills))
+    missing_count = max(int(baseline.get("missing_requirement_count") or len(missing_requirements)), 0)
+    skill_overlap = max(0.0, min(1.0, float(baseline.get("skill_overlap") or 0.0)))
+    title_similarity = max(0.0, min(1.0, float(baseline.get("title_similarity") or 0.0)))
+    if matched_count + missing_count > 0:
+        requirement_coverage = matched_count / (matched_count + missing_count)
+    else:
+        requirement_coverage = skill_overlap
 
     max_delta = 2
     if bounded_confidence >= 0.85 and (len(matched_skills) >= 5 or len(missing_requirements) >= 4):
@@ -684,16 +736,23 @@ def _apply_score_calibration(
     if hard_mismatch and bounded_confidence >= 0.8 and bounded_llm_score <= 2:
         calibrated = min(calibrated, 2)
 
-    strong_eng_overlap = (
-        baseline.get("is_software_engineering_role")
-        and baseline.get("profile_role_family") in {"software_engineering", "data_ai"}
-        and float(baseline.get("skill_overlap") or 0.0) >= 0.35
-        and float(baseline.get("title_similarity") or 0.0) >= 0.2
+    # Generic floor based on measurable overlap; no role-specific hardcoded buckets.
+    evidence_score = max(
+        max(0.0, min(1.0, float(baseline.get("evidence_strength") or 0.0))),
+        max(
+            0.0,
+            min(
+                1.0,
+                0.45 * skill_overlap
+                + 0.30 * min(1.0, matched_count / 6.0)
+                + 0.20 * requirement_coverage
+                + 0.05 * title_similarity,
+            ),
+        ),
     )
-    if strong_eng_overlap and calibrated <= 2 and not _has_hard_mismatch_evidence(
-        baseline, missing_requirements, job_context
-    ):
-        calibrated = 3
+    if not hard_mismatch and evidence_score >= 0.35:
+        dynamic_floor = max(3, min(5, int(round(1.0 + 5.0 * evidence_score))))
+        calibrated = max(calibrated, dynamic_floor)
 
     return calibrated, calibrated - baseline_score
 
@@ -785,6 +844,10 @@ def score_job(resume_text: str, job: dict, scoring_profile: dict) -> dict:
         "baseline_score": baseline["score"],
         "title_similarity": baseline["title_similarity"],
         "skill_overlap": baseline["skill_overlap"],
+        "matched_skill_count": baseline.get("matched_skill_count"),
+        "missing_requirement_count": baseline.get("missing_requirement_count"),
+        "requirement_coverage": baseline.get("requirement_coverage"),
+        "evidence_strength": baseline.get("evidence_strength"),
         "matched_skills": baseline["matched_skills"],
         "missing_requirements": baseline["missing_requirements"],
         "seniority_gap": baseline["seniority_gap"],
@@ -839,6 +902,7 @@ def score_job(resume_text: str, job: dict, scoring_profile: dict) -> dict:
                     f"Baseline={baseline['score']} LLM={llm_score} Confidence={llm_confidence:.2f} Delta={delta}. "
                     f"{parsed['reasoning']}"
                 ),
+                "llm_reasoning_full": str(parsed["reasoning"]),
                 "matched_skills": matched_skills[:12],
                 "missing_requirements": missing_requirements[:12],
                 "baseline_score": baseline["score"],
@@ -1101,7 +1165,11 @@ def run_scoring(limit: int = 0, rescore: bool = False) -> dict:
             marker,
         )
         if _SCORE_TRACE_ENABLED or result["outcome"] == "llm_failed":
-            log.info("          %s", _build_score_trace(result))
+            _emit_score_trace(result)
+            full_reasoning = str(result.get("llm_reasoning_full") or result.get("reasoning") or "").strip()
+            if full_reasoning:
+                # Persist a full untruncated rationale in pipeline logs for auditability.
+                log.info("          rationale_full=%s", full_reasoning)
 
     now = datetime.now(timezone.utc).isoformat()
     for result in results:
