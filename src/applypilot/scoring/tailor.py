@@ -11,7 +11,6 @@ to avoid apologetic spirals.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
@@ -30,6 +29,7 @@ from applypilot.resume_json import (
     get_profile_skill_sections,
     get_profile_verified_metrics,
 )
+from applypilot.scoring.artifact_naming import build_artifact_prefix
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     FABRICATION_WATCHLIST,
@@ -319,22 +319,10 @@ def _strip_disallowed_watchlist_skills(data: dict, profile: dict) -> list[str]:
     return removed
 
 
-def _slugify_for_filename(value: str, max_len: int, fallback: str) -> str:
-    """Return a filesystem-safe slug for artifact filenames."""
-
-    safe = re.sub(r"[^\w\s-]", "", value).strip().replace(" ", "_")
-    safe = re.sub(r"_+", "_", safe)[:max_len].strip("_")
-    return safe or fallback
-
-
 def _build_tailored_prefix(job: dict) -> str:
     """Build a deterministic, collision-resistant filename prefix for a job."""
 
-    safe_title = _slugify_for_filename(str(job.get("title", "")), max_len=50, fallback="untitled")
-    safe_site = _slugify_for_filename(str(job.get("site", "")), max_len=20, fallback="unknown_site")
-    url = str(job.get("url", ""))
-    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10] if url else "no_url"
-    return f"{safe_site}_{safe_title}_{digest}"
+    return build_artifact_prefix(job)
 
 
 # ── Resume Assembly (profile-driven header) ──────────────────────────────

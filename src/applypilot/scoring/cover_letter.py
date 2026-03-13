@@ -6,7 +6,6 @@ profile at runtime. No hardcoded personal information.
 """
 
 import logging
-import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +18,7 @@ from applypilot.resume_json import (
     get_profile_skill_keywords,
     get_profile_verified_metrics,
 )
+from applypilot.scoring.artifact_naming import build_artifact_prefix
 from applypilot.scoring.validator import (
     BANNED_WORDS,
     LLM_LEAK_PHRASES,
@@ -190,12 +190,12 @@ def generate_cover_letter(
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 
-def run_cover_letters(min_score: int = 7, limit: int = 20, validation_mode: str = "normal") -> dict:
+def run_cover_letters(min_score: int = 7, limit: int = 0, validation_mode: str = "normal") -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes.
 
     Args:
         min_score:       Minimum fit_score threshold.
-        limit:           Maximum jobs to process.
+        limit:           Maximum jobs to process (0 = all eligible jobs).
         validation_mode: "strict", "normal", or "lenient".
 
     Returns:
@@ -210,15 +210,19 @@ def run_cover_letters(min_score: int = 7, limit: int = 20, validation_mode: str 
     conn = get_connection()
 
     # Fetch jobs that have tailored resumes but no cover letter yet
-    jobs = conn.execute(
+    query = (
         "SELECT * FROM jobs "
         "WHERE fit_score >= ? AND tailored_resume_path IS NOT NULL "
         "AND full_description IS NOT NULL "
         "AND (cover_letter_path IS NULL OR cover_letter_path = '') "
         "AND COALESCE(cover_attempts, 0) < ? "
-        "ORDER BY fit_score DESC LIMIT ?",
-        (min_score, MAX_ATTEMPTS, limit),
-    ).fetchall()
+        "ORDER BY fit_score DESC"
+    )
+    params: list[int] = [min_score, MAX_ATTEMPTS]
+    if limit > 0:
+        query += " LIMIT ?"
+        params.append(limit)
+    jobs = conn.execute(query, tuple(params)).fetchall()
 
     if not jobs:
         log.info("No jobs needing cover letters (score >= %d).", min_score)
@@ -250,10 +254,7 @@ def run_cover_letters(min_score: int = 7, limit: int = 20, validation_mode: str 
                 job_resume = resume_text
             letter = generate_cover_letter(job_resume, job, profile, validation_mode=validation_mode)
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            prefix = build_artifact_prefix(job)
 
             cl_path = COVER_LETTER_DIR / f"{prefix}_CL.txt"
             cl_path.write_text(letter, encoding="utf-8")

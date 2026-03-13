@@ -238,6 +238,7 @@ def run(
         ),
     ),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    limit: int = typer.Option(0, "--limit", "-l", help="Max jobs per tailor/cover batch (0 = all eligible)."),
     workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
     stream: bool = typer.Option(False, "--stream", help="Run stages concurrently (streaming mode)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview stages without executing."),
@@ -286,6 +287,7 @@ def run(
     result = run_pipeline(
         stages=stage_list,
         min_score=min_score,
+        limit=limit,
         dry_run=dry_run,
         stream=stream,
         workers=workers,

@@ -392,14 +392,14 @@ def convert_to_pdf(text_path: Path, output_path: Path | None = None, html_only: 
     return out
 
 
-def batch_convert(limit: int = 50) -> int:
+def batch_convert(limit: int = 0) -> int:
     """Convert .txt files in TAILORED_DIR that don't have corresponding PDFs.
 
     Scans for .txt files (excluding _JOB.txt and _REPORT.json), checks if a
     .pdf with the same stem already exists, and converts any that are missing.
 
     Args:
-        limit: Maximum number of files to convert.
+        limit: Maximum number of files to convert (0 = all eligible files).
 
     Returns:
         Number of PDFs generated.
@@ -419,7 +419,7 @@ def batch_convert(limit: int = 50) -> int:
         pdf_path = f.with_suffix(".pdf")
         if not pdf_path.exists():
             to_convert.append(f)
-        if len(to_convert) >= limit:
+        if limit > 0 and len(to_convert) >= limit:
             break
 
     if not to_convert:
