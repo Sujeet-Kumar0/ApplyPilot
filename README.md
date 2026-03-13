@@ -30,8 +30,10 @@ Three commands. That's it.
 pip install applypilot
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
 applypilot init          # one-time setup: resume, profile, preferences, API keys
+npm install              # one-time in repo root: installs local `resumed` CLI for resume render
 applypilot doctor        # verify your setup — shows what's installed and what's missing
 applypilot resume render --format html   # render the canonical resume.json with a theme
+applypilot resume render --format pdf    # render canonical resume.json to PDF
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
 applypilot apply         # autonomous browser-driven submission
@@ -96,6 +98,8 @@ Each stage is independent. Run them all or pick what you need.
 | Codex CLI, Claude Code CLI, or OpenCode CLI | Auto-apply | Codex is preferred by default; Claude and OpenCode remain supported as additive backends |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenRouter, OpenAI, Anthropic, and local models (Ollama/llama.cpp) are also supported.
+
+> **Resume render prerequisite:** Run `npm install` once in the repository root before using `applypilot resume render --format html|pdf`. This installs the local `resumed` CLI used for themed HTML/PDF output.
 
 ### Optional
 
