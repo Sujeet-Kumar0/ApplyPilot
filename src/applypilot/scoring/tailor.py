@@ -11,11 +11,13 @@ to avoid apologetic spirals.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from applypilot.config import TAILORED_DIR, load_profile, load_resume_text
@@ -317,6 +319,24 @@ def _strip_disallowed_watchlist_skills(data: dict, profile: dict) -> list[str]:
     return removed
 
 
+def _slugify_for_filename(value: str, max_len: int, fallback: str) -> str:
+    """Return a filesystem-safe slug for artifact filenames."""
+
+    safe = re.sub(r"[^\w\s-]", "", value).strip().replace(" ", "_")
+    safe = re.sub(r"_+", "_", safe)[:max_len].strip("_")
+    return safe or fallback
+
+
+def _build_tailored_prefix(job: dict) -> str:
+    """Build a deterministic, collision-resistant filename prefix for a job."""
+
+    safe_title = _slugify_for_filename(str(job.get("title", "")), max_len=50, fallback="untitled")
+    safe_site = _slugify_for_filename(str(job.get("site", "")), max_len=20, fallback="unknown_site")
+    url = str(job.get("url", ""))
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10] if url else "no_url"
+    return f"{safe_site}_{safe_title}_{digest}"
+
+
 # ── Resume Assembly (profile-driven header) ──────────────────────────────
 
 def assemble_resume_text(data: dict, profile: dict) -> str:
@@ -608,14 +628,14 @@ def run_tailoring(min_score: int = 7, limit: int = 0,
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
 
-            # Build safe filename prefix
-            safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
-            safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
-            prefix = f"{safe_site}_{safe_title}"
+            # Build collision-resistant filename prefix
+            prefix = _build_tailored_prefix(job)
 
             # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
             txt_path.write_text(tailored, encoding="utf-8")
+            if not txt_path.exists() or txt_path.stat().st_size == 0:
+                raise RuntimeError(f"Failed to persist tailored TXT: {txt_path}")
 
             # Save job description for traceability
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
@@ -633,15 +653,21 @@ def run_tailoring(min_score: int = 7, limit: int = 0,
             report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-            # Generate PDF for approved resumes (best-effort)
+            # Generate PDF for approved resumes.
             # "approved_with_judge_warning" is also a success — resume was generated.
             pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
+            status = report["status"]
+            if status in ("approved", "approved_with_judge_warning"):
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
-                    pdf_path = str(convert_to_pdf(txt_path))
-                except Exception:
-                    log.debug("PDF generation failed for %s", txt_path, exc_info=True)
+                    generated_pdf = convert_to_pdf(txt_path)
+                    pdf_path = str(generated_pdf)
+                    if not generated_pdf.exists() or generated_pdf.stat().st_size == 0:
+                        raise RuntimeError(f"Generated PDF missing or empty: {generated_pdf}")
+                except Exception as exc:
+                    # A submission-ready tailored resume needs both TXT and PDF.
+                    log.error("PDF generation failed for %s: %s", txt_path, exc)
+                    status = "error"
 
             result = {
                 "url": job["url"],
@@ -649,9 +675,13 @@ def run_tailoring(min_score: int = 7, limit: int = 0,
                 "pdf_path": pdf_path,
                 "title": job["title"],
                 "site": job["site"],
-                "status": report["status"],
+                "status": status,
                 "attempts": report["attempts"],
             }
+            if status in ("approved", "approved_with_judge_warning"):
+                log.info("Saved tailored artifacts: txt=%s | pdf=%s", txt_path.resolve(), Path(pdf_path).resolve())
+            else:
+                log.info("Saved tailored TXT: %s", txt_path.resolve())
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
