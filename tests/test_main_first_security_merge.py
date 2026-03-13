@@ -188,14 +188,50 @@ def test_generate_dashboard_escapes_attribute_bound_values(monkeypatch, tmp_path
 
     monkeypatch.setattr("applypilot.view.get_connection", lambda: _FakeConnection([job]))
     monkeypatch.setattr("applypilot.view.APP_DIR", tmp_path)
+    monkeypatch.setattr("applypilot.view._resolve_applypilot_binary", lambda: "/tmp/venv/bin/applypilot")
+    monkeypatch.setattr("applypilot.view.is_manual_ats", lambda url: False)
 
     output_path = Path(generate_dashboard(str(tmp_path / "dashboard.html")))
     html = output_path.read_text(encoding="utf-8")
 
     assert 'data-location="remote&quot; onclick=&quot;alert(1)"' in html
     assert 'data-location="remote" onclick=' not in html
-    assert 'data-cmd="applypilot apply --url https://example.com/job?q=&quot;quoted&quot;"' in html
-    assert 'data-cmd="applypilot apply --url https://example.com/job?q="quoted""' not in html
+    assert 'data-cmd="/tmp/venv/bin/applypilot apply --url &#x27;https://example.com/job?q=&quot;quoted&quot;&#x27;"' in html
+    assert 'data-cmd="/tmp/venv/bin/applypilot apply --url https://example.com/job?q="quoted""' not in html
+
+
+def test_generate_dashboard_manual_ats_shows_test_auto_apply_button(monkeypatch, tmp_path: Path) -> None:
+    manual_job = {
+        "url": "https://thomsonreuters.wd5.myworkdayjobs.com/External_Career_Site/job/USA/Role_123",
+        "title": "Engineer",
+        "salary": "$100k",
+        "description": "desc",
+        "location": "Remote",
+        "site": "Thomson Reuters",
+        "strategy": None,
+        "full_description": "full description",
+        "application_url": "https://thomsonreuters.wd5.myworkdayjobs.com/External_Career_Site/job/USA/Role_123",
+        "detail_error": None,
+        "fit_score": 8,
+        "score_reasoning": "python\nstrong fit",
+        "applied_at": None,
+        "apply_status": None,
+        "apply_error": None,
+        "last_attempted_at": None,
+    }
+
+    monkeypatch.setattr("applypilot.view.get_connection", lambda: _FakeConnection([manual_job]))
+    monkeypatch.setattr("applypilot.view.APP_DIR", tmp_path)
+    monkeypatch.setattr("applypilot.view._resolve_applypilot_binary", lambda: "/tmp/venv/bin/applypilot")
+    monkeypatch.setattr("applypilot.view.is_manual_ats", lambda url: True)
+
+    output_path = Path(generate_dashboard(str(tmp_path / "dashboard.html")))
+    html = output_path.read_text(encoding="utf-8")
+
+    assert "Auto-Apply (Test)" in html
+    assert "Manual ATS: may fail (testing)" not in html
+    assert "auto-apply-btn--manual" in html
+    assert 'onclick="copyApplyCmd(this)"' in html
 
 
 def test_run_scoring_returns_safe_summary_when_resume_is_missing(monkeypatch, tmp_path: Path) -> None:

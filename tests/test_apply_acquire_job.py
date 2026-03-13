@@ -69,7 +69,7 @@ def test_acquire_job_skips_manual_ats_and_returns_next_actionable(monkeypatch, t
     assert acquired["agent_id"] == "worker-2"
 
 
-def test_acquire_job_target_url_manual_marks_manual_and_returns_none(monkeypatch, tmp_path):
+def test_acquire_job_target_url_manual_allows_attempt(monkeypatch, tmp_path):
     from applypilot import database
     from applypilot.apply import launcher
 
@@ -91,10 +91,33 @@ def test_acquire_job_target_url_manual_marks_manual_and_returns_none(monkeypatch
 
     job = launcher.acquire_job(target_url=manual_url, min_score=7, worker_id=0)
 
-    assert job is None
+    assert job is not None
+    assert job["url"] == manual_url
     manual = conn.execute(
-        "SELECT apply_status, apply_error FROM jobs WHERE url = ?",
+        "SELECT apply_status, apply_error, agent_id FROM jobs WHERE url = ?",
         (manual_url,),
     ).fetchone()
-    assert manual["apply_status"] == "manual"
-    assert manual["apply_error"] == "manual ATS"
+    assert manual["apply_status"] == "in_progress"
+    assert manual["apply_error"] is None
+    assert manual["agent_id"] == "worker-0"
+
+
+def test_target_unavailable_reason_reports_missing_resume_before_other_checks(monkeypatch, tmp_path):
+    from applypilot import database
+    from applypilot.apply import launcher
+
+    conn = database.init_db(tmp_path / "applypilot.db")
+    url = "https://example.com/job/123"
+    conn.execute(
+        """
+        INSERT INTO jobs (url, title, site, application_url, tailored_resume_path, fit_score, apply_status, apply_attempts)
+        VALUES (?, ?, ?, ?, NULL, ?, NULL, 0)
+        """,
+        (url, "Test Job", "Example", url, 9),
+    )
+    conn.commit()
+
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    reason = launcher._target_unavailable_reason(url, min_score=7)
+    assert reason == "missing tailored resume for this job"

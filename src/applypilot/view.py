@@ -10,6 +10,9 @@ Generates a self-contained HTML dashboard with:
 
 from __future__ import annotations
 
+import shlex
+import shutil
+import sys
 import webbrowser
 from datetime import datetime
 from html import escape
@@ -17,10 +20,26 @@ from pathlib import Path
 
 from rich.console import Console
 
-from applypilot.config import APP_DIR
+from applypilot.config import APP_DIR, is_manual_ats
 from applypilot.database import get_connection
 
 console = Console()
+
+
+def _resolve_applypilot_binary() -> str:
+    """Resolve the applypilot executable path for copy/paste dashboard actions."""
+    venv_candidate = Path(sys.executable).with_name("applypilot")
+    if venv_candidate.exists():
+        return str(venv_candidate.resolve())
+    system_candidate = shutil.which("applypilot")
+    if system_candidate:
+        return str(Path(system_candidate).resolve())
+    return "applypilot"
+
+
+def _build_auto_apply_command(url: str, applypilot_binary: str) -> str:
+    """Build a shell-safe auto-apply command."""
+    return f"{shlex.quote(applypilot_binary)} apply --url {shlex.quote(url)}"
 
 
 def generate_dashboard(output_path: str | None = None) -> str:
@@ -151,6 +170,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
     # Job cards grouped by score
     job_sections = ""
     current_score = None
+    applypilot_binary = _resolve_applypilot_binary()
     for j in jobs:
         score = j["fit_score"] or 0
         if score != current_score:
@@ -204,8 +224,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
 
         # Auto-apply command button (only for jobs not yet applied)
         raw_url = j["url"] or ""
-        auto_apply_cmd = f"applypilot apply --url {raw_url}"
+        auto_apply_cmd = _build_auto_apply_command(raw_url, applypilot_binary)
         data_location = escape((j["location"] or "").lower())
+        manual_ats = is_manual_ats(j["application_url"] or j["url"])
 
         # Applied indicator
         was_applied = j["apply_status"] == "applied" and j["applied_at"]
@@ -262,6 +283,23 @@ def generate_dashboard(output_path: str | None = None) -> str:
         elif was_failed:
             card_extra_class = "  job-card--failed"
 
+        action_html = ""
+        if not was_applied:
+            if manual_ats:
+                action_html = (
+                    '<div class="manual-ats-action">'
+                    f'<button class="auto-apply-btn auto-apply-btn--manual" onclick="copyApplyCmd(this)" '
+                    f'data-cmd="{escape(auto_apply_cmd)}" title="{escape(auto_apply_cmd)}">'
+                    "&#9888; Auto-Apply (Test)</button>"
+                    "</div>"
+                )
+            else:
+                action_html = (
+                    f'<button class="auto-apply-btn" onclick="copyApplyCmd(this)" '
+                    f'data-cmd="{escape(auto_apply_cmd)}" title="{escape(auto_apply_cmd)}">'
+                    "&#9654; Auto-Apply</button>"
+                )
+
         job_sections += f"""
         <div class="job-card{card_extra_class}" data-score="{score}" data-site="{escape(j['site'] or '')}" data-location="{data_location}"{applied_attr}>
           {applied_banner}{failed_banner}
@@ -276,7 +314,7 @@ def generate_dashboard(output_path: str | None = None) -> str:
           {"<details class='full-desc-details'><summary class='expand-btn'>Full Description (" + f'{desc_len:,}' + " chars)</summary><div class='full-desc'>" + full_desc_html + "</div></details>" if j["full_description"] else ""}
           <div class="card-footer">
             {apply_html}
-            {"" if was_applied else f'<button class="auto-apply-btn" onclick="copyApplyCmd(this)" data-cmd="{escape(auto_apply_cmd)}" title="{escape(auto_apply_cmd)}">&#9654; Auto-Apply</button>'}
+            {action_html}
           </div>
         </div>"""
 
@@ -509,6 +547,9 @@ def generate_dashboard(output_path: str | None = None) -> str:
     border-radius: 6px; cursor: pointer; font-size: 0.78rem; font-weight: 600; transition: all 0.15s; white-space: nowrap; }}
   .auto-apply-btn:hover {{ background: #6366f122; color: #a5b4fc; border-color: #a5b4fc; }}
   .auto-apply-btn.copied {{ background: #064e3b; border-color: #10b981; color: #6ee7b7; }}
+  .auto-apply-btn--manual {{ border-color: #ef4444; color: #fca5a5; background: #3f1111; }}
+  .auto-apply-btn--manual:hover {{ border-color: #f87171; color: #fecaca; background: #571515; }}
+  .manual-ats-action {{ display: flex; justify-content: flex-end; }}
 
   /* Applied indicator */
   .job-card--applied {{ border-left-color: #10b981 !important; background: #0d2b1e; }}

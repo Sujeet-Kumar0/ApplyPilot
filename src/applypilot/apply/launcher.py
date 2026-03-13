@@ -375,16 +375,13 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             # Skip manual ATS sites (unsolvable CAPTCHAs)
             from applypilot.config import is_manual_ats
             apply_url = row["application_url"] or row["url"]
-            if is_manual_ats(apply_url):
+            if is_manual_ats(apply_url) and not target_url:
                 conn.execute(
                     "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
                     (row["url"],),
                 )
                 conn.commit()
                 logger.info("Skipping manual ATS: %s", row["url"][:80])
-                # For targeted apply, this is the only candidate.
-                if target_url:
-                    return None
                 # In queue mode, continue scanning for the next actionable job.
                 continue
 
@@ -401,6 +398,40 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     except Exception:
         conn.rollback()
         raise
+
+
+def _target_unavailable_reason(target_url: str, min_score: int) -> str:
+    """Return a user-facing reason when a targeted URL cannot be acquired."""
+    conn = get_connection()
+    like = f"%{target_url.split('?')[0].rstrip('/')}%"
+    row = conn.execute(
+        """
+        SELECT url, application_url, tailored_resume_path, fit_score, apply_status, apply_error
+        FROM jobs
+        WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+        LIMIT 1
+        """,
+        (target_url, target_url, like, like),
+    ).fetchone()
+
+    if not row:
+        return "target URL not found in database"
+
+    if not row["tailored_resume_path"]:
+        return "missing tailored resume for this job"
+    score = row["fit_score"]
+    if score is not None and score < min_score:
+        return f"fit score {score} is below min-score {min_score}"
+    status = (row["apply_status"] or "").lower().strip()
+    if status == "applied":
+        return "already marked applied"
+    if status == "in_progress":
+        return "already in progress on another worker"
+    if status == "manual":
+        return "marked manual ATS"
+    if status and status != "failed":
+        return f"status is '{status}'"
+    return "job is not currently eligible for auto-apply"
 
 
 def mark_result(url: str, status: str, error: str | None = None,
@@ -722,8 +753,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                           worker_id=worker_id)
         if not job:
             if not continuous:
-                add_event(f"[W{worker_id}] Queue empty")
-                update_state(worker_id, status="done", last_action="queue empty")
+                if target_url:
+                    reason = _target_unavailable_reason(target_url, min_score)
+                    add_event(f"[W{worker_id}] Target unavailable: {reason}")
+                    update_state(worker_id, status="done", last_action=reason[:35])
+                else:
+                    add_event(f"[W{worker_id}] Queue empty")
+                    update_state(worker_id, status="done", last_action="queue empty")
                 break
             empty_polls += 1
             update_state(worker_id, status="idle",
