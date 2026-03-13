@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import pytest
@@ -142,6 +143,60 @@ def test_scrape_with_retry_uses_normalized_kwargs(monkeypatch) -> None:
         "location": "Remote",
         "proxy": "proxy.example:443",
     }
+
+
+def test_ziprecruiter_search_url_applies_radius_only_for_non_remote() -> None:
+    local_url = jobspy._ziprecruiter_search_url(
+        "Backend Engineer",
+        "Austin, TX",
+        False,
+        page_number=1,
+        distance=25,
+    )
+    local_params = parse_qs(urlparse(local_url).query)
+    assert local_params["radius"] == ["25"]
+    assert "refine_by_location_type" not in local_params
+
+    remote_url = jobspy._ziprecruiter_search_url(
+        "Backend Engineer",
+        "Austin, TX",
+        True,
+        page_number=1,
+        distance=25,
+    )
+    remote_params = parse_qs(urlparse(remote_url).query)
+    assert remote_params["refine_by_location_type"] == ["only_remote"]
+    assert "radius" not in remote_params
+
+
+def test_run_one_search_passes_distance_from_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    captured: dict[str, int | None] = {}
+
+    def _fake_scrape_sites_independently(**kwargs):
+        captured["distance"] = kwargs["distance"]
+        return [pd.DataFrame([{"job_url": "https://example.com/li", "location": "Remote", "site": "linkedin"}])], [], {}
+
+    monkeypatch.setattr(jobspy, "_JOBSPY_SITE_QUARANTINE_PATH", tmp_path / "jobspy_site_quarantine.json")
+    monkeypatch.setattr(jobspy, "_scrape_sites_independently", _fake_scrape_sites_independently)
+    monkeypatch.setattr(jobspy, "get_connection", lambda: object())
+    monkeypatch.setattr(jobspy, "store_jobspy_results", lambda conn, df, source_label: (len(df), 0))
+
+    result = jobspy._run_one_search(
+        search={"query": "Backend Engineer", "location": "Austin, TX", "remote": False, "tier": 1},
+        sites=["linkedin"],
+        results_per_site=50,
+        hours_old=72,
+        proxy_config=None,
+        defaults={"distance": 25},
+        max_retries=0,
+        accept_locs=[],
+        reject_locs=[],
+        glassdoor_map={},
+    )
+
+    assert captured["distance"] == 25
+    assert result["errors"] == 0
+    assert result["total"] == 1
 
 
 def test_apply_local_hours_filter_uses_date_posted_when_available() -> None:

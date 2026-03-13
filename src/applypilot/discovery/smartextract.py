@@ -1052,6 +1052,8 @@ def build_scrape_targets(
       {query_encoded} -> URL-encoded search query
       {location_encoded} -> URL-encoded location
       {query} -> raw search query (for simple substitution)
+      {distance} -> search radius in miles from searches.yaml defaults.distance
+      {distance_encoded} -> URL-encoded search radius in miles
     """
     if sites is None:
         sites = load_sites()
@@ -1062,6 +1064,12 @@ def build_scrape_targets(
     queries = [q["query"] for q in queries_cfg]
     locs = search_cfg.get("locations", [])
     default_location = locs[0]["location"] if locs else ""
+    distance_cfg = search_cfg.get("defaults", {}).get("distance", 0)
+    try:
+        default_distance = max(0, int(distance_cfg))
+    except (TypeError, ValueError):
+        default_distance = 0
+    default_distance_str = str(default_distance)
 
     targets: list[dict] = []
 
@@ -1077,6 +1085,8 @@ def build_scrape_targets(
                 expanded_url = expanded_url.replace("{query_encoded}", quote_plus(query))
                 expanded_url = expanded_url.replace("{query}", quote_plus(query))
                 expanded_url = expanded_url.replace("{location_encoded}", quote_plus(default_location))
+                expanded_url = expanded_url.replace("{distance}", default_distance_str)
+                expanded_url = expanded_url.replace("{distance_encoded}", quote_plus(default_distance_str))
                 targets.append(
                     {
                         "name": site_name,
@@ -1088,6 +1098,8 @@ def build_scrape_targets(
         else:
             expanded_url = site_url
             expanded_url = expanded_url.replace("{location_encoded}", quote_plus(default_location))
+            expanded_url = expanded_url.replace("{distance}", default_distance_str)
+            expanded_url = expanded_url.replace("{distance_encoded}", quote_plus(default_distance_str))
             targets.append(
                 {
                     "name": site_name,

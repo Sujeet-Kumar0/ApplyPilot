@@ -365,6 +365,27 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
     return False
 
 
+def _coerce_distance(value: object) -> int | None:
+    """Parse a search distance (miles) value from config or CLI."""
+    if value is None:
+        return None
+    try:
+        miles = int(value)
+    except (TypeError, ValueError):
+        return None
+    return miles if miles > 0 else None
+
+
+def _resolve_search_distance(search: dict, defaults: dict | None = None) -> int | None:
+    """Resolve effective search distance (miles) for one query/location combo."""
+    if search.get("remote"):
+        return None
+    if "distance" in search:
+        return _coerce_distance(search.get("distance"))
+    defaults = defaults or {}
+    return _coerce_distance(defaults.get("distance"))
+
+
 def _resolve_jobspy_sites(sites: list[str], remote_only: bool) -> tuple[list[str], bool]:
     """Return non-Glassdoor sites after ApplyPilot's remote-only adjustments."""
     has_glassdoor = "glassdoor" in sites
@@ -441,7 +462,13 @@ def _quarantine_reason_for_exception(site: str, exc: Exception) -> str | None:
     return None
 
 
-def _ziprecruiter_search_url(search_term: str, location: str, remote_only: bool, page_number: int) -> str:
+def _ziprecruiter_search_url(
+    search_term: str,
+    location: str,
+    remote_only: bool,
+    page_number: int,
+    distance: int | None = None,
+) -> str:
     params = {
         "search": search_term,
         "location": location,
@@ -449,6 +476,8 @@ def _ziprecruiter_search_url(search_term: str, location: str, remote_only: bool,
     }
     if remote_only:
         params["refine_by_location_type"] = "only_remote"
+    elif distance is not None:
+        params["radius"] = distance
     base = "https://www.ziprecruiter.com/jobs-search"
     if page_number > 1:
         base += f"/{page_number}"
@@ -612,7 +641,8 @@ def _scrape_ziprecruiter_browser(
     location: str,
     results_wanted: int,
     remote_only: bool,
-    proxy_config: dict | None,
+    distance: int | None = None,
+    proxy_config: dict | None = None,
 ):
     """Scrape ZipRecruiter with a real browser to clear Cloudflare and parse rendered results."""
     from playwright.sync_api import sync_playwright
@@ -644,7 +674,13 @@ def _scrape_ziprecruiter_browser(
 
             for page_number in range(1, page_count + 1):
                 page.goto(
-                    _ziprecruiter_search_url(search_term, location, remote_only, page_number),
+                    _ziprecruiter_search_url(
+                        search_term,
+                        location,
+                        remote_only,
+                        page_number,
+                        distance,
+                    ),
                     timeout=60000,
                     wait_until="domcontentloaded",
                 )
@@ -716,6 +752,7 @@ def _build_site_scrape_kwargs(
     hours_old: int,
     proxy_config: dict | None,
     remote_only: bool,
+    distance: int | None,
     country_indeed: str,
     verbose: int,
 ) -> dict:
@@ -728,6 +765,8 @@ def _build_site_scrape_kwargs(
         "description_format": "markdown",
         "verbose": verbose,
     }
+    if distance is not None:
+        kwargs["distance"] = distance
     if site == "indeed":
         kwargs["country_indeed"] = country_indeed
     if remote_only:
@@ -749,6 +788,7 @@ def _scrape_sites_independently(
     hours_old: int,
     proxy_config: dict | None,
     remote_only: bool,
+    distance: int | None,
     country_indeed: str,
     max_retries: int,
     verbose: int = 0,
@@ -775,6 +815,7 @@ def _scrape_sites_independently(
                     location=location,
                     results_wanted=results_per_site,
                     remote_only=remote_only,
+                    distance=distance,
                     proxy_config=proxy_config,
                 )
             else:
@@ -786,6 +827,7 @@ def _scrape_sites_independently(
                     hours_old=hours_old,
                     proxy_config=proxy_config,
                     remote_only=remote_only,
+                    distance=distance,
                     country_indeed=country_indeed,
                     verbose=verbose,
                 )
@@ -811,6 +853,7 @@ def _scrape_sites_independently(
                     "location": location,
                     "results_wanted": results_per_site,
                     "is_remote": remote_only,
+                    "distance": distance,
                     "strategy": "browser",
                 }
             else:
@@ -960,6 +1003,9 @@ def _run_one_search(
     label = f'"{s["query"]}" in {s["location"]} {"(remote)" if s.get("remote") else ""}'
     if "tier" in s:
         label += f" [tier {s['tier']}]"
+    distance = _resolve_search_distance(s, defaults)
+    if distance is not None:
+        label += f" [{distance}mi]"
 
     # Split sites: Glassdoor needs simplified location, others use original
     gd_location = glassdoor_map.get(s["location"], s["location"].split(",")[0])
@@ -973,6 +1019,7 @@ def _run_one_search(
             "query": s["query"],
             "location": s["location"],
             "remote": bool(s.get("remote")),
+            "distance": distance,
             "configured_sites": sites,
             "resolved_non_glassdoor_sites": other_sites,
             "glassdoor_enabled": has_glassdoor,
@@ -993,6 +1040,7 @@ def _run_one_search(
             hours_old=hours_old,
             proxy_config=proxy_config,
             remote_only=bool(s.get("remote")),
+            distance=distance,
             country_indeed=defaults.get("country_indeed", "usa"),
             max_retries=max_retries,
             verbose=0,
@@ -1019,6 +1067,8 @@ def _run_one_search(
             "description_format": "markdown",
             "verbose": 0,
         }
+        if distance is not None:
+            gd_kwargs["distance"] = distance
         if s.get("remote"):
             gd_kwargs["is_remote"] = True
         if proxy_config:
@@ -1115,17 +1165,29 @@ def search_jobs(
     hours_old: int = 72,
     proxy: str | None = None,
     country_indeed: str = "usa",
+    distance: int | None = None,
 ) -> dict:
     """Run a single job search via JobSpy and store results in DB."""
     if sites is None:
         sites = ["indeed", "linkedin", "zip_recruiter"]
 
     proxy_config = parse_proxy(proxy) if proxy else None
+    effective_distance = _resolve_search_distance(
+        {"remote": remote_only, "distance": distance},
+        defaults=None,
+    )
     effective_sites, has_glassdoor = _resolve_jobspy_sites(sites, remote_only)
     active_quarantines = _load_site_quarantines()
     preexisting_quarantines = dict(active_quarantines)
 
-    log.info('Search: "%s" in %s | sites=%s | remote=%s', query, location, sites, remote_only)
+    log.info(
+        'Search: "%s" in %s | sites=%s | remote=%s | distance=%s',
+        query,
+        location,
+        sites,
+        remote_only,
+        effective_distance if effective_distance is not None else "default",
+    )
     _emit_debug_log(
         hypothesis_id="H5",
         location="jobspy.py:search_jobs",
@@ -1135,6 +1197,7 @@ def search_jobs(
             "location": location,
             "sites": sites,
             "remote_only": remote_only,
+            "distance": effective_distance,
         },
     )
     _emit_debug_log(
@@ -1145,6 +1208,7 @@ def search_jobs(
             "query": query,
             "location": location,
             "remote_only": remote_only,
+            "distance": effective_distance,
             "configured_sites": sites,
             "resolved_non_glassdoor_sites": effective_sites,
             "glassdoor_enabled": has_glassdoor,
@@ -1161,6 +1225,7 @@ def search_jobs(
         hours_old=hours_old,
         proxy_config=proxy_config,
         remote_only=remote_only,
+        distance=effective_distance,
         country_indeed=country_indeed,
         max_retries=2,
         verbose=2,
@@ -1179,6 +1244,7 @@ def search_jobs(
             hours_old=hours_old,
             proxy_config=proxy_config,
             remote_only=remote_only,
+            distance=effective_distance,
             country_indeed=country_indeed,
             verbose=2,
         )
@@ -1274,6 +1340,7 @@ def _full_crawl(
                     "query": q["query"],
                     "location": loc["location"],
                     "remote": loc.get("remote", False),
+                    "distance": loc.get("distance", defaults.get("distance")),
                     "tier": q.get("tier", 0),
                 }
             )

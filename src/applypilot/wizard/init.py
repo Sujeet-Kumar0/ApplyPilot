@@ -653,7 +653,10 @@ def _setup_searches() -> None:
     console.print(Panel("[bold]Step 3: Job Search Config[/bold]\nDefine what you're looking for."))
 
     location = Prompt.ask("Target location (e.g. 'Remote', 'Canada', 'New York, NY')", default="Remote")
-    distance_str = Prompt.ask("Search radius in miles (0 for remote-only)", default="0")
+    distance_str = Prompt.ask(
+        "Search radius in miles for supported sources (JobSpy + URL templates), 0 for remote-only",
+        default="0",
+    )
     try:
         distance = int(distance_str)
     except ValueError:
