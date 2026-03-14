@@ -33,6 +33,11 @@ from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
 
+
+def _exception_summary(exc: Exception) -> str:
+    """Return a minimal exception summary safe for logs."""
+    return exc.__class__.__name__
+
 # Fix Windows encoding -- prevents charmap errors on emoji/unicode in job titles
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     try:
@@ -908,7 +913,7 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
     try:
         intel = collect_page_intelligence(url)
     except Exception as e:
-        log.error("Page intelligence collection failed (timeout or error): %s", e)
+        log.error("Page intelligence collection failed (%s)", _exception_summary(e))
         return {"name": name, "status": "ERROR", "error": str(e), "jobs": [], "total": 0, "titles": 0}
     collect_time = time.time() - t0
     log.info(
@@ -938,7 +943,7 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
         try:
             intel = collect_page_intelligence(url, headless=False)
         except Exception as e:
-            log.warning("Headful retry failed: %s", e)
+            log.warning("Headful retry failed (%s)", _exception_summary(e))
         collect_time = time.time() - t0
         log.info(
             "Headful done in %.1fs | JSON-LD: %d | API: %d",
@@ -963,7 +968,7 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
     try:
         raw, elapsed, meta = ask_llm(prompt)
     except Exception as e:
-        log.error("LLM_ERROR: %s", e)
+        log.error("LLM_ERROR (%s)", _exception_summary(e))
         return {"name": name, "status": "LLM_ERROR", "error": str(e)}
 
     log.info("LLM: %d chars, %.1fs", meta["response_chars"], elapsed)
@@ -971,7 +976,7 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
     try:
         plan = extract_json(raw)
     except Exception as e:
-        log.error("PARSE_ERROR: %s | raw: %s", e, raw[:500])
+        log.error("PARSE_ERROR (%s)", _exception_summary(e))
         return {"name": name, "status": "PARSE_ERROR", "error": str(e), "raw": raw}
 
     strategy = plan.get("strategy", "?")
@@ -995,7 +1000,7 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
             log.warning("Unknown strategy: %s", strategy)
             jobs = []
     except Exception as e:
-        log.error("EXECUTION_ERROR: %s", e)
+        log.error("EXECUTION_ERROR (%s)", _exception_summary(e))
         return {"name": name, "status": "EXEC_ERROR", "error": str(e), "plan": plan}
 
     # Step 4: Report
@@ -1015,14 +1020,6 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
         salaries,
         descs,
     )
-
-    for j in jobs[:3]:
-        log.info(
-            "  - %s | loc: %s | salary: %s",
-            str(j.get("title") or "?")[:55],
-            str(j.get("location") or "?")[:25],
-            str(j.get("salary") or "-")[:20],
-        )
 
     return {
         "name": name,

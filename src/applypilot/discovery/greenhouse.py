@@ -24,6 +24,13 @@ log = logging.getLogger(__name__)
 GREENHOUSE_API_BASE = "https://boards-api.greenhouse.io/v1/boards"
 
 
+def _exception_summary(exc: Exception) -> str:
+    """Return a minimal exception summary safe for logs."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{exc.__class__.__name__}(status={exc.response.status_code})"
+    return exc.__class__.__name__
+
+
 def _validate_employer_registry(data: dict, source: str) -> dict:
     """Validate the parsed Greenhouse registry shape."""
     if not isinstance(data, dict):
@@ -154,10 +161,10 @@ def fetch_jobs_api(board_token: str, content: bool = True) -> dict | None:
             resp = client.get(url, headers=headers, params=params)
 
             if resp.status_code == 404:
-                log.debug("Board not found: %s", board_token)
+                log.debug("Greenhouse board not found")
                 return None
             elif resp.status_code == 429:
-                log.warning("Rate limited for %s, retrying...", board_token)
+                log.warning("Greenhouse API rate limited; retrying")
                 time.sleep(2)
                 resp = client.get(url, headers=headers, params=params)
                 resp.raise_for_status()
@@ -167,10 +174,10 @@ def fetch_jobs_api(board_token: str, content: bool = True) -> dict | None:
             return resp.json()
 
     except httpx.HTTPStatusError as e:
-        log.warning("HTTP error for %s: %s", board_token, e)
+        log.warning("Greenhouse API HTTP error (%s)", _exception_summary(e))
         return None
     except Exception as e:
-        log.warning("Failed to fetch %s: %s", board_token, e)
+        log.warning("Greenhouse fetch failed (%s)", _exception_summary(e))
         return None
 
 
@@ -232,8 +239,8 @@ def parse_api_response(data: dict, company_name: str, query: str = "") -> list[d
 
             jobs.append(job)
 
-        except Exception as e:
-            log.debug("Error parsing job: %s", e)
+        except Exception:
+            log.debug("Skipping malformed Greenhouse job payload")
             continue
 
     return jobs
@@ -248,7 +255,7 @@ def search_employer(
     reject_locs: list[str] | None = None,
 ) -> list[dict]:
     """Search a single Greenhouse employer via API."""
-    log.info('%s: searching "%s"...', employer["name"], search_text)
+    log.info("%s: starting Greenhouse search", employer["name"])
 
     # Fetch from API
     api_data = fetch_jobs_api(employer_key, content=True)
@@ -265,7 +272,7 @@ def search_employer(
                 filtered.append(job)
         jobs = filtered
 
-    log.info("%s: found %d jobs", employer["name"], len(jobs))
+    log.info("%s: Greenhouse search complete", employer["name"])
     return jobs
 
 
@@ -286,7 +293,7 @@ def search_all(
 
     accept_locs, reject_locs = _load_location_filter()
 
-    log.info('Greenhouse API search: %d employers, "%s", workers=%d', len(employers), search_text, workers)
+    log.info("Greenhouse API search starting")
 
     all_jobs = []
     errors = 0
@@ -311,15 +318,10 @@ def search_all(
                 jobs = future.result()
                 all_jobs.extend(jobs)
             except Exception as e:
-                log.error("Error searching %s: %s", key, e)
+                log.error("Greenhouse employer search failed for %s (%s)", key, _exception_summary(e))
                 errors += 1
 
-    log.info(
-        "Greenhouse API search complete: %d total jobs from %d employers (%d errors)",
-        len(all_jobs),
-        len(employers),
-        errors,
-    )
+    log.info("Greenhouse API search complete")
 
     # Store in database
     return _store_jobs(all_jobs)
@@ -380,7 +382,7 @@ def run_all_searches(
 
     for search in searches:
         query = search.get("query", "")
-        log.info('Greenhouse API search: "%s"', query)
+        log.info("Running Greenhouse API query")
 
         new, existing = search_all(query, workers=workers)
         total_new += new

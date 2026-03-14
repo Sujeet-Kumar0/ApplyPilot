@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from applypilot.config import DB_PATH
+from applypilot.url_safety import host_matches, host_matches_any, path_segments, subdomain_prefix
 
 _log = logging.getLogger(__name__)
 
@@ -725,79 +726,73 @@ def extract_company(application_url: str | None) -> str | None:
     if not application_url:
         return None
     try:
-        from urllib.parse import urlparse
+        from urllib.parse import parse_qs, unquote, urlparse
+
         parsed = urlparse(application_url)
         host = parsed.hostname or ""
         path = parsed.path or ""
+        segments = path_segments(path)
 
         # Workday: workiva.wd503.myworkdayjobs.com → workiva
-        if "myworkdayjobs.com" in host:
-            return host.split(".")[0].lower()
+        workday_match = _re.match(r"^(?P<company>[^.]+)(?:\.wd[^.]*)?\.myworkdayjobs\.com$", host, _re.IGNORECASE)
+        if workday_match:
+            return workday_match.group("company").lower()
 
         # Greenhouse job boards: job-boards.greenhouse.io/hudl/... → hudl
         # Greenhouse embed:     job-boards.greenhouse.io/embed/job_app?for=coinbase → coinbase
-        if "greenhouse.io" in host:
-            from urllib.parse import parse_qs, urlparse as _urlparse
-            qs = parse_qs(_urlparse(application_url).query)
+        if host in {"job-boards.greenhouse.io", "boards.greenhouse.io"}:
+            qs = parse_qs(parsed.query)
             if "for" in qs:
                 return qs["for"][0].lower()
             if "/job_boards/" not in path:
-                parts = [p for p in path.split("/") if p and p not in ("embed", "job_app")]
+                parts = [p for p in segments if p not in ("embed", "job_app")]
                 if parts:
                     return parts[0].lower()
 
         # Lever: jobs.lever.co/LuminDigital/... → lumindigital
-        if "lever.co" in host:
-            parts = [p for p in path.split("/") if p]
-            if parts:
-                return parts[0].lower()
+        if host_matches(host, "lever.co") and segments:
+            return segments[0].lower()
 
         # iCIMS: careers-mercuryinsurance.icims.com → mercuryinsurance
-        if "icims.com" in host:
-            prefix = host.split(".icims.com")[0]
+        if host_matches(host, "icims.com"):
+            prefix = subdomain_prefix(host, "icims.com")
             prefix = prefix.replace("careers-", "").replace("careers.", "")
             return prefix.lower() if prefix else None
 
         # Jobvite: jobs.jobvite.com/en/company/... → company
-        if "jobvite.com" in host:
-            parts = [p for p in path.split("/") if p and p != "en"]
+        if host_matches(host, "jobvite.com"):
+            parts = [p for p in segments if p != "en"]
             if parts:
                 return parts[0].lower()
 
         # Ashby: jobs.ashbyhq.com/{company-slug}/... → company-slug
-        if "ashbyhq.com" in host:
-            from urllib.parse import unquote
-            parts = [p for p in path.split("/") if p]
-            if parts:
-                return unquote(parts[0]).lower()
+        if host_matches(host, "ashbyhq.com"):
+            if segments:
+                return unquote(segments[0]).lower()
 
         # Rippling ATS: ats.rippling.com/{company-slug}/jobs/... → company-slug
-        if "rippling.com" in host and host.startswith("ats."):
-            parts = [p for p in path.split("/") if p]
-            if parts:
-                return parts[0].lower()
+        if host_matches(host, "ats.rippling.com") and segments:
+            return segments[0].lower()
 
         # Workable: apply.workable.com/{company}/j/... → company
         # (short-form apply.workable.com/j/CODE has no company name — skip those)
-        if "workable.com" in host:
-            parts = [p for p in path.split("/") if p]
+        if host_matches(host, "workable.com"):
+            parts = segments
             if parts and parts[0] != "j":
                 return parts[0].lower()
 
         # Recruitee: {company}.recruitee.com/... → company
-        if "recruitee.com" in host:
-            sub = host.split(".recruitee.com")[0]
+        if host_matches(host, "recruitee.com"):
+            sub = subdomain_prefix(host, "recruitee.com")
             if sub and sub not in ("www", "app", "jobs"):
                 return sub.lower()
 
         # SmartRecruiters: careers.smartrecruiters.com/{Company}/... → company
-        if "smartrecruiters.com" in host:
-            parts = [p for p in path.split("/") if p]
-            if parts:
-                return parts[0].lower()
+        if host_matches(host, "smartrecruiters.com") and segments:
+            return segments[0].lower()
 
         # Oracle Cloud ATS: skip (company not in URL)
-        if "oraclecloud.com" in host:
+        if host_matches(host, "oraclecloud.com"):
             return None
 
         # Greenhouse short URLs: grnh.se → skip
@@ -813,7 +808,7 @@ def extract_company(application_url: str | None) -> str | None:
             "dice.com", "simplyhired.com", "monster.com", "careerjet.ca",
             "talent.com", "jobbank.gc.ca", "wellfound.com",
         }
-        if any(host.endswith(d) for d in skip_domains):
+        if host_matches_any(host, skip_domains):
             return None
 
         # Strip common subdomains

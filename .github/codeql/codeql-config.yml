@@ -1,0 +1,10 @@
+name: applypilot-security-scope
+
+paths:
+  - src
+  - scripts
+
+paths-ignore:
+  - tests/**
+  - scripts/test_*
+  - scripts/debug_*

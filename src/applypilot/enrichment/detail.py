@@ -25,6 +25,7 @@ from playwright.sync_api import sync_playwright
 
 from applypilot.database import init_db
 from applypilot.llm import get_client
+from applypilot.url_safety import is_algolia_queries_url
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +167,7 @@ def resolve_wttj_urls(conn: sqlite3.Connection) -> int:
     algolia_data: dict = {}
 
     def capture_algolia(response):
-        if "algolia.net" in response.url and "/queries" in response.url:
+        if is_algolia_queries_url(response.url):
             try:
                 algolia_data["response"] = json.loads(response.text())
             except Exception:
