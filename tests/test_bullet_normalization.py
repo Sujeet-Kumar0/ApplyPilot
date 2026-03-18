@@ -175,16 +175,16 @@ class TestWatchlistSkillStripping:
         profile = {"skills": [{"name": "Languages", "keywords": ["Python", "JavaScript"]}]}
         data = {
             "skills": {
-                "Languages": "Python, Rust, JavaScript, Vue.js",
-                "Frameworks": "React, Django, FastAPI",
+                "Languages": "Python, Rust, JavaScript, Swift",
+                "Frameworks": "React, Rails, FastAPI",
             }
         }
 
         removed = _strip_disallowed_watchlist_skills(data, profile)
 
         assert "Rust" in removed
-        assert "Vue.js" in removed
-        assert "Django" in removed
+        assert "Swift" in removed
+        assert "Rails" in removed
         assert data["skills"]["Languages"] == "Python, JavaScript"
         assert data["skills"]["Frameworks"] == "React, FastAPI"
 

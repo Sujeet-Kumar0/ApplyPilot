@@ -140,7 +140,7 @@ def test_fabricated_skill_is_hard_error(mode: str):
     data = {
         "title": "Senior Software Engineer",
         "summary": "Experienced engineer.",
-        "skills": {"Languages": "Python, Django"},
+        "skills": {"Languages": "Python, Rust"},
         "experience": [{"header": "Senior Software Engineer at Acme Corp", "bullets": ["Did work"]}],
         "projects": [{"header": "Project Alpha", "subtitle": "Python | 2023", "bullets": ["Built X"]}],
         "education": "Acme University | B.S. Computer Science",
@@ -148,4 +148,4 @@ def test_fabricated_skill_is_hard_error(mode: str):
 
     res = validate_json_fields(data, profile, mode=mode)
     assert not res["passed"], f"Expected fabricated skill to fail in {mode} mode"
-    assert any("Fabricated skill: 'django'" in error for error in res["errors"])
+    assert any("Fabricated skill: 'rust'" in error for error in res["errors"])
