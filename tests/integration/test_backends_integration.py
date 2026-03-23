@@ -63,7 +63,7 @@ class TestBackendDetection:
         print(f"\nPreferred backend: {preferred}")
 
         if preferred:
-            assert preferred in ["opencode", "claude"]
+            assert preferred in ["opencode", "claude", "codex"]
 
     def test_backends_detected_if_installed(self):
         """Should detect opencode if installed."""

@@ -30,13 +30,13 @@ Three commands. That's it.
 pip install applypilot
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
 applypilot init          # one-time setup: resume, profile, preferences, API keys
-npm install              # one-time in repo root: installs local `resumed` CLI for resume render
+applypilot init --resume-pdf resume.pdf  # import resume from PDF via LLM
 applypilot doctor        # verify your setup — shows what's installed and what's missing
 applypilot resume render --format html   # render the canonical resume.json with a theme
-applypilot resume render --format pdf    # render canonical resume.json to PDF
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
-applypilot apply         # autonomous browser-driven submission for all ready jobs
+applypilot single URL    # scoped pipeline for one job URL (enrich→score→tailor→cover)
+applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
 ```
@@ -66,7 +66,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 129 Greenhouse ATS employers + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
-| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
+| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates. A statistical deviation guard (binomial proportion test) compares token retention between original and tailored resume — if the AI fabricated content, retention drops below threshold and the result is rejected |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
 | **6. Auto-Apply** | A browser agent CLI (Codex by default, Claude optional) navigates application forms, fills fields, uploads documents, answers questions, and submits |
 
@@ -99,8 +99,6 @@ Each stage is independent. Run them all or pick what you need.
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenRouter, OpenAI, Anthropic, and local models (Ollama/llama.cpp) are also supported.
 
-> **Resume render prerequisite:** Run `npm install` once in the repository root before using `applypilot resume render --format html|pdf`. This installs the local `resumed` CLI used for themed HTML/PDF output.
-
 ### Optional
 
 | Component | What It Does |
@@ -114,6 +112,55 @@ GEMINI_API_KEY=your_key_here pytest -m smoke -q tests/test_gemini_smoke.py
 ```
 
 > **Note:** python-jobspy is installed separately with `--no-deps` because it pins an exact numpy version in its metadata that conflicts with pip's resolver. It works fine with modern numpy at runtime.
+
+---
+
+## PDF Resume Import
+
+Import your existing resume from PDF (or TXT) files. The LLM extracts structured data and produces a canonical `resume.json`. Multiple files are merged automatically — first document wins for basics, arrays are deduplicated by key.
+
+```bash
+applypilot init --resume-pdf resume.pdf                          # single file
+applypilot init --resume-pdf page1.pdf --resume-pdf page2.pdf    # merge multiple
+```
+
+Also available as a standalone command:
+
+```bash
+applypilot resume import file1.pdf file2.pdf --output path
+```
+
+---
+
+## PPP Salary Intelligence
+
+ApplyPilot adjusts salary expectations per target location using Purchasing Power Parity, so you don't get exploited when switching economies.
+
+**How it works:** During `applypilot init`, you enter your current salary and target locations. ApplyPilot fetches live PPP data from the World Bank API and FX rates from open.er-api.com (both cached locally), then calculates what salary in each target country gives you equivalent purchasing power — and applies your desired hike on top of that.
+
+**Example:** ₹20L in India → PPP equivalent ≈$98k USD → with 40% hike → ask for $138k in the US.
+
+Without PPP adjustment, a naive 40% hike on ₹20L = ₹28L = ~$30k USD — unlivable in the US.
+
+**Downward PPP warning:** If you're moving to a cheaper economy (e.g. US → Vietnam), ApplyPilot warns that applying a hike on top of PPP-equivalent gives you outsized purchasing power, which local employers will reject. It suggests a realistic range instead.
+
+Data sources:
+- PPP: [World Bank PA.NUS.PPP indicator](https://data.worldbank.org/indicator/PA.NUS.PPP) (198 countries, refreshed monthly)
+- FX: [open.er-api.com](https://open.er-api.com) (166 currencies, refreshed daily)
+
+---
+
+## Statistical Deviation Guard
+
+The tailoring engine rewrites your resume per job, but it must never fabricate. A binomial proportion test compares token retention between your original and tailored resume:
+
+1. Tokenizes both resumes into lowercase word sets
+2. Measures what fraction of original tokens survived in the tailored version
+3. Uses binomial distribution: SE = √(p₀(1−p₀)/N), threshold = p₀ + z × SE
+4. Names, companies, dates, and metrics are "anchors" that keep retention high when the AI is honest
+5. If retention drops below the statistical threshold → the AI fabricated → result is rejected and retried
+
+Baseline: 40% token overlap expected (p₀ = 0.40), 99% confidence level (α = 0.01).
 
 ---
 
@@ -136,21 +183,7 @@ Still supported for LLM-facing resume text when `resume.json` is absent.
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_AGENT_PRIORITY`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional), `APPLYPILOT_LOGIN_<DOMAIN>_EMAIL`, `APPLYPILOT_LOGIN_<DOMAIN>_PASSWORD`, `APPLYPILOT_REQUIRE_DOMAIN_CREDENTIALS` (optional, `1` = fail when domain creds missing), `APPLYPILOT_SITE_PASSWORD` (legacy shared-password fallback), `APPLYPILOT_SCORE_TRACE` (optional, set `1` for per-job scoring rationale logs).
-
-Per-domain credential examples:
-```bash
-APPLYPILOT_LOGIN_LINKEDIN_COM_EMAIL=you@example.com
-APPLYPILOT_LOGIN_LINKEDIN_COM_PASSWORD=your-linkedin-password
-APPLYPILOT_LOGIN_INDEED_COM_EMAIL=you@example.com
-APPLYPILOT_LOGIN_INDEED_COM_PASSWORD=your-indeed-password
-APPLYPILOT_LOGIN_ZIPRECRUITER_COM_EMAIL=you@example.com
-APPLYPILOT_LOGIN_ZIPRECRUITER_COM_PASSWORD=your-ziprecruiter-password
-APPLYPILOT_LOGIN_GREENHOUSE_IO_EMAIL=you@example.com
-APPLYPILOT_LOGIN_GREENHOUSE_IO_PASSWORD=your-greenhouse-password
-APPLYPILOT_REQUIRE_DOMAIN_CREDENTIALS=1
-```
-Domain transform rule: uppercase the hostname and replace non-alphanumeric chars with `_` (for example, `jobs.lever.co` -> `APPLYPILOT_LOGIN_JOBS_LEVER_CO_*`).
+API keys and runtime config: `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `LLM_URL`, `LLM_MODEL`, `AUTO_APPLY_AGENT`, `AUTO_APPLY_AGENT_PRIORITY`, `AUTO_APPLY_MODEL`, `CAPSOLVER_API_KEY` (optional), `APPLYPILOT_SCORE_TRACE` (optional, set `1` for per-job scoring rationale logs).
 
 ## Two AI Layers
 
@@ -159,6 +192,42 @@ ApplyPilot intentionally separates its AI work into two different layers:
 1. The built-in LLM layer handles text-heavy tasks like scoring jobs, tailoring resumes, writing cover letters, and some enrichment. Gemini is the default here.
 2. The auto-apply agent layer drives the browser through MCP tools. Codex CLI is the default browser agent. Claude Code CLI and OpenCode CLI remain supported as compatibility backends.
    If you keep `AUTO_APPLY_AGENT=auto`, you can override the fallback order with `AUTO_APPLY_AGENT_PRIORITY=codex,claude,opencode`.
+
+### Multi-Model Routing
+
+ApplyPilot supports using different models for different tasks — a cheap/free model for high-volume work (scoring, enrichment) and a premium model for quality-sensitive output (tailoring, cover letters).
+
+| Stage | Client | What it does |
+|-------|--------|-------------|
+| Discover, Enrich, Score | `get_client()` | Default model — high volume, cost-sensitive |
+| Tailor, Cover Letter | `get_client(quality=True)` | Quality model — output directly impacts interviews |
+
+Configure in `~/.applypilot/.env`:
+
+```bash
+# Default model (used for scoring, enrichment)
+# Detected automatically from whichever API key is set:
+GEMINI_API_KEY=your_key          # Free tier, recommended for scoring
+# or OPENROUTER_API_KEY=...
+# or OPENAI_API_KEY=...
+# or BEDROCK_MODEL_ID=...
+
+# Quality model override (used for tailoring, cover letters)
+# Optional — if not set, uses the same model as default.
+LLM_MODEL_QUALITY=bedrock/global.anthropic.claude-opus-4-6-v1
+# or LLM_MODEL_QUALITY=gpt-4o
+# or LLM_MODEL_QUALITY=anthropic/claude-sonnet-4-20250514
+```
+
+**Example cost comparison (8,000 jobs, ~400 tailored):**
+
+| Setup | Scoring cost | Tailoring cost | Total |
+|-------|-------------|---------------|-------|
+| All Opus | ~$300 | ~$60 | ~$360 |
+| Gemini free + Opus quality | $0 | ~$60 | ~$60 |
+| Gemini free + Haiku quality | $0 | ~$5 | ~$5 |
+
+Provider detection order: `LLM_URL` (local) → `GEMINI_API_KEY` → `OPENROUTER_API_KEY` → `OPENAI_API_KEY` → `ANTHROPIC_API_KEY` → `BEDROCK_MODEL_ID`
 
 Canonical auto-apply settings stay on `AUTO_APPLY_*`. Compatibility aliases such as `APPLY_BACKEND`, `APPLY_CLAUDE_MODEL`, `APPLY_OPENCODE_MODEL`, and `APPLY_OPENCODE_AGENT` are accepted for merged-branch compatibility, but they are not the primary interface.
 
@@ -205,6 +274,26 @@ applypilot apply --reset-failed        # reset all failed jobs for retry
 applypilot apply --gen --url URL       # generate prompt file for manual debugging
 ```
 
+### Single Job
+
+Have a specific job URL? Skip the full pipeline and target it directly:
+
+```bash
+applypilot single "https://example.com/jobs/12345"
+```
+
+This runs a scoped pipeline (enrich → score → tailor → cover letter) for that one URL only — no other jobs in your database are touched. Once done, submit with:
+
+```bash
+applypilot apply --url "https://example.com/jobs/12345"
+```
+
+If you only want the tailored resume without a cover letter:
+
+```bash
+applypilot single "https://example.com/jobs/12345" --skip-apply
+```
+
 ---
 
 ## CLI Reference
@@ -222,13 +311,18 @@ applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
-applypilot apply                        # Launch auto-apply for all ready jobs
+applypilot single URL                   # Scoped pipeline for one job (enrich→score→tailor→cover)
+applypilot single URL --skip-apply      # Same but skip cover letter generation
+applypilot apply                        # Launch auto-apply
 applypilot apply --workers 3            # Parallel browser workers
-applypilot apply --limit 10             # Cap a batch to 10 applications
 applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
+applypilot apply --gen --url URL        # Generate prompt file for manual debugging
+applypilot apply --mark-applied URL     # Manually mark a job as applied
+applypilot apply --mark-failed URL      # Manually mark a job as failed
+applypilot apply --reset-failed         # Reset all failed jobs for retry
 applypilot analyze --url URL            # Parse a job description and optional resume match
 applypilot analyze --text-file job.txt --resume-file resume.json
 applypilot greenhouse validate          # Validate configured Greenhouse employers

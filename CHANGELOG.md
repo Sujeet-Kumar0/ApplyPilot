@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  **User config override** - Users can extend/modify employers via `~/.applypilot/greenhouse.yaml`
  **New CLI commands** - `applypilot greenhouse verify|discover|validate|list-employers|add-job` for managing Greenhouse employers
  **Pipeline integration** - Greenhouse fetcher runs automatically during `discover` stage alongside JobSpy, Workday, and SmartExtract
+ **`pending_cover` stage** in `get_jobs_by_stage()` — cover letter generation now uses the shared query gateway instead of inline SQL
+
+### Fixed
+ **`applypilot single` processed all jobs instead of one** — score, tailor, cover, and enrich stages ignored `PipelineContext.job_url` and queried the entire database. Added `job_url` parameter to `get_jobs_by_stage()`, `run_scoring()`, `run_tailoring()`, `run_cover_letters()`, `run_enrichment()`, and `_run_detail_scraper()`. All stages in `pipeline/stages.py` now pass `ctx.job_url` through. Existing batch callers are unaffected (parameter defaults to `None`).
 
 ### Changed
 - **Canonical resume contract** - Runtime personal info, work history, education, skills, projects, and verified metrics now come from `~/.applypilot/resume.json` instead of duplicated fields in `~/.applypilot/profile.json`

@@ -11,7 +11,6 @@ Interactive flow that creates ~/.applypilot/ with:
 from __future__ import annotations
 
 import json
-import re
 import shutil
 from pathlib import Path
 
@@ -50,6 +49,7 @@ _PROVIDER_CREDENTIAL_PROMPTS = {
     "openrouter": "OpenRouter API key (from openrouter.ai/keys)",
     "openai": "OpenAI API key",
     "anthropic": "Anthropic API key",
+    "bedrock": "AWS region",
     "local": "Local LLM endpoint URL",
 }
 
@@ -58,8 +58,30 @@ _PROVIDER_MODEL_PROMPTS = {
     "openrouter": "Model",
     "openai": "Model",
     "anthropic": "Model",
+    "bedrock": "Bedrock model ID",
     "local": "Model name",
 }
+
+
+# ---------------------------------------------------------------------------
+# Early LLM bootstrap (needed when PDF import runs before Step 4)
+# ---------------------------------------------------------------------------
+
+def _ensure_llm_configured() -> None:
+    """If no LLM provider is configured yet, prompt for one now and persist."""
+    from applypilot.llm_provider import detect_llm_provider
+    from applypilot.config import load_env
+
+    load_env()
+    provider = detect_llm_provider()
+    if provider is not None:
+        return
+
+    console.print(
+        "\n[yellow]PDF import needs an LLM. Let's configure one first.[/yellow]"
+    )
+    _setup_ai_features()
+    load_env()  # reload so the rest of the process picks up the new keys
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +359,122 @@ def _create_resume_json_scaffold() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Compensation & target locations (UI layer — logic in salary.py)
+# ---------------------------------------------------------------------------
+
+def _prompt_compensation(compensation: dict) -> dict:
+    """Prompt for current salary, derive expected range, optional breakdown."""
+    from applypilot.salary import clean_number, parse_range, SalaryRange
+
+    # Skip if all key fields already present
+    if all(str(compensation.get(k, "")).strip() for k in ("salary_expectation", "salary_currency", "salary_range_min", "salary_range_max")):
+        return compensation
+
+    current = str(compensation.get("current_salary", "")).strip()
+    if not current:
+        current = Prompt.ask("Current annual salary (total comp, number)", default="")
+    currency = str(compensation.get("salary_currency", "")).strip()
+    if not currency:
+        currency = Prompt.ask("Currency", default="USD")
+
+    clean_current = clean_number(current)
+
+    if clean_current > 0:
+        derived = SalaryRange.from_current(clean_current)
+        console.print(
+            f"[dim]Derived range: {currency} {derived.range_min:,} – {derived.range_max:,} "
+            f"(+40% to +100% of current)[/dim]"
+        )
+        if Confirm.ask("Use this derived range?", default=True):
+            expected, range_min, range_max = str(derived.expected), str(derived.range_min), str(derived.range_max)
+        else:
+            expected = Prompt.ask("Expected annual salary (number)", default="")
+            range_min, range_max = parse_range(
+                Prompt.ask("Acceptable range (e.g. 80000-120000)", default=""),
+                fallback=clean_number(expected),
+            )
+    else:
+        expected = str(compensation.get("salary_expectation", "")).strip()
+        if not expected:
+            expected = Prompt.ask("Expected annual salary (number)", default="")
+        range_min, range_max = parse_range(
+            Prompt.ask("Acceptable range (e.g. 80000-120000)", default=""),
+            fallback=clean_number(expected),
+        )
+
+    if Confirm.ask("Add salary breakdown (base/bonus/equity)?", default=False):
+        compensation["breakdown"] = {
+            "base": str(int(clean_number(Prompt.ask("Base salary", default=expected)))),
+            "bonus": str(int(clean_number(Prompt.ask("Annual bonus", default="0")))),
+            "equity": str(int(clean_number(Prompt.ask("Annual equity/RSU", default="0")))),
+        }
+
+    compensation.update({
+        "current_salary": current,
+        "salary_expectation": expected,
+        "salary_currency": currency or "USD",
+        "salary_range_min": range_min,
+        "salary_range_max": range_max,
+    })
+    return compensation
+
+
+def _prompt_target_locations(salary_usd: float, current_salary: float = 0, current_currency: str = "USD") -> dict:
+    """Prompt for target locations with all/any mode, language barriers, and PPP-adjusted salary."""
+    from applypilot.salary import PPPResult, SalaryRange
+
+    console.print(Panel(
+        "[bold]Target Locations[/bold]\n"
+        "[dim]all = must match every location, any = match at least one[/dim]"
+    ))
+    mode = Prompt.ask("Location match mode", choices=["all", "any"], default="any")
+    locations: list[dict] = []
+
+    while True:
+        loc = Prompt.ask("Target location (e.g. 'Remote', 'Germany', 'New York, NY') — empty to finish", default="")
+        if not loc:
+            break
+        entry: dict = {"name": loc}
+
+        lang = Prompt.ask(f"  Language requirement for {loc} (e.g. 'English', 'German B2+') — empty if none", default="")
+        if lang:
+            entry["language_requirement"] = lang
+
+        # PPP-adjusted salary range for this location
+        if current_salary > 0:
+            ppp_range = SalaryRange.from_current_ppp(current_salary, current_currency, loc)
+            if ppp_range.currency and ppp_range.currency != current_currency:
+                entry["ppp_salary_range"] = {
+                    "min": ppp_range.range_min,
+                    "max": ppp_range.range_max,
+                    "expected": ppp_range.expected,
+                    "currency": ppp_range.currency,
+                }
+                console.print(f"  [dim]{ppp_range.note}[/dim]")
+                if ppp_range.warning:
+                    console.print(f"  [bold yellow]{ppp_range.warning}[/bold yellow]")
+                    entry["ppp_warning"] = ppp_range.warning
+                else:
+                    console.print(
+                        f"  [dim]→ Ask for {ppp_range.currency} {ppp_range.range_min:,} – "
+                        f"{ppp_range.range_max:,}[/dim]"
+                    )
+
+        if salary_usd > 0:
+            ppp = PPPResult.convert(salary_usd, loc)
+            if ppp.known and ppp.currency != "USD":
+                entry["ppp_equivalent"] = ppp.display()
+                entry["ppp_rate"] = ppp.ppp_rate
+
+        locations.append(entry)
+
+    if not locations:
+        locations.append({"name": "Remote"})
+
+    return {"mode": mode, "locations": locations}
+
+
 def _prompt_missing_applypilot_fields(resume_data: dict) -> dict:
     console.print(
         Panel(
@@ -411,23 +549,16 @@ def _prompt_missing_applypilot_fields(resume_data: dict) -> dict:
         work_auth["needs_sponsorship"] = value
     work_auth.setdefault("work_permit_type", "")
 
-    salary = str(compensation.get("salary_expectation", "")).strip()
-    if not salary:
-        salary = Prompt.ask("Expected annual salary (number)", default="")
-    salary_currency = str(compensation.get("salary_currency", "")).strip() or Prompt.ask("Currency", default="USD")
-    salary_range = (
-        f"{compensation.get('salary_range_min', '')}-{compensation.get('salary_range_max', '')}".strip("-")
-        if compensation.get("salary_range_min") or compensation.get("salary_range_max")
-        else Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
-    )
-    clean_salary = re.sub(r"[$,\s]", "", salary)
-    clean_range = re.sub(r"[$,\s]", "", salary_range)
-    range_parts = clean_range.split("-") if "-" in clean_range else [clean_salary, clean_salary]
-    compensation["salary_expectation"] = salary
-    compensation["salary_currency"] = salary_currency or "USD"
-    compensation["salary_range_min"] = range_parts[0].strip() if range_parts and range_parts[0] else ""
-    compensation["salary_range_max"] = range_parts[1].strip() if len(range_parts) > 1 else compensation["salary_range_min"]
-    compensation.setdefault("currency_conversion_note", "")
+    compensation = _prompt_compensation(compensation)
+    applypilot["compensation"] = compensation
+
+    # -- Target locations + language --
+    if not applypilot.get("target_locations", {}).get("locations"):
+        from applypilot.salary import clean_number, to_usd
+        cur_salary = clean_number(compensation.get("current_salary", ""))
+        cur_currency = compensation.get("salary_currency", "USD")
+        salary_usd = to_usd(clean_number(compensation.get("salary_expectation", "")), cur_currency)
+        applypilot["target_locations"] = _prompt_target_locations(salary_usd, cur_salary, cur_currency)
 
     if not applypilot.get("years_of_experience_total"):
         derived_years = derived_profile.get("experience", {}).get("years_of_experience_total", "")
@@ -473,17 +604,27 @@ def _setup_canonical_resume(resume_json: Path | None = None) -> tuple[dict, dict
 
     console.print(Panel(
         "[bold]Step 1: Resume Source[/bold]\n"
-        "Choose how to create your canonical [cyan]resume.json[/cyan]."
+        "Choose how to create your canonical [cyan]resume.json[/cyan].\n"
+        "[dim]pdf — import from PDF/TXT files (requires LLM)[/dim]"
     ))
     choice = Prompt.ask(
         "Resume setup mode",
-        choices=["import", "migrate", "scaffold", "legacy"],
-        default="import" if PROFILE_PATH.exists() or RESUME_PATH.exists() else "scaffold",
+        choices=["pdf", "import", "migrate", "scaffold", "legacy"],
+        default="pdf",
     )
 
     if choice == "legacy":
         return None
-    if choice == "import":
+    if choice == "pdf":
+        _ensure_llm_configured()
+        path_str = Prompt.ask("Resume file path(s), comma-separated")
+        paths = [Path(p.strip().strip('"').strip("'")).expanduser().resolve() for p in path_str.split(",")]
+        from applypilot.resume_ingest import ingest_resumes
+        console.print("[dim]Parsing resume(s) via LLM...[/dim]")
+        data = ingest_resumes(paths)
+        _write_resume_json(data)
+        console.print(f"[green]Imported resume into {RESUME_JSON_PATH}[/green]")
+    elif choice == "import":
         path_str = Prompt.ask("Path to JSON Resume file")
         data = _copy_resume_json(Path(path_str.strip().strip('"').strip("'")).expanduser().resolve())
     elif choice == "migrate":
@@ -590,18 +731,15 @@ def _setup_profile() -> dict:
 
     # -- Compensation --
     console.print("\n[bold cyan]Compensation[/bold cyan]")
-    salary = Prompt.ask("Expected annual salary (number)", default="")
-    salary_currency = Prompt.ask("Currency", default="USD")
-    salary_range = Prompt.ask("Acceptable range (e.g. 80000-120000)", default="")
-    clean_salary = re.sub(r"[$,\s]", "", salary)
-    clean_range = re.sub(r"[$,\s]", "", salary_range)
-    range_parts = clean_range.split("-") if "-" in clean_range else [clean_salary, clean_salary]
-    profile["compensation"] = {
-        "salary_expectation": salary,
-        "salary_currency": salary_currency,
-        "salary_range_min": range_parts[0].strip(),
-        "salary_range_max": range_parts[1].strip() if len(range_parts) > 1 else range_parts[0].strip(),
-    }
+    profile["compensation"] = _prompt_compensation({})
+
+    # -- Target Locations --
+    from applypilot.salary import clean_number, to_usd
+    comp = profile["compensation"]
+    cur_salary = clean_number(comp.get("current_salary", ""))
+    cur_currency = comp.get("salary_currency", "USD")
+    salary_usd = to_usd(clean_number(comp.get("salary_expectation", "")), cur_currency)
+    profile["target_locations"] = _prompt_target_locations(salary_usd, cur_salary, cur_currency)
 
     # -- Experience --
     console.print("\n[bold cyan]Experience[/bold cyan]")
@@ -671,7 +809,8 @@ def _setup_searches() -> None:
         console.print("[yellow]No roles provided. Using a default set.[/yellow]")
         roles = ["Software Engineer"]
 
-    # Build YAML content
+    # CHANGED: Always include worldwide (empty location) + user's specific location.
+    # This ensures discovery finds jobs everywhere, not just one location.
     lines = [
         "# ApplyPilot search configuration",
         "# Edit this file to refine your job search queries.",
@@ -683,11 +822,15 @@ def _setup_searches() -> None:
         "  results_per_site: 50",
         "",
         "locations:",
-        f'  - location: "{location}"',
-        f"    remote: {str(distance == 0).lower()}",
-        "",
-        "queries:",
+        '  - location: ""',
+        "    remote: false",
     ]
+    if location:
+        is_remote = "remote" in location.lower() or distance == 0
+        lines.append(f'  - location: "{location}"')
+        lines.append(f"    remote: {str(is_remote).lower()}")
+    lines.append("")
+    lines.append("queries:")
     for i, role in enumerate(roles):
         lines.append(f'  - query: "{role}"')
         lines.append(f"    tier: {min(i + 1, 3)}")
@@ -779,7 +922,8 @@ def _setup_ai_features() -> None:
 
     console.print(
         "Supported providers: [bold]Gemini[/bold] (recommended, free tier), "
-        "OpenRouter (flexible multi-model), OpenAI, Anthropic, local (Ollama/llama.cpp)"
+        "OpenRouter (flexible multi-model), OpenAI, Anthropic, "
+        "AWS Bedrock (uses ada credentials), local (Ollama/llama.cpp)"
     )
     provider = Prompt.ask(
         "Provider",
@@ -787,18 +931,29 @@ def _setup_ai_features() -> None:
         default="gemini",
     )
 
-    if provider == "local":
+    if provider == "bedrock":
+        region = Prompt.ask(_PROVIDER_CREDENTIAL_PROMPTS[provider], default="us-east-1")
+        model = Prompt.ask(_PROVIDER_MODEL_PROMPTS[provider], default=LLM_PROVIDER_SPECS[provider].default_model)
+        other_provider_keys = [entry.env_key for entry in LLM_PROVIDER_SPECS.values() if entry.key != provider]
+        _delete_env_vars(other_provider_keys + ["LLM_MODEL"])
+        _upsert_env_vars({
+            "BEDROCK_MODEL_ID": model,
+            "BEDROCK_REGION": region,
+        })
+    elif provider == "local":
         credential = Prompt.ask(_PROVIDER_CREDENTIAL_PROMPTS[provider], default="http://localhost:8080/v1")
+        model = Prompt.ask(_PROVIDER_MODEL_PROMPTS[provider], default=LLM_PROVIDER_SPECS[provider].default_model)
+        spec = LLM_PROVIDER_SPECS[provider]
+        other_provider_keys = [entry.env_key for entry in LLM_PROVIDER_SPECS.values() if entry.key != provider]
+        _delete_env_vars(other_provider_keys)
+        _upsert_env_vars({spec.env_key: credential, "LLM_MODEL": model})
     else:
         credential = Prompt.ask(_PROVIDER_CREDENTIAL_PROMPTS[provider])
-    model = Prompt.ask(_PROVIDER_MODEL_PROMPTS[provider], default=LLM_PROVIDER_SPECS[provider].default_model)
-    spec = LLM_PROVIDER_SPECS[provider]
-    other_provider_keys = [entry.env_key for entry in LLM_PROVIDER_SPECS.values() if entry.key != provider]
-    _delete_env_vars(other_provider_keys)
-    _upsert_env_vars({
-        spec.env_key: credential,
-        "LLM_MODEL": model,
-    })
+        model = Prompt.ask(_PROVIDER_MODEL_PROMPTS[provider], default=LLM_PROVIDER_SPECS[provider].default_model)
+        spec = LLM_PROVIDER_SPECS[provider]
+        other_provider_keys = [entry.env_key for entry in LLM_PROVIDER_SPECS.values() if entry.key != provider]
+        _delete_env_vars(other_provider_keys)
+        _upsert_env_vars({spec.env_key: credential, "LLM_MODEL": model})
     console.print(f"[green]AI configuration saved to {ENV_PATH}[/green]")
 
 
@@ -964,7 +1119,7 @@ def _setup_optional_files(profile: dict, canonical_resume: dict | None = None) -
 # Main entry
 # ---------------------------------------------------------------------------
 
-def run_wizard(resume_json: Path | None = None) -> None:
+def run_wizard(resume_json: Path | None = None, resume_pdfs: list[Path] | None = None) -> None:
     """Run the full interactive setup wizard."""
     console.print()
     console.print(
@@ -980,7 +1135,21 @@ def run_wizard(resume_json: Path | None = None) -> None:
     ensure_dirs()
     console.print(f"[dim]Created {APP_DIR}[/dim]\n")
 
-    canonical_result = _setup_canonical_resume(resume_json=resume_json)
+    # If --resume-pdf was passed, bootstrap LLM and import directly
+    if resume_pdfs:
+        _ensure_llm_configured()
+        from applypilot.resume_ingest import ingest_resumes
+        console.print("[dim]Parsing resume(s) via LLM...[/dim]")
+        data = ingest_resumes(resume_pdfs)
+        _write_resume_json(data)
+        console.print(f"[green]Imported resume into {RESUME_JSON_PATH}[/green]")
+        from applypilot.resume_json import load_resume_json_from_path
+        data = load_resume_json_from_path(RESUME_JSON_PATH)
+        data = _prompt_missing_applypilot_fields(data)
+        _write_resume_json(data)
+        canonical_result = (data, normalize_profile_from_resume_json(data))
+    else:
+        canonical_result = _setup_canonical_resume(resume_json=resume_json)
     if canonical_result is None:
         # Step 1: Resume
         _setup_resume()
@@ -999,8 +1168,14 @@ def run_wizard(resume_json: Path | None = None) -> None:
     _setup_searches()
     console.print()
 
-    # Step 4: AI features (optional LLM)
-    _setup_ai_features()
+    # Step 4: AI features (optional LLM) — skip if already configured during PDF import
+    from applypilot.llm_provider import detect_llm_provider
+    from applypilot.config import load_env
+    load_env()
+    if detect_llm_provider() is None:
+        _setup_ai_features()
+    else:
+        console.print("[green]AI provider already configured.[/green]")
     console.print()
 
     # Step 5: Auto-apply agent
