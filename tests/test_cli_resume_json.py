@@ -62,6 +62,9 @@ def _sample_resume_json() -> dict:
                     "github_url": "https://github.com/alex",
                     "linkedin_url": "https://linkedin.com/in/alex",
                 },
+                "target_role": "Staff Engineer",
+                "years_of_experience_total": "10",
+                "target_locations": {"locations": ["US"], "mode": "any"},
                 "tailoring_config": {
                     "default_role_type": "software_engineer",
                     "validation": {"enabled": True, "max_retries": 3, "min_bullets_per_role": 2, "max_bullets_per_role": 5, "min_metrics_ratio": 0.7},
