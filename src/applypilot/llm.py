@@ -114,6 +114,8 @@ def _env_get(env: Mapping[str, str], key: str) -> str:
 def _normalize_model(provider: str, model: str) -> str:
     if provider == "local":
         provider = "openai"
+    if provider == "bedrock":
+        return model if model.startswith("bedrock/") else f"bedrock/{model}"
     if provider == "openrouter":
         return model if model.startswith("openrouter/") else f"openrouter/{model}"
     return model if "/" in model else f"{provider}/{model}"
@@ -216,6 +218,19 @@ def resolve_llm_config(env: Mapping[str, str] | None = None, quality: bool = Fal
     configured_model = _env_get(env_map, "LLM_MODEL_QUALITY") if quality else ""
     if not configured_model:
         configured_model = _env_get(env_map, "LLM_MODEL")
+
+    # ADDED: When LLM_MODEL_QUALITY specifies a different provider (e.g. bedrock/...),
+    # override the detected provider. This enables multi-model routing: cheap model
+    # (Gemini) for scoring, expensive model (Bedrock Opus) for tailoring.
+    if configured_model and configured_model.startswith("bedrock/"):
+        return LLMConfig(
+            provider="bedrock",
+            api_base=None,
+            model=configured_model,
+            api_key="",
+            base_url=None,
+            use_streaming=False,
+        )
     local_url = _env_get(env_map, "LLM_URL").rstrip("/")
     use_streaming = _env_get(env_map, "LLM_STREAMING_MODE").lower() in _STREAMING_TRUE_VALUES
 
@@ -225,12 +240,21 @@ def resolve_llm_config(env: Mapping[str, str] | None = None, quality: bool = Fal
         model = _normalize_model(selected_provider, raw_model)
         api_base = local_url if selected_provider == "local" else None
         provider = "openai" if selected_provider == "local" else selected_provider
+        api_key = selection.api_key
+        base_url = selection.base_url
+
+        if selected_provider == "bedrock":
+            provider = "bedrock"
+            api_key = ""
+            api_base = None
+            base_url = None
+
         return LLMConfig(
             provider=provider,
             api_base=api_base,
             model=model,
-            api_key=selection.api_key,
-            base_url=selection.base_url,
+            api_key=api_key,
+            base_url=base_url,
             use_streaming=use_streaming,
         )
 
@@ -414,6 +438,11 @@ class LLMClient:
             "api_base": entry.base_url or None,
             "base_url": entry.base_url or None,
         }
+        if entry.provider == "bedrock":
+            kwargs.pop("api_key", None)
+            kwargs.pop("api_base", None)
+            region = os.environ.get("BEDROCK_REGION", "us-east-1").strip()
+            kwargs["aws_region_name"] = region
         if temperature is not None:
             kwargs["temperature"] = temperature
         kwargs.update(options.get("extra", {}))
@@ -431,7 +460,7 @@ class LLMClient:
                 text = self._extract_text(response)
         except Exception as exc:
             message = str(exc).lower()
-            if any(token in message for token in ("429", "rate limit", "quota", "resource has been exhausted", "payment required")):
+            if any(token in message for token in ("429", "rate limit", "quota", "resource has been exhausted", "payment required", "throttlingexception")):
                 _note_openrouter_rate_limit(self._entry_model(entry))
                 self._exhausted[entry.name] = time.time()
                 if not is_last:

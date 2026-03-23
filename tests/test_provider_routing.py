@@ -27,8 +27,14 @@ _FAKE_LLM_KEY = "fake-gateway-key-for-test"
 
 def _clear_llm_env(monkeypatch):
     """Remove all LLM-related env vars so each test starts clean."""
-    for var in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL", "LLM_API_KEY", "LLM_MODEL"):
+    for var in (
+        "GEMINI_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+        "DEEPSEEK_API_KEY", "LLM_URL", "LLM_API_KEY", "LLM_MODEL", "LLM_MODEL_QUALITY",
+        "BEDROCK_MODEL_ID", "BEDROCK_REGION",
+    ):
         monkeypatch.delenv(var, raising=False)
+    # Prevent get_client() from reloading .env mid-test
+    monkeypatch.setattr("applypilot.config.load_env", lambda: None)
 
 
 def _reset_singleton(monkeypatch):
