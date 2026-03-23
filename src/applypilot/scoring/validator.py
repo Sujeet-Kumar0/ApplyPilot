@@ -118,6 +118,56 @@ def sanitize_text(text: str) -> str:
     return text.strip()
 
 
+def _tokenize_words(text: str) -> set[str]:
+    """Extract lowercase word tokens from text."""
+    return set(re.findall(r"[a-z]{2,}", text.lower()))
+
+
+def check_resume_deviation(original: str, tailored: str, alpha: float = 0.01) -> tuple[bool, float]:
+    """Check if a tailored resume deviates too far from the original.
+
+    Uses a binomial proportion test: given N original tokens, we expect at
+    least a baseline fraction to survive in the tailored version. If the
+    observed retention rate falls below the critical threshold derived from
+    the normal approximation to the binomial distribution, the resume is
+    flagged as over-deviated.
+
+    Args:
+        original: Original resume text.
+        tailored: Tailored resume text.
+        alpha: Significance level (default 0.01 = 99% confidence).
+
+    Returns:
+        (passed, retention_rate) — passed is False if deviation is anomalous.
+    """
+    if not original or not tailored:
+        return True, 1.0
+
+    import math
+
+    orig_tokens = _tokenize_words(original)
+    tail_tokens = _tokenize_words(tailored)
+
+    if not orig_tokens:
+        return True, 1.0
+
+    n = len(orig_tokens)
+    retained = len(orig_tokens & tail_tokens)
+    p_hat = retained / n
+
+    # Expected retention rate: tailoring rewrites bullets but preserves
+    # companies, skills, names, dates, metrics. Baseline ~40% token overlap.
+    p0 = 0.40
+
+    # Normal approximation to binomial: z = (p_hat - p0) / sqrt(p0*(1-p0)/n)
+    se = math.sqrt(p0 * (1 - p0) / n)
+    # z critical values: alpha=0.01 → -2.326, alpha=0.05 → -1.645
+    z_crit = -2.326 if alpha <= 0.01 else -1.645
+    threshold = p0 + z_crit * se
+
+    return p_hat >= threshold, round(p_hat, 3)
+
+
 def _get_role_constraints(role_type: str, config: dict) -> dict:
     """Get role-specific validation constraints from tailoring_config."""
 
@@ -194,6 +244,7 @@ def validate_json_fields(
 
     # Required keys — always checked regardless of mode.
     # "projects" may be an empty list; only the field itself is required.
+    allowed_skills = _build_skills_set(profile)
     for key in ("title", "summary", "skills", "experience", "education"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
@@ -246,7 +297,7 @@ def validate_json_fields(
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
                 continue
-            if fake in skills_text:
+            if fake in skills_text and fake not in allowed_skills:
                 errors.append(f"Fabricated skill: '{fake}'")
 
     work_companies = get_profile_company_names(profile)
@@ -392,6 +443,7 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         warnings.append("Phone missing -- will be injected")
 
     # 7. Scan TECHNICAL SKILLS section for fabricated tools
+    allowed_skills = _build_skills_set(profile)
     skills_start = text_lower.find("technical skills")
     skills_end = text_lower.find("experience", skills_start) if skills_start != -1 else -1
     if skills_start != -1 and skills_end != -1:
@@ -399,7 +451,7 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
         for fake in FABRICATION_WATCHLIST:
             if len(fake) <= 2:
                 continue
-            if fake in skills_block:
+            if fake in skills_block and fake not in allowed_skills:
                 errors.append(f"FABRICATED SKILL in Technical Skills: '{fake}'")
 
     # 8. Scan full document for fabrication watchlist items not in original
@@ -432,6 +484,17 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
             count += 1
         if count > 1:
             errors.append(f"Section '{section_name}' appears {count} times.")
+
+    # 13. Statistical deviation check (binomial proportion test)
+    if original_text:
+        passed, retention = check_resume_deviation(original_text, text)
+        if not passed:
+            errors.append(
+                f"Resume deviates too far from original (token retention {retention:.0%}, "
+                f"below statistical threshold). Reframe existing content, don't replace it."
+            )
+        elif retention < 0.50:
+            warnings.append(f"Low token retention ({retention:.0%}) — borderline deviation.")
 
     return {
         "passed": len(errors) == 0,

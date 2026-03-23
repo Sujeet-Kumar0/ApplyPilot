@@ -41,6 +41,74 @@ log = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
+# ── Skill-Gap Detection (deterministic, no LLM) ─────────────────────────
+
+_STOPWORDS = frozenset(
+    "a about above after again all am an and any are as at be because been before being "
+    "below between both but by can could did do does doing down during each few for from "
+    "further get got had has have having he her here hers herself him himself his how i if "
+    "in into is it its itself just let like make me might more most must my myself no nor "
+    "not now of off on once only or other our ours ourselves out over own part per please "
+    "put re s same she should so some still such t than that the their theirs them "
+    "themselves then there these they this those through to too under until up us very was "
+    "we were what when where which while who whom why will with would you your yours "
+    "yourself yourselves able also work working experience team role position job company "
+    "including include includes using use used based well within across join looking "
+    "opportunity responsibilities responsible required requirements preferred qualifications "
+    "minimum years year strong knowledge ability skills skill ensure support provide "
+    "develop development manage management build building create creating maintain "
+    "maintaining etc e g i e "
+    "benefits compensation incentive awards perks maternity parental leave health pto "
+    "belonging culture associate associates customer customers supplier suppliers "
+    "community communities employer equal opportunity inclusive inclusion diversity "
+    "valued respected identities opinions styles experiences ideas welcoming "
+    "country countries world worldwide global operate operating operations "
+    "retailer retail warehouse club membership physical geographic region "
+    "floor tower flrs part india chennai bangalore location primary located "
+    "outlined listed none below above option options "
+    "aim alignment among ago best bring career careers commitment consistent "
+    "continuous continuously creating define defining deliver delivering detail "
+    "dynamic effectively engaged engagement environment epic expert experts "
+    "family feel feels first foreground foster fostering great grow growing "
+    "guidance heart helping imagine impact innovative innovate learn learner "
+    "led leverage life live lives making meet million millions mindset "
+    "new next people person place power powered practices proud purpose "
+    "really reinventing rooted sense serve serving shaping start started "
+    "today transformative understand unique way welcome".split()
+)
+
+
+def _extract_jd_keywords(jd_text: str) -> set[str]:
+    """Extract meaningful terms from a JD. Works for any domain."""
+    text = re.sub(r"https?://\S+", " ", jd_text)
+    text = re.sub(r"\S+@\S+", " ", text)
+    text = re.sub(r"[^a-zA-Z+#\s-]", " ", text).lower()
+    words = text.split()
+
+    def _is_useful(w: str) -> bool:
+        return len(w) >= 3 and w not in _STOPWORDS
+
+    bigrams = set()
+    for i in range(len(words) - 1):
+        if _is_useful(words[i]) and _is_useful(words[i + 1]):
+            bigrams.add(f"{words[i]} {words[i + 1]}")
+    singles = {w for w in words if _is_useful(w)}
+    return bigrams | singles
+
+
+def check_skill_gaps(jd_text: str, tailored_text: str) -> dict:
+    """Compare JD keywords against tailored resume — no LLM call."""
+    jd_keywords = _extract_jd_keywords(jd_text)
+    resume_lower = tailored_text.lower()
+    matched = {kw for kw in jd_keywords if kw in resume_lower}
+    missing = jd_keywords - matched
+    return {
+        "jd_keywords": len(jd_keywords),
+        "matched": sorted(matched),
+        "missing": sorted(missing),
+        "coverage": round(len(matched) / len(jd_keywords), 2) if jd_keywords else 1.0,
+    }
+
 
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
 
@@ -93,6 +161,12 @@ def _build_tailor_prompt(profile: dict, resume_text: str | None = None) -> str:
         education_block = f"{school} | {education_level}" if school else education_level
     del resume_text
 
+    # Bullet count from user's tailoring config (set during init)
+    validation_cfg = profile.get("tailoring_config", {}).get("validation", {})
+    min_bullets = validation_cfg.get("min_bullets_per_role", 3)
+    max_bullets = validation_cfg.get("max_bullets_per_role", 5)
+    bullet_example = ", ".join(f'"bullet {i}"' for i in range(1, max_bullets + 1))
+
     return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
 
 Take the base resume and job description. Return a tailored resume as a JSON object.
@@ -120,7 +194,7 @@ Reframe EVERY bullet for this role. Same real work, different angle. Every bulle
 
 PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
 
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
+BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. {min_bullets}-{max_bullets} bullets per role (aim for {max_bullets}).
 
 ## VOICE:
 - Write like a real engineer. Short, direct.
@@ -139,7 +213,7 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{education_block}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":[{bullet_example}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{education_block}"}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -436,7 +510,8 @@ def judge_tailored_resume(
         )},
     ]
 
-    client = get_client()
+    # CHANGED: Judge uses quality model — it evaluates tailored resume accuracy.
+    client = get_client(quality=True)
     response = client.chat(messages, max_output_tokens=512)
 
     passed = "VERDICT: PASS" in response.upper()
@@ -493,7 +568,10 @@ def tailor_resume(
     }
     avoid_notes: list[str] = []
     tailored = ""
-    client = get_client()
+    # CHANGED: Tailoring uses quality model — output quality directly impacts
+    # interview chances. Scoring uses cheap model (Gemini), tailoring uses
+    # expensive one (Bedrock Opus). Set via LLM_MODEL_QUALITY env var.
+    client = get_client(quality=True)
     tailor_prompt_base = _build_tailor_prompt(profile)
 
     for attempt in range(max_retries + 1):
@@ -511,7 +589,9 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
+        log.debug("[tailor] %s — prompt length: %d chars", job.get("title", "?")[:40], len(prompt))
         raw = client.chat(messages, max_output_tokens=16000)
+        log.debug("[tailor] %s — LLM response: %s", job.get("title", "?")[:40], raw[:400])
 
         # Parse JSON from response
         try:
@@ -658,6 +738,20 @@ def run_tailoring(
         try:
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
+
+            # ADDED: Skill-gap check + debug logging for tailor results
+            jd_text = job.get("full_description") or ""
+            if jd_text and tailored:
+                report["skill_gaps"] = check_skill_gaps(jd_text, tailored)
+                coverage = report["skill_gaps"]["coverage"]
+                log.debug("[tailor] %s — skill coverage: %.0f%% missing: %s",
+                          job.get("title", "?")[:40], coverage * 100,
+                          report["skill_gaps"]["missing"][:10])
+                if coverage < 0.5:
+                    log.warning("Low JD keyword coverage (%.0f%%) for %s", coverage * 100, job["title"][:50])
+            bullet_count = tailored.count("\n- ")
+            log.debug("[tailor] %s — bullets: %d, status: %s, attempts: %d",
+                      job.get("title", "?")[:40], bullet_count, report["status"], report["attempts"])
 
             # Build collision-resistant filename prefix
             prefix = _build_tailored_prefix(job)
