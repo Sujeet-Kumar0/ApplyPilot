@@ -7,6 +7,7 @@ Search queries, locations, and filtering rules are loaded from the user's
 search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
+import inspect as _inspect
 import logging
 import inspect
 import json
@@ -21,7 +22,16 @@ from urllib.parse import urlencode
 from uuid import uuid4
 
 import pandas as pd
-from jobspy import scrape_jobs
+from jobspy import scrape_jobs as _raw_scrape_jobs
+
+# Only pass params that the installed jobspy version actually accepts.
+_JOBSPY_PARAMS = set(_inspect.signature(_raw_scrape_jobs).parameters.keys())
+
+
+def scrape_jobs(**kwargs):
+    """Wrapper that filters kwargs to only what the installed jobspy supports."""
+    filtered = {k: v for k, v in kwargs.items() if k in _JOBSPY_PARAMS}
+    return _raw_scrape_jobs(**filtered)
 
 # Patch TLSRotating to always specify a client_identifier.
 # Without one, the tls-client Go binary receives a nil JA3 string and panics
@@ -58,11 +68,11 @@ try:
 except Exception:
     pass  # If patching fails, fall back to original behavior
 
-from applypilot import config
-from applypilot.database import commit_with_retry, get_connection, init_db
+from applypilot import config  # noqa: E402
+from applypilot.database import commit_with_retry, get_connection, init_db  # noqa: E402
 
 log = logging.getLogger(__name__)
-_SCRAPE_JOBS_PARAMS = set(inspect.signature(scrape_jobs).parameters)
+_SCRAPE_JOBS_PARAMS = set(inspect.signature(_raw_scrape_jobs).parameters)
 _HOURS_OLD_SUPPORTED = "hours_old" in _SCRAPE_JOBS_PARAMS
 _HOURS_OLD_WARNING_EMITTED = False
 _DEBUG_JOBSPY_ENABLED = os.getenv("APPLYPILOT_DEBUG_JOBSPY") == "1"
@@ -1350,6 +1360,7 @@ def _full_crawl(
 
     log.info("Full crawl: %d search combinations", len(searches))
     log.info("Sites: %s | Results/site: %d | Hours old: %d", ", ".join(sites), results_per_site, hours_old)
+    log.debug("[discover] queries: %s", [s.get("query") or s.get("search_term") for s in searches[:10]])
     if active_quarantines:
         for site, info in active_quarantines.items():
             until = info["until"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
