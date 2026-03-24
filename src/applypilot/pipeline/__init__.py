@@ -17,6 +17,8 @@ def run_pipeline(**kwargs) -> dict:
         validation_mode=kwargs.get("validation_mode", "normal"),
         dry_run=kwargs.get("dry_run", False),
         stream=kwargs.get("stream", False),
+        chunked=kwargs.get("chunked", False),
+        chunk_size=kwargs.get("chunk_size", 1000),
         limit=kwargs.get("limit", 0),
     ).execute()
 

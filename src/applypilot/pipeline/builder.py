@@ -21,23 +21,28 @@ VALID_STAGES = list(STAGES.keys())
 
 
 class Pipeline:
-    """Builder for composing pipeline stages. Supports batch, single-job, sequential, and streaming modes."""
+    """Builder for composing pipeline stages. Supports batch, single-job, sequential, chunked, and streaming modes."""
 
     def __init__(self, ctx: PipelineContext | None = None) -> None:
         self._ctx = ctx or PipelineContext()
         self._stages: list[Stage] = []
         self._stream = False
+        self._chunked = False
+        self._chunk_size = 1000
 
     @classmethod
     def batch(cls, stages: list[str] | None = None, min_score: int = 7,
               workers: int = 1, validation_mode: str = "normal",
               dry_run: bool = False, stream: bool = False,
+              chunked: bool = False, chunk_size: int = 1000,
               limit: int = 0) -> Pipeline:
         """Batch mode: run named stages over all pending jobs."""
         ctx = PipelineContext(min_score=min_score, limit=limit, workers=workers,
                               validation_mode=validation_mode, dry_run=dry_run)
         p = cls(ctx)
         p._stream = stream
+        p._chunked = chunked
+        p._chunk_size = chunk_size
         for name in _resolve(stages):
             p._stages.append(STAGES[name])
         return p
@@ -62,6 +67,51 @@ class Pipeline:
         self._stages.append(STAGES["pdf"]); return self
 
     def execute(self) -> dict:
+        """Run all composed stages sequentially (or chunked if enabled)."""
+        if self._chunked and not self._ctx.is_single:
+            return self._execute_chunked()
+        return self._execute_sequential()
+
+    def _execute_chunked(self) -> dict:
+        """Run discover→enrich→score in overlapping chunks via producer-consumer threads."""
+        from applypilot.pipeline.chunked import ChunkedExecutor
+
+        console.print(Panel(f"[bold]ApplyPilot Pipeline (chunked, {self._chunk_size}/chunk)[/bold]"))
+        stage_names = [s.name for s in self._stages]
+        console.print(f"  Stages:     {' → '.join(stage_names)}\n")
+
+        def discover_fn(ctx):
+            for s in self._stages:
+                if s.name == "discover":
+                    s.run(ctx)
+            conn = get_connection()
+            return conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+        def enrich_fn(chunk_idx):
+            for s in self._stages:
+                if s.name == "enrich":
+                    s.run(self._ctx)
+
+        def score_fn():
+            for s in self._stages:
+                if s.name == "score":
+                    s.run(self._ctx)
+
+        executor = ChunkedExecutor(self._ctx, chunk_size=self._chunk_size)
+        result = executor.execute(discover_fn, enrich_fn, score_fn)
+
+        # Run remaining stages (tailor, cover, pdf) sequentially after chunked stages
+        for stage in self._stages:
+            if stage.name not in ("discover", "enrich", "score"):
+                console.print(f"  STAGE: {stage.name}")
+                stage.run(self._ctx)
+
+        console.print(f"\n  Chunked pipeline: {result['chunks']} chunks in {result['elapsed']:.1f}s")
+        if result["errors"]:
+            console.print(f"  Errors: {result['errors']}")
+        return result
+
+    def _execute_sequential(self) -> dict:
         """Run all composed stages sequentially and return summary."""
         mode = "single" if self._ctx.is_single else "batch"
         stage_names = [s.name for s in self._stages]
