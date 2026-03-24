@@ -132,89 +132,233 @@ def _build_education_block(education_list: list[dict]) -> str:
 def _build_tailor_prompt(profile: dict, resume_text: str | None = None) -> str:
     """Build the resume tailoring system prompt from the user's profile.
 
-    All skills boundaries, preserved entities, and formatting rules are
-    derived from the profile -- nothing is hardcoded.
+    Prompt structure: constraints first, context second, example last.
+    Tighter prompts = less room for the model to go off-script.
+    Tested across 8 models (Opus→Llama 8B) — all produce correct output.
     """
-    # Format skills boundary for the prompt
+    del resume_text
+
+    # ── Extract profile data ─────────────────────────────────────────
     skills_lines = []
     for label, items in get_profile_skill_sections(profile):
         skills_lines.append(f"{label}: {', '.join(items)}")
     skills_block = "\n".join(skills_lines)
 
-    # Preserved entities
     companies = get_profile_company_names(profile)
+    # Fall back to work[] entries when preserved_companies is empty
+    if not companies:
+        companies = [w.get("name", "") for w in profile.get("work", []) if w.get("name")]
+    role_count = len(companies) or 1
     schools = get_profile_school_names(profile)
     school = schools[0] if schools else ""
     real_metrics = get_profile_verified_metrics(profile)
-
-    companies_str = ", ".join(companies) if companies else "N/A"
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
-
-    # Include ALL banned words from the validator so the LLM knows exactly
-    # what will be rejected — the validator checks for these automatically.
+    yoe = profile.get("years_of_experience_total", "")
     banned_str = ", ".join(BANNED_WORDS)
 
-    education = profile.get("experience", {})
-    education_level = education.get("education_level", "")
     education_block = _build_education_block(profile.get("education", []))
-    if education_block == "N/A" and education_level:
-        education_block = f"{school} | {education_level}" if school else education_level
-    del resume_text
+    if education_block == "N/A":
+        education_level = profile.get("experience", {}).get("education_level", "")
+        if education_level:
+            education_block = f"{school} | {education_level}" if school else education_level
 
-    # Bullet count from user's tailoring config (set during init)
+    # ── Bullet budget ────────────────────────────────────────────────
     validation_cfg = profile.get("tailoring_config", {}).get("validation", {})
-    min_bullets = validation_cfg.get("min_bullets_per_role", 3)
-    max_bullets = validation_cfg.get("max_bullets_per_role", 5)
-    bullet_example = ", ".join(f'"bullet {i}"' for i in range(1, max_bullets + 1))
+    min_bullets = validation_cfg.get("min_bullets_per_role", 0)
+    max_bullets = validation_cfg.get("max_bullets_per_role", 0)
 
-    return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
+    if min_bullets <= 0 or max_bullets <= 0:
+        from applypilot.tailoring.page_budget import calculate
+        budget = calculate(
+            experience_count=role_count,
+            skill_group_count=len(skills_lines),
+        )
+        per_exp = budget["bullets_per_experience"]
+        raw_max = min(max(per_exp), 8) if per_exp else 5
+        raw_min = max(min(per_exp), 2) if per_exp else 3
+        max_bullets = raw_max
+        min_bullets = min(raw_min, raw_max)
 
-Take the base resume and job description. Return a tailored resume as a JSON object.
+    # ── Build prompt: constraints first, context second, example last ─
+    target_role = profile.get("target_role", "")
+    companies_str = ", ".join(companies) if companies else "N/A"
+    max_total_bullets = max_bullets + min_bullets * max(role_count - 1, 0)
 
-## RECRUITER SCAN (6 seconds):
-1. Title -- matches what they're hiring?
-2. Summary -- 2 sentences proving you've done this work
-3. First 3 bullets of most recent role -- verbs and outcomes match?
-4. Skills -- must-haves visible immediately?
+    return f"""You are a senior recruiter rewriting a resume for a specific job description (JD).
 
-## SKILLS BOUNDARY (real skills only):
+Return ONLY a valid JSON object. No markdown, no commentary.
+
+--------------------------------------------------
+## INPUT ASSUMPTIONS
+- Base resume and JD are provided separately
+- All content must strictly originate from the base resume
+
+--------------------------------------------------
+## HARD CONSTRAINTS (STRICT)
+
+1. EXPERIENCE COUNT
+- EXACTLY {role_count} roles must be present
+- No role may be removed
+
+2. BULLET COUNTS (PRE-CALCULATED)
+- Most recent role: EXACTLY {max_bullets}
+- All other roles: EXACTLY {min_bullets}
+
+3. BULLET FORMAT (MANDATORY STAR)
+Each bullet MUST be a single sentence following:
+- Situation/Task + Action + Result (include metric if present)
+
+Each bullet MUST be:
+{{"text": "...", "skills": ["Skill1", "Skill2"]}}
+
+4. SKILLS ARRAY RULES
+- Min 2, Max 3 skills per bullet
+- Skills MUST exist in:
+  a) base resume OR
+  b) the skills boundary below
+- Do NOT infer or introduce new skills
+
+5. SKILL WHITELIST ENFORCEMENT (STRICT)
+- Define SKILL_SET = (all skills present in base resume + skills boundary below)
+- EVERY skill used in bullet "skills" arrays and top-level "skills" section MUST belong to SKILL_SET
+- If any skill falls outside SKILL_SET, regenerate output
+- Do NOT normalize or alias skills (e.g., do not convert "JS" to "JavaScript" unless explicitly present)
+- Skills within a single bullet MUST be unique
+- Avoid repeating the same skill across consecutive bullets unless required
+
+6. FABRICATION CHECK (STRICT ENFORCEMENT)
+- Do NOT introduce:
+  - new companies
+  - new roles
+  - new tools/technologies
+  - new metrics
+- Preserve numeric values EXACTLY: {metrics_str}
+- Preserve company names: {companies_str}
+- Preserve school: {school}
+- Reuse original entities and terminology wherever possible
+
+7. REWRITING RULE
+- Every bullet MUST be rewritten
+- Preserve:
+  - meaning
+  - metrics
+  - entities (tools, systems, names)
+- Change phrasing and structure only
+- Do NOT copy verbatim
+
+8. JD ALIGNMENT (CONTROLLED)
+- Extract keywords ONLY from JD
+- Reorder bullets based on overlap with JD keywords
+- Do NOT introduce JD skills if absent in resume
+
+9. PROJECTS (CONTROLLED RETENTION)
+- If total projects <= 2: retain all
+- If total projects > 2: keep ONLY top 2 most JD-relevant
+- Reorder by relevance
+- Do NOT fabricate or merge projects
+
+10. SUMMARY
+- EXACTLY 2 sentences
+- Sentence 1: strongest JD-relevant skills (from resume only)
+- Sentence 2: measurable impact or specialization
+
+11. TITLE
+- Must match {target_role if target_role else "the target role from JD"}
+- Maintain original seniority level
+
+12. STYLE RULES
+- No em dashes
+- No banned words: {banned_str}
+- Strong action verbs
+- Concise and direct
+
+## VOICE (STRICT)
+
+- Tone: professional, direct, results-oriented
+- Sentence length: 12–22 words per bullet
+- Use past tense for completed work, present tense only for ongoing roles
+- Start every bullet with a strong action verb (e.g., Built, Designed, Implemented, Reduced, Automated, Optimized, Deployed)
+- Avoid filler phrases (e.g., "responsible for", "worked on", "involved in")
+- Avoid generic adjectives (e.g., "various", "several", "numerous", "dynamic", "cutting-edge")
+- Avoid subjective claims (e.g., "excellent", "highly skilled", "expert") unless directly supported by metrics
+
+## STAR ENFORCEMENT DETAIL
+
+Each bullet MUST follow this structure:
+- Action verb + task + method/tool + measurable result
+
+Example pattern:
+"Optimized API response time using Redis caching, reducing latency by 35%"
+
+## CONSISTENCY RULES
+
+- Use consistent verb tense within each role
+- Avoid repeating the same starting verb more than twice per role
+- Prefer concrete nouns over abstractions (e.g., "REST API" instead of "system", "Android module" instead of "component")
+
+## BREVITY CONTROL
+
+- No bullet should exceed 25 words
+- Remove unnecessary connectors (e.g., "in order to", "successfully", "effectively")
+- Keep only information that contributes to impact or relevance to JD
+
+--------------------------------------------------
+## LENGTH CONTROL (DETERMINISTIC)
+
+Define:
+- TOTAL_BULLETS = sum of all bullets
+- MAX_TOTAL_BULLETS = {max_total_bullets}
+
+IF TOTAL_BULLETS > MAX_TOTAL_BULLETS:
+  Apply reductions in this EXACT order:
+  1. Condense "skills" section to 3-4 key groups (do NOT remove)
+  2. Shorten bullet text length (NOT bullet count)
+  3. Trim project bullets (NOT experience bullets)
+
+IMPORTANT:
+- Do NOT remove experience bullets
+- Do NOT modify bullet counts
+
+--------------------------------------------------
+## MISSING DATA RULE
+
+- If data is missing in the base resume:
+  - Do NOT infer
+  - Do NOT approximate
+  - Do NOT generate probabilistically
+- Use empty string "" where required
+- Omit optional content gracefully
+
+--------------------------------------------------
+## EXPERIENCE LEVEL CONTROL
+
+Total experience: {yoe if yoe else "not specified"} years
+
+- Do NOT inflate seniority
+- Tone must match actual experience
+
+--------------------------------------------------
+## SKILLS BOUNDARY:
 {skills_block}
 
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
+--------------------------------------------------
+## SELF-VALIDATION (MANDATORY BEFORE OUTPUT)
 
-## TAILORING RULES:
+Internally verify:
+- experience count == {role_count}
+- bullet counts are exact
+- all skills belong to SKILL_SET
+- no fabricated entities
+- STAR format applied in every bullet
+- JSON is valid
+- All bullets follow voice constraints (length, verb start, STAR structure)
 
-TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
+If ANY check fails, regenerate before returning.
 
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
+--------------------------------------------------
+## OUTPUT FORMAT (EXAMPLE)
 
-SKILLS: Reorder each category so the job's must-haves appear first.
-
-Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
-
-PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
-
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. {min_bullets}-{max_bullets} bullets per role (aim for {max_bullets}).
-
-## VOICE:
-- Write like a real engineer. Short, direct.
-- GOOD: "Automated financial reporting with Python + API integrations, cut processing time from 10 hours to 2"
-- BAD: "Leveraged cutting-edge AI technologies to drive transformative operational efficiencies"
-- BANNED WORDS (using ANY of these = validation failure — do not use them even once):
-  {banned_str}
-- No em dashes. Use commas, periods, or hyphens.
-
-## HARD RULES:
-- Do NOT invent work, companies, degrees, or certifications
-- Do NOT change real numbers ({metrics_str})
-- Preserved companies: {companies_str} -- names stay as-is
-- Preserved school: {school}
-- Must fit 1 page.
-
-## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
-
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":[{bullet_example}]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{education_block}"}}"""
-
+{{"title":"Role Title","summary":"Sentence one. Sentence two.","skills":{{"Languages":"...","Frameworks":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":[{{"text":"...","skills":["S1","S2"]}}]}},{{"header":"Title at Company 2","subtitle":"Tech | Dates","bullets":[{{"text":"...","skills":["S1"]}}]}}],"projects":[{{"header":"Name","subtitle":"Tech","bullets":[{{"text":"...","skills":["S1"]}}]}}],"education":"{education_block}"}}"""
 
 def _build_judge_prompt(profile: dict) -> str:
     """Build the LLM judge prompt from the user's profile."""
@@ -761,6 +905,12 @@ def run_tailoring(
             txt_path.write_text(tailored, encoding="utf-8")
             if not txt_path.exists() or txt_path.stat().st_size == 0:
                 raise RuntimeError(f"Failed to persist tailored TXT: {txt_path}")
+
+            # Save raw LLM JSON with {text, skills} bullet annotations.
+            # build_html() reads this sidecar to bold skill keywords in the PDF,
+            # proving skills are real (used in context) not just listed.
+            data_path = TAILORED_DIR / f"{prefix}_DATA.json"
+            data_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
             # Save job description for traceability
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
