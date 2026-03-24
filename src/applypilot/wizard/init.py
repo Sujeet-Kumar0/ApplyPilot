@@ -131,6 +131,90 @@ def _write_resume_json(data: dict) -> None:
     RESUME_JSON_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def _decompose_resume(resume_data: dict) -> None:
+    """Decompose canonical resume.json into atomic segments for variant generation."""
+    from applypilot.db.connection import get_connection
+    from applypilot.db.segments_repo import SegmentsRepo
+    from applypilot.tailoring.decomposer import decompose
+
+    user_id = resume_data.get("basics", {}).get("email", "default")
+    conn = get_connection()
+    repo = SegmentsRepo(conn, user_id=user_id)
+    repo.delete_all()
+
+    segments = decompose(resume_data)
+    repo.save_many(segments)
+
+    bullet_count = sum(1 for s in segments if s.type == "bullet")
+    console.print(f"[green]Decomposed resume into {len(segments)} segments ({bullet_count} bullets)[/green]")
+
+
+def _generate_variants_background(resume_data: dict) -> None:
+    """Generate role-specific resume variants in a background thread.
+
+    Runs after decomposition during init. Non-blocking — init continues
+    while variants are generated. Reads target roles from searches.yaml.
+    """
+    import threading
+
+    def _run():
+        try:
+            import yaml
+            from applypilot.db.connection import get_connection
+            from applypilot.db.segments_repo import SegmentsRepo
+            from applypilot.db.variants_repo import VariantsRepo
+            from applypilot.tailoring.variant_gen import VariantGenerator
+            from applypilot.llm import get_client
+            from applypilot.config import APP_DIR
+
+            searches_path = APP_DIR / "searches.yaml"
+            if not searches_path.exists():
+                return
+
+            searches = yaml.safe_load(searches_path.read_text(encoding="utf-8"))
+            queries = searches.get("queries", [])
+            if not queries:
+                return
+
+            user_id = resume_data.get("basics", {}).get("email", "default")
+            conn = get_connection()
+            seg_repo = SegmentsRepo(conn, user_id=user_id)
+            var_repo = VariantsRepo(conn, user_id=user_id)
+
+            # Skip if variants already exist
+            if var_repo.get_all():
+                return
+
+            client = get_client()
+            def llm_fn(messages, max_tokens=500):
+                return client.chat(messages=messages, max_output_tokens=max_tokens)
+
+            generator = VariantGenerator(
+                segments_repo=seg_repo, variants_repo=var_repo,
+                llm_fn=llm_fn, profile=resume_data,
+            )
+
+            # Deduplicate role names from search queries
+            seen = set()
+            for q in queries:
+                name = q["query"].lower().replace(" ", "_")
+                if name not in seen:
+                    seen.add(name)
+                    tags = q["query"].lower().split()
+                    try:
+                        generator.generate(name, tags, max_bullets=5)
+                    except Exception:
+                        pass  # Non-blocking — failures are silent
+
+            console.print(f"[dim]Background: generated {len(var_repo.get_pending())} resume variants for review[/dim]")
+        except Exception:
+            pass  # Background task — never crash init
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return thread
+
+
 def _write_profile_json(profile: dict) -> None:
     PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
     PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1162,6 +1246,9 @@ def run_wizard(resume_json: Path | None = None, resume_pdfs: list[Path] | None =
     else:
         canonical_resume, profile = canonical_result
         console.print(f"[green]Canonical resume ready:[/green] {RESUME_JSON_PATH}")
+        _decompose_resume(canonical_resume)
+        # Start variant generation in background — non-blocking, init continues
+        _variant_thread = _generate_variants_background(canonical_resume)
         console.print()
 
     # Step 3: Search config
