@@ -14,11 +14,19 @@ class PipelineContext:
     workers: int = 1
     validation_mode: str = "normal"
     sources: list[str] | None = None
+    companies: list[str] | None = None
+    urls: list[str] | None = None
+    strict_title: bool = False
+    force: bool = False
     dry_run: bool = False
-
-    # Scope: None = batch (all pending jobs), set = single job
-    job_url: str | None = None
 
     @property
     def is_single(self) -> bool:
-        return self.job_url is not None
+        return self.urls is not None and len(self.urls) == 1
+
+    @property
+    def job_url(self) -> str | None:
+        """Backward compat — stages that read ctx.job_url still work."""
+        if self.urls and len(self.urls) == 1:
+            return self.urls[0]
+        return None

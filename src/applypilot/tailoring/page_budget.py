@@ -14,16 +14,16 @@ PAGE_LINES = 55
 
 # Fixed line costs — each section type consumes a known number of lines
 _COSTS = {
-    "header": 3,           # name + title + contact + blank
-    "summary": 4,          # heading + 2-3 sentences + blank
+    "header": 3,  # name + title + contact + blank
+    "summary": 4,  # heading + 2-3 sentences + blank
     "skills_heading": 1,
-    "skill_line": 1,       # one skill group = one line
+    "skill_line": 1,  # one skill group = one line
     "exp_heading": 1,
-    "exp_entry": 2,        # company header + subtitle (dates/tech)
+    "exp_entry": 2,  # company header + subtitle (dates/tech)
     "proj_heading": 1,
-    "proj_entry": 2,       # project header + subtitle
-    "education": 3,        # heading + content + blank
-    "gap": 1,              # blank line between sections
+    "proj_entry": 2,  # project header + subtitle
+    "education": 3,  # heading + content + blank
+    "gap": 1,  # blank line between sections
 }
 
 # Recency weights — most recent role gets the most bullets

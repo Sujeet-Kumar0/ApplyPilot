@@ -35,6 +35,7 @@ def _mock_rates(monkeypatch):
 # clean_number
 # ---------------------------------------------------------------------------
 
+
 class TestCleanNumber:
     def test_strips_currency_symbols(self):
         assert clean_number("$120,000") == 120000.0
@@ -56,6 +57,7 @@ class TestCleanNumber:
 # parse_range
 # ---------------------------------------------------------------------------
 
+
 class TestParseRange:
     def test_dash_separated(self):
         assert parse_range("80000-120000") == ("80000", "120000")
@@ -73,6 +75,7 @@ class TestParseRange:
 # ---------------------------------------------------------------------------
 # Country resolution
 # ---------------------------------------------------------------------------
+
 
 class TestResolveCountry:
     def test_full_name(self):
@@ -109,6 +112,7 @@ class TestResolveCountryFromCurrency:
 # SalaryRange.from_current (simple, no PPP)
 # ---------------------------------------------------------------------------
 
+
 class TestSalaryRangeSimple:
     def test_default_multipliers(self):
         r = SalaryRange.from_current(100000)
@@ -129,6 +133,7 @@ class TestSalaryRangeSimple:
 # SalaryRange.from_current_ppp — the core PPP scenarios
 # ---------------------------------------------------------------------------
 
+
 class TestSalaryRangePPP:
     """
     PPP math: current_local / source_ppp × target_ppp = equivalent in target currency.
@@ -142,8 +147,8 @@ class TestSalaryRangePPP:
         assert r.currency == "USD"
         assert r.range_min == 140_000  # 100k × 1.4
         assert r.range_max == 200_000  # 100k × 2.0
-        assert r.expected == 170_000   # 100k × 1.7
-        assert r.warning == ""         # upward move — no warning
+        assert r.expected == 170_000  # 100k × 1.7
+        assert r.warning == ""  # upward move — no warning
 
     def test_us_to_vietnam_downward_warns(self):
         """$150k US → Vietnam. Massively cheaper economy — must warn."""
@@ -191,6 +196,7 @@ class TestSalaryRangePPP:
 # PPPResult.convert
 # ---------------------------------------------------------------------------
 
+
 class TestPPPResult:
     def test_known_country(self):
         p = PPPResult.convert(100_000, "India")
@@ -217,6 +223,7 @@ class TestPPPResult:
 # ---------------------------------------------------------------------------
 # to_usd
 # ---------------------------------------------------------------------------
+
 
 class TestToUsd:
     def test_inr_to_usd(self):

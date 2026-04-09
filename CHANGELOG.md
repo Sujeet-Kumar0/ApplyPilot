@@ -8,6 +8,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- **v2 Architecture Implementation** — Full implementation of all v2 planning doc requirements. See
+  `docs/IMPLEMENTATION_ADDENDUM-2026-04-03.md` for details.
+- **`applypilot recover`** — Reset stale in-progress jobs and clean partial artifacts (APPLY-22)
+- **`applypilot cv render`** — Generate comprehensive CV from master profile, all sections, no page limit (INIT-20)
+- **`applypilot resume refresh`** — Detect stale tailored resumes after profile edits and clear for re-tailoring (
+  INIT-23)
+- **FTS5 full-text search** — `jobs_fts` virtual table for fast keyword search across job titles, companies,
+  descriptions (RUN-04)
+- **Geographic filtering modes** — `worldwide`, `include_only`, `exclude` modes in searches.yaml (RUN-09)
+- **Remote work mode filtering** — `classify_work_mode()` and `work_mode_ok()` for remote/hybrid/onsite filtering (
+  RUN-10)
+- **Market Intelligence** — Top skills demand, locations, seniority distribution from scored jobs (ANALYZE-03)
+- **Career Health Score** — 0-10 composite metric: skill coverage + experience depth + success rate + market demand (
+  ANALYZE-04)
+- **Career Roadmap** — Prioritized skill acquisition milestones with demand percentages (ANALYZE-05)
+- **Track/Segment Comparison** — Side-by-side metrics by job source (ANALYZE-07)
+- **AI-suggested flagging** — Enrichment-generated content tracked in `meta.applypilot.ai_suggested[]` (INIT-04)
+- **Multi-language input** — Non-English resume content auto-normalized to English via LLM (INIT-06)
+- **Per-section resume review** — Interactive accept/edit/remove per resume section during init (INIT-10)
+- **Tiered tailoring** — TL0-TL3 effort levels based on fit score (INIT-22)
+- **LLM cost persistence** — Costs saved to `analytics_events` DB, survives across sessions
+- **`pipeline.cost_tracking`** — Config flag to enable/disable cost persistence
+- **BulletBankRepository** — ABC + SQLite implementation for bullet bank persistence
+- **Per-file migration system** — `db/migrations/mNNN_*.py` auto-discovered by runner
+- **ComprehensiveStorage** — Storage adapter for comprehensive tailoring engine
+- **`resume/` subpackage** — Validation and extraction extracted from `resume_json.py`
+- **Company-aware priority queue** — `PARTITION BY COALESCE(company, site)` spreads applications across employers (
+  APPLY-19)
+- **139 new tests** (565 → 704), 9 new test files covering analytics, classifiers, scoring, threading, cost tracking
+
+### Fixed
+
+- **SQLite threading crash in analytics observer** — Observer now creates thread-local DB connection
+- **`init --resume-json` overwrites existing resume** — Now merges, preserving profiles/contact/meta
+- **GitHub URL missing from HTML render** — URLs from `meta.applypilot.personal` now synced to `basics.profiles[]`
+- **`applypilot llm costs` KeyError** — Factory and CLI now use consistent `CostTracker.summary()` keys
+- **LLM costs lost on exit** — Persisted to DB via `analytics_events`
+- **`CostTracker` never wired** — Now instantiated in `LLMClient.__init__` and recorded after each call
+- **113 F821 lint warnings** — All cross-module undefined name references resolved
+- **894 total lint errors** — All fixed (auto-fix + ruff format + manual splits)
+- **Dead code in orchestrator** — Removed legacy `run_job()` (90 lines of raw SQL)
+- **All SQL leaks** — Zero `sqlite3.connect()` calls remain in business logic
+
+### Changed
+
+- `tracking/stubs.py` — Rewritten to use `TrackingRepository` (5 new methods)
+- `tracking/pipeline.py` — Rewritten to use repos instead of raw SQL
+- `tailoring/bullet_bank/bank.py` — Now accepts `BulletBankRepository` via constructor
+- `tailoring/comprehensive_engine.py` — `import sqlite3` removed, uses `ComprehensiveStorage`
+- `tailoring/state_machine.py` — `_make_bullet_bank()` helper with DI fallback
+- `discovery/jobspy/filters.py` — `_location_ok()` accepts mode param, `_load_location_config()` returns 3-tuple
+- `analytics/observer.py` — Thread-local connection, all 7 aggregator models wired
+- `analytics/aggregators/processor.py` — Routes events to market, health, roadmap, tracks aggregators
+- `pyproject.toml` — Added `[tool.ruff.lint]` config suppressing structural rules
+
  **Greenhouse ATS support** - New discovery source for 129 AI/ML startups and tech companies using Greenhouse (Scale AI, Stripe, Figma, Notion, etc.). Uses official Greenhouse Job Board API (`boards-api.greenhouse.io`) for reliable, structured data.
  **New module**: `src/applypilot/discovery/greenhouse.py` - API-based fetcher with full job descriptions, parallel execution, location filtering, and query matching
  **New config**: `src/applypilot/config/greenhouse.yaml` - 129 verified Greenhouse employers organized by category (Core AI, Infrastructure, Fintech, Healthcare, etc.)

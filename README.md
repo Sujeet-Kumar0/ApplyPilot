@@ -35,7 +35,8 @@ applypilot doctor        # verify your setup — shows what's installed and what
 applypilot resume render --format html   # render the canonical resume.json with a theme
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
-applypilot single URL    # scoped pipeline for one job URL (enrich→score→tailor→cover)
+applypilot run --url URL # scoped pipeline for one job URL (enrich→score→tailor→cover)
+applypilot run --source workday --company walmart  # targeted discovery
 applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
@@ -279,20 +280,23 @@ applypilot apply --gen --url URL       # generate prompt file for manual debuggi
 Have a specific job URL? Skip the full pipeline and target it directly:
 
 ```bash
-applypilot single "https://example.com/jobs/12345"
+applypilot run --url "https://example.com/jobs/12345"
 ```
 
-This runs a scoped pipeline (enrich → score → tailor → cover letter) for that one URL only — no other jobs in your database are touched. Once done, submit with:
+This runs a scoped pipeline (enrich → score → tailor → cover letter) for that URL only — no other jobs in your database
+are touched. Once done, submit with:
 
 ```bash
 applypilot apply --url "https://example.com/jobs/12345"
 ```
 
-If you only want the tailored resume without a cover letter:
+Multiple URLs work too:
 
 ```bash
-applypilot single "https://example.com/jobs/12345" --skip-apply
+applypilot run --url "https://example.com/jobs/1" "https://example.com/jobs/2"
 ```
+
+> **Backward compat:** `applypilot single URL` still works as an alias for `run --url URL`.
 
 ---
 
@@ -311,8 +315,13 @@ applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
-applypilot single URL                   # Scoped pipeline for one job (enrich→score→tailor→cover)
-applypilot single URL --skip-apply      # Same but skip cover letter generation
+applypilot run --url URL1 URL2          # Skip discover, run enrich→score→tailor→cover on URLs
+applypilot run --source workday,greenhouse  # Only run specific discovery sources
+applypilot run --company walmart,stripe # Filter discovery to specific companies
+applypilot run --strict-title           # Require ALL query terms in job title
+applypilot run --force                  # Re-tailor already-tailored jobs
+applypilot company add NAME URL         # Add a company's career site to the registry
+applypilot company list                 # List all companies in the registry
 applypilot apply                        # Launch auto-apply
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
@@ -328,6 +337,16 @@ applypilot analyze --text-file job.txt --resume-file resume.json
 applypilot greenhouse validate          # Validate configured Greenhouse employers
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
+applypilot recover                      # Reset stale jobs, clean partial artifacts
+applypilot recover --clean              # Also remove partial resume/cover files
+applypilot cv render --format html      # Render comprehensive CV (all sections)
+applypilot resume refresh               # Clear stale tailored resumes for re-generation
+applypilot resume refresh --force       # Force-regenerate all tailored resumes
+applypilot analytics report             # Skill gaps, market intel, career health, roadmap
+applypilot llm costs                    # Show LLM usage and cost summary
+applypilot strengthen --paste           # Paste experience text, AI extracts achievements
+applypilot strengthen --voice           # Record audio, transcribe, extract achievements
+applypilot config show                  # Show runtime configuration
 ```
 
 ---

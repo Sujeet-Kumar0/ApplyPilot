@@ -16,7 +16,6 @@ from collections import deque
 from typing import Callable
 
 from applypilot.pipeline.context import PipelineContext
-from applypilot.pipeline.stage import StageResult
 
 log = logging.getLogger(__name__)
 
@@ -40,20 +39,22 @@ class ChunkedExecutor:
         discover_fn: Callable[[PipelineContext], int],
         enrich_fn: Callable[[int], None],
         score_fn: Callable[[], None],
+            on_high_score: Callable[[list[str]], None] | None = None,
+            priority_score: int = 9,
     ) -> dict:
         """Run discover → enrich → score in overlapping chunks.
 
         Args:
             discover_fn: Discovery function. Returns total jobs discovered.
-                Must insert jobs into DB in batches of chunk_size and call
-                the on_chunk callback after each batch.
             enrich_fn: Enrichment function. Called per chunk with chunk index.
             score_fn: Scoring function. Called per chunk after enrichment.
+            on_high_score: Callback when jobs score >= priority_score. Receives list of URLs.
+            priority_score: Threshold for immediate callback (default 9).
 
         Returns:
             Summary dict with timing and chunk counts.
         """
-        results: dict = {"chunks": 0, "errors": [], "elapsed": 0.0}
+        results: dict = {"chunks": 0, "errors": [], "elapsed": 0.0, "priority_jobs": 0}
         t0 = time.time()
 
         # Queues between stages — each item is a chunk index
@@ -61,6 +62,7 @@ class ChunkedExecutor:
         score_queue: deque[int | None] = deque()
         enrich_ready = threading.Event()
         score_ready = threading.Event()
+        priority_tailored: set[str] = set()  # URLs already priority-processed
 
         chunk_count = 0
 
@@ -69,7 +71,6 @@ class ChunkedExecutor:
             nonlocal chunk_count
             try:
                 total = discover_fn(self._ctx)
-                # Signal how many chunks were produced
                 chunk_count = max((total + self._chunk_size - 1) // self._chunk_size, 1)
                 for i in range(chunk_count):
                     enrich_queue.append(i)

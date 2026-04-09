@@ -28,6 +28,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 def _get_ua() -> str:
     """Build a realistic UA from the actual installed Chrome version."""
     from applypilot.apply.chrome import _get_real_user_agent
+
     return _get_real_user_agent()
 
 
@@ -37,6 +38,7 @@ UA = _get_ua()
 
 class PageIntelligence(TypedDict, total=False):
     """Structured intelligence report from a page fetch."""
+
     url: str
     json_ld: list[dict]
     api_responses: list[dict]
@@ -51,6 +53,7 @@ class PageIntelligence(TypedDict, total=False):
 @runtime_checkable
 class PageFetcher(Protocol):
     """Protocol for page fetching backends."""
+
     def fetch(self, url: str) -> PageIntelligence: ...
 
 
@@ -81,8 +84,7 @@ class PlaywrightFetcher:
             ct = response.headers.get("content-type", "")
             rurl = response.url
             # Skip static assets — only capture potential API responses
-            if any(ext in rurl for ext in [".js", ".css", ".png", ".jpg", ".svg",
-                                           ".woff", ".ico", ".gif", ".webp"]):
+            if any(ext in rurl for ext in [".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico", ".gif", ".webp"]):
                 return
             if "json" in ct or "/api/" in rurl or "algolia" in rurl or "graphql" in rurl:
                 try:
@@ -91,15 +93,20 @@ class PlaywrightFetcher:
                         data = json.loads(body)
                     except Exception:
                         data = None
-                    captured_responses.append({
-                        "url": rurl, "status": response.status,
-                        "size": len(body), "data": data,
-                    })
+                    captured_responses.append(
+                        {
+                            "url": rurl,
+                            "status": response.status,
+                            "size": len(body),
+                            "data": data,
+                        }
+                    )
                 except Exception:
                     pass
 
         with sync_playwright() as p:
-            from applypilot.enrichment.detail import _STEALTH_INIT_SCRIPT
+            from applypilot.enrichment.browser_config import STEALTH_INIT_SCRIPT as _STEALTH_INIT_SCRIPT
+
             browser = p.chromium.launch(headless=self._headless)
             context = browser.new_context(user_agent=UA)
             context.add_init_script(_STEALTH_INIT_SCRIPT)

@@ -55,6 +55,7 @@ class TestChunkedExecutor:
 
     def test_discover_error_handled(self):
         """Discovery failure doesn't crash the pipeline."""
+
         def discover_fn(ctx):
             raise RuntimeError("network error")
 
@@ -84,6 +85,7 @@ class TestChunkedExecutor:
 
     def test_zero_jobs(self):
         """Zero discovered jobs still completes cleanly."""
+
         def discover_fn(ctx):
             return 0
 

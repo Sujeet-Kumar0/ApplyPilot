@@ -24,29 +24,66 @@ _PPP_CACHE = _CACHE_DIR / "ppp.json"
 _FX_CACHE = _CACHE_DIR / "fx.json"
 
 _PPP_MAX_AGE_SECONDS = 30 * 24 * 3600  # 30 days
-_FX_MAX_AGE_SECONDS = 24 * 3600         # 1 day
+_FX_MAX_AGE_SECONDS = 24 * 3600  # 1 day
 _REQUEST_TIMEOUT = 15
 
 # Country name/code aliases → ISO-3166 alpha-2 (for PPP lookup).
 _COUNTRY_ALIASES: dict[str, str] = {
-    "USA": "US", "United States": "US", "America": "US",
-    "UK": "GB", "United Kingdom": "GB", "England": "GB",
-    "India": "IN", "Germany": "DE", "France": "FR", "Canada": "CA",
-    "Australia": "AU", "Singapore": "SG", "Japan": "JP", "Netherlands": "NL",
-    "Ireland": "IE", "Sweden": "SE", "Switzerland": "CH", "Poland": "PL",
-    "Brazil": "BR", "Italy": "IT", "Spain": "ES", "Austria": "AT",
-    "Belgium": "BE", "Portugal": "PT", "Finland": "FI", "Norway": "NO",
-    "Denmark": "DK", "New Zealand": "NZ", "South Korea": "KR", "Korea": "KR",
-    "Mexico": "MX", "Argentina": "AR", "Chile": "CL", "Colombia": "CO",
-    "South Africa": "ZA", "UAE": "AE", "Israel": "IL", "China": "CN",
-    "Hong Kong": "HK", "Taiwan": "TW", "Czech Republic": "CZ", "Czechia": "CZ",
-    "Romania": "RO", "Hungary": "HU", "Philippines": "PH", "Vietnam": "VN",
-    "Thailand": "TH", "Indonesia": "ID", "Malaysia": "MY",
+    "USA": "US",
+    "United States": "US",
+    "America": "US",
+    "UK": "GB",
+    "United Kingdom": "GB",
+    "England": "GB",
+    "India": "IN",
+    "Germany": "DE",
+    "France": "FR",
+    "Canada": "CA",
+    "Australia": "AU",
+    "Singapore": "SG",
+    "Japan": "JP",
+    "Netherlands": "NL",
+    "Ireland": "IE",
+    "Sweden": "SE",
+    "Switzerland": "CH",
+    "Poland": "PL",
+    "Brazil": "BR",
+    "Italy": "IT",
+    "Spain": "ES",
+    "Austria": "AT",
+    "Belgium": "BE",
+    "Portugal": "PT",
+    "Finland": "FI",
+    "Norway": "NO",
+    "Denmark": "DK",
+    "New Zealand": "NZ",
+    "South Korea": "KR",
+    "Korea": "KR",
+    "Mexico": "MX",
+    "Argentina": "AR",
+    "Chile": "CL",
+    "Colombia": "CO",
+    "South Africa": "ZA",
+    "UAE": "AE",
+    "Israel": "IL",
+    "China": "CN",
+    "Hong Kong": "HK",
+    "Taiwan": "TW",
+    "Czech Republic": "CZ",
+    "Czechia": "CZ",
+    "Romania": "RO",
+    "Hungary": "HU",
+    "Philippines": "PH",
+    "Vietnam": "VN",
+    "Thailand": "TH",
+    "Indonesia": "ID",
+    "Malaysia": "MY",
 }
 
 # ---------------------------------------------------------------------------
 # Generic cache helpers
 # ---------------------------------------------------------------------------
+
 
 def _read_cache(path: Path, max_age: int) -> dict | None:
     """Return cached JSON if fresh, else None."""
@@ -75,6 +112,7 @@ def _fetch_json(url: str) -> dict | list:
 # ---------------------------------------------------------------------------
 # PPP data (World Bank)
 # ---------------------------------------------------------------------------
+
 
 def _fetch_ppp() -> dict[str, float]:
     """Fetch PPP conversion factors from World Bank. Returns {country_code: ppp_factor}."""
@@ -110,6 +148,7 @@ def get_ppp_rates() -> dict[str, float]:
 # FX data (open.er-api.com)
 # ---------------------------------------------------------------------------
 
+
 def _fetch_fx() -> dict[str, float]:
     """Fetch exchange rates vs USD. Returns {currency_code: rate_per_usd}."""
     raw = _fetch_json("https://open.er-api.com/v6/latest/USD")
@@ -136,15 +175,49 @@ def get_fx_rates() -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 _COUNTRY_CURRENCY: dict[str, str] = {
-    "US": "USD", "IN": "INR", "GB": "GBP", "DE": "EUR", "FR": "EUR",
-    "NL": "EUR", "IE": "EUR", "CA": "CAD", "AU": "AUD", "SG": "SGD",
-    "JP": "JPY", "SE": "SEK", "CH": "CHF", "PL": "PLN", "BR": "BRL",
-    "IT": "EUR", "ES": "EUR", "AT": "EUR", "BE": "EUR", "PT": "EUR",
-    "FI": "EUR", "NO": "NOK", "DK": "DKK", "NZ": "NZD", "KR": "KRW",
-    "MX": "MXN", "AR": "ARS", "CL": "CLP", "CO": "COP", "ZA": "ZAR",
-    "AE": "AED", "IL": "ILS", "CN": "CNY", "HK": "HKD", "TW": "TWD",
-    "VN": "VND", "TH": "THB", "PH": "PHP", "ID": "IDR", "MY": "MYR",
-    "RO": "RON", "HU": "HUF", "CZ": "CZK",
+    "US": "USD",
+    "IN": "INR",
+    "GB": "GBP",
+    "DE": "EUR",
+    "FR": "EUR",
+    "NL": "EUR",
+    "IE": "EUR",
+    "CA": "CAD",
+    "AU": "AUD",
+    "SG": "SGD",
+    "JP": "JPY",
+    "SE": "SEK",
+    "CH": "CHF",
+    "PL": "PLN",
+    "BR": "BRL",
+    "IT": "EUR",
+    "ES": "EUR",
+    "AT": "EUR",
+    "BE": "EUR",
+    "PT": "EUR",
+    "FI": "EUR",
+    "NO": "NOK",
+    "DK": "DKK",
+    "NZ": "NZD",
+    "KR": "KRW",
+    "MX": "MXN",
+    "AR": "ARS",
+    "CL": "CLP",
+    "CO": "COP",
+    "ZA": "ZAR",
+    "AE": "AED",
+    "IL": "ILS",
+    "CN": "CNY",
+    "HK": "HKD",
+    "TW": "TWD",
+    "VN": "VND",
+    "TH": "THB",
+    "PH": "PHP",
+    "ID": "IDR",
+    "MY": "MYR",
+    "RO": "RON",
+    "HU": "HUF",
+    "CZ": "CZK",
 }
 
 
@@ -173,6 +246,7 @@ def _resolve_country(location: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+
 def clean_number(raw: str) -> float:
     """Strip currency symbols, commas, spaces and return a float. Returns 0 on empty/invalid."""
     cleaned = re.sub(r"[^0-9.]", "", raw.strip())
@@ -195,12 +269,13 @@ def parse_range(range_str: str, fallback: float = 0) -> tuple[str, str]:
 @dataclass(frozen=True)
 class SalaryRange:
     """Derived salary range from current compensation."""
+
     expected: int
     range_min: int
     range_max: int
     currency: str
-    note: str       # explains how it was derived
-    warning: str    # non-empty if the ask is unrealistic for the target market
+    note: str  # explains how it was derived
+    warning: str  # non-empty if the ask is unrealistic for the target market
 
     @staticmethod
     def from_current(current: float, low_mult: float = 1.4, high_mult: float = 2.0) -> SalaryRange:
@@ -210,7 +285,7 @@ class SalaryRange:
             range_min=int(current * low_mult),
             range_max=int(current * high_mult),
             currency="",
-            note=f"+{int((low_mult-1)*100)}% to +{int((high_mult-1)*100)}% of current",
+            note=f"+{int((low_mult - 1) * 100)}% to +{int((high_mult - 1) * 100)}% of current",
             warning="",
         )
 
@@ -261,7 +336,7 @@ class SalaryRange:
             warning = (
                 f"⚠ Moving to a lower-cost economy ({target_country} PPP {target_ppp:.1f} "
                 f"> {source_country} PPP {source_ppp:.1f}). "
-                f"A +{int((low_mult-1)*100)}% hike = +{overshoot_pct}% more purchasing power "
+                f"A +{int((low_mult - 1) * 100)}% hike = +{overshoot_pct}% more purchasing power "
                 f"than you have now — local employers may reject this. "
                 f"Consider asking ≈{target_currency} {int(ppp_at_par):,} (PPP parity) "
                 f"to {target_currency} {int(ppp_at_par * 1.15):,} (+15% realistic max)."
@@ -275,7 +350,7 @@ class SalaryRange:
             note=(
                 f"PPP-adjusted: {current_currency} {int(current):,} → "
                 f"≈{target_currency} {int(base_local):,} equivalent, "
-                f"then +{int((low_mult-1)*100)}%–+{int((high_mult-1)*100)}%"
+                f"then +{int((low_mult - 1) * 100)}%–+{int((high_mult - 1) * 100)}%"
             ),
             warning=warning,
         )
@@ -301,6 +376,7 @@ def to_usd(amount: float, currency: str) -> float:
 @dataclass(frozen=True)
 class PPPResult:
     """PPP conversion result for a target location."""
+
     equivalent: float
     currency: str
     ppp_rate: float
@@ -312,15 +388,21 @@ class PPPResult:
         country = _resolve_country(location)
         if not country:
             return PPPResult(
-                equivalent=amount_usd, currency="USD",
-                ppp_rate=1.0, known=False, source="location not mapped",
+                equivalent=amount_usd,
+                currency="USD",
+                ppp_rate=1.0,
+                known=False,
+                source="location not mapped",
             )
         ppp_rates = get_ppp_rates()
         ppp_factor = ppp_rates.get(country)
         if ppp_factor is None:
             return PPPResult(
-                equivalent=amount_usd, currency="USD",
-                ppp_rate=1.0, known=False, source="no PPP data for country",
+                equivalent=amount_usd,
+                currency="USD",
+                ppp_rate=1.0,
+                known=False,
+                source="no PPP data for country",
             )
         currency = _COUNTRY_CURRENCY.get(country, "USD")
         return PPPResult(

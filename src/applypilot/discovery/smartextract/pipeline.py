@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -35,14 +34,18 @@ def _exception_summary(exc: Exception) -> str:
 
 
 def _store_jobs_filtered(
-    conn: sqlite3.Connection,
     jobs: list[dict],
     site: str,
     strategy: str,
     accept_locs: list[str],
     reject_locs: list[str],
+        conn=None,
 ) -> tuple[int, int]:
     """Store jobs with location filtering. Returns (new, existing)."""
+    from applypilot.bootstrap import get_app
+    from applypilot.db.dto import JobDTO
+
+    job_repo = get_app().container.job_repo
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
@@ -55,20 +58,25 @@ def _store_jobs_filtered(
         if not location_ok(job.get("location"), accept_locs, reject_locs):
             filtered += 1
             continue
-        try:
-            conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
-            )
-            new += 1
-        except sqlite3.IntegrityError:
+        if job_repo.get_by_url(url):
             existing += 1
+            continue
+        job_repo.upsert(
+            JobDTO(
+                url=url,
+                title=job.get("title"),
+                salary=job.get("salary"),
+                description=job.get("description"),
+                location=job.get("location"),
+                site=site,
+                strategy=strategy,
+                discovered_at=now,
+            )
+        )
+        new += 1
 
     if filtered:
         log.info("Filtered %d jobs (wrong location)", filtered)
-    conn.commit()
     return new, existing
 
 
@@ -103,8 +111,7 @@ class SiteExtractionPipeline:
         # Step 1: Collect intelligence
         # force_headful skips headless entirely (for SPA sites like Naukri)
         use_headless = not force_headful
-        log.debug("[smartextract] %s — force_headful: %s, starting headless: %s",
-                  name, force_headful, use_headless)
+        log.debug("[smartextract] %s — force_headful: %s, starting headless: %s", name, force_headful, use_headless)
 
         log.info("[1] Collecting page intelligence...")
         fetcher = PlaywrightFetcher(headless=use_headless)
@@ -116,27 +123,32 @@ class SiteExtractionPipeline:
 
         log.info(
             "Done | JSON-LD: %d | API: %d | testids: %d | cards: %d",
-            len(intel["json_ld"]), len(intel["api_responses"]),
-            len(intel["data_testids"]), len(intel["card_candidates"]),
+            len(intel["json_ld"]),
+            len(intel["api_responses"]),
+            len(intel["data_testids"]),
+            len(intel["card_candidates"]),
         )
 
         # Headful retry if page content is too small (and not force_headful, which already used headful)
         full_html = intel.get("full_html", "")
         cleaned_check = clean_page_html(full_html) if full_html else ""
         is_captcha = detect_captcha(full_html)
-        log.debug("[smartextract] %s — CAPTCHA detected: %s, force_headful: %s",
-                  name, is_captcha, force_headful)
+        log.debug("[smartextract] %s — CAPTCHA detected: %s, force_headful: %s", name, is_captcha, force_headful)
 
-        if (not force_headful and len(cleaned_check) < MIN_CONTENT_THRESHOLD
-                and full_html and not is_captcha and not no_headful):
+        if (
+                not force_headful
+                and len(cleaned_check) < MIN_CONTENT_THRESHOLD
+                and full_html
+                and not is_captcha
+                and not no_headful
+        ):
             log.info("Cleaned HTML only %s chars — retrying headful...", f"{len(cleaned_check):,}")
             try:
                 fetcher_headful = PlaywrightFetcher(headless=False)
                 intel = fetcher_headful.fetch(url)
             except Exception as e:
                 log.warning("Headful retry failed (%s)", _exception_summary(e))
-            log.info("Headful done | JSON-LD: %d | API: %d",
-                     len(intel["json_ld"]), len(intel["api_responses"]))
+            log.info("Headful done | JSON-LD: %d | API: %d", len(intel["json_ld"]), len(intel["api_responses"]))
         elif is_captcha:
             log.warning("CAPTCHA/rate-limit detected — skipping headful retry")
 
@@ -183,14 +195,26 @@ class SiteExtractionPipeline:
         urls = sum(1 for j in jobs if j.get("url"))
         salaries = sum(1 for j in jobs if j.get("salary"))
         descs = sum(1 for j in jobs if j.get("description"))
-        log.info("RESULT: %s — %d jobs, %d titles, %d urls, %d salaries, %d descriptions",
-                 status, total, titles, urls, salaries, descs)
+        log.info(
+            "RESULT: %s — %d jobs, %d titles, %d urls, %d salaries, %d descriptions",
+            status,
+            total,
+            titles,
+            urls,
+            salaries,
+            descs,
+        )
         log.debug("[smartextract] %s — stored: pending DB write", name)
 
         return {
-            "name": name, "status": status, "strategy": strategy,
-            "total": total, "titles": titles, "plan": plan,
-            "jobs": jobs, "sample": jobs[:5],
+            "name": name,
+            "status": status,
+            "strategy": strategy,
+            "total": total,
+            "titles": titles,
+            "plan": plan,
+            "jobs": jobs,
+            "sample": jobs[:5],
         }
 
 
@@ -199,7 +223,7 @@ def run_all(
     accept_locs: list[str],
     reject_locs: list[str],
     llm_client,
-    conn: sqlite3.Connection,
+        conn=None,
     workers: int = 1,
 ) -> dict:
     """Run smart extract on all targets.
@@ -211,11 +235,14 @@ def run_all(
     workers defaults to os.cpu_count() when > 1 is requested.
     """
     import os
-    from applypilot.database import get_stats
+    from applypilot.bootstrap import get_app
 
-    pre_stats = get_stats(conn)
-    log.info("Database: %d jobs already stored, %d pending detail scrape",
-             pre_stats["total"], pre_stats["pending_detail"])
+    counts = get_app().container.job_repo.get_pipeline_counts()
+    log.info(
+        "Database: %d jobs already stored, %d pending detail scrape",
+        counts["total"],
+        counts["total"] - counts["with_desc"],
+    )
 
     # Group targets by site name — each site gets one thread
     site_groups: dict[str, list[dict]] = {}
@@ -231,9 +258,7 @@ def run_all(
         nonlocal total_new, total_existing
         jobs = r.get("jobs", [])
         if jobs:
-            new, existing = _store_jobs_filtered(
-                conn, jobs, target["name"], r.get("strategy", "?"), accept_locs, reject_locs
-            )
+            new, existing = _store_jobs_filtered(jobs, target["name"], r.get("strategy", "?"), accept_locs, reject_locs)
             total_new += new
             total_existing += existing
             log.info("DB: +%d new, %d already existed", new, existing)
@@ -248,8 +273,10 @@ def run_all(
                 label = f"{target['name']} [{target['query']}]"
             log.info("[%s %d/%d] %s", target["name"], i + 1, len(site_targets), label)
             r = pipeline.run_one_site(
-                target["name"], target["url"],
-                target.get("no_headful", False), target.get("force_headful", False),
+                target["name"],
+                target["url"],
+                target.get("no_headful", False),
+                target.get("force_headful", False),
             )
             site_results.append((r, target))
         return site_results
@@ -261,10 +288,7 @@ def run_all(
         max_workers = min(os.cpu_count() or 4, len(unique_sites))
         log.info("Parallel mode: %d unique sites, %d workers", len(unique_sites), max_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_site = {
-                pool.submit(_run_site_group, site_targets): site_targets
-                for site_targets in unique_sites
-            }
+            future_to_site = {pool.submit(_run_site_group, site_targets): site_targets for site_targets in unique_sites}
             for future in as_completed(future_to_site):
                 for r, target in future.result():
                     results.append(r)
@@ -288,5 +312,4 @@ def run_all(
     passed = sum(1 for r in results if r["status"] == "PASS")
     log.info("%d/%d PASS", passed, len(results))
 
-    return {"total_new": total_new, "total_existing": total_existing,
-            "passed": passed, "total": len(results)}
+    return {"total_new": total_new, "total_existing": total_existing, "passed": passed, "total": len(results)}

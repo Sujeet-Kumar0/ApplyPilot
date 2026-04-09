@@ -20,10 +20,12 @@ log = logging.getLogger(__name__)
 @runtime_checkable
 class LLMClient(Protocol):
     """Minimal protocol for LLM interaction — matches applypilot.llm.LLMClient."""
+
     def chat(self, messages: list[dict], **kwargs) -> str: ...
 
 
 # -- Strategy briefing (lightweight, no raw DOM) --
+
 
 def format_strategy_briefing(intel: dict) -> str:
     """Build a concise briefing for the LLM strategy selection prompt."""
@@ -51,7 +53,9 @@ def format_strategy_briefing(intel: dict) -> str:
         sections.append(f"\nAPI RESPONSES INTERCEPTED: {len(intel['api_responses'])} calls")
         for resp in intel["api_responses"]:
             sections.append(f"\n  URL: {resp['url']}")
-            sections.append(f"  Status: {resp['status']} | Size: {resp['size']:,} chars | Type: {resp.get('type', '?')}")
+            sections.append(
+                f"  Status: {resp['status']} | Size: {resp['size']:,} chars | Type: {resp.get('type', '?')}"
+            )
             if "first_item_keys" in resp:
                 sections.append(f"  Item keys: {resp['first_item_keys']}")
                 sections.append(f"  Sample: {json.dumps(resp.get('first_item_sample', {}), indent=2)[:1000]}")
@@ -69,7 +73,9 @@ def format_strategy_briefing(intel: dict) -> str:
                             if "count" in sv:
                                 sections.append(f"    .{arr_name}[0].{sub_name}: array of {sv['count']} items")
                                 sections.append(f"      Item keys: {sv['first_item_keys']}")
-                                sections.append(f"      Sample: {json.dumps(sv.get('first_item_sample', {}), indent=2)[:1500]}")
+                                sections.append(
+                                    f"      Sample: {json.dumps(sv.get('first_item_sample', {}), indent=2)[:1500]}"
+                                )
                             elif "keys" in sv:
                                 sections.append(f"    .{arr_name}[0].{sub_name}: object with keys {sv['keys']}")
                                 sections.append(f"      Sample: {json.dumps(sv.get('sample', {}), indent=2)[:1500]}")
@@ -158,16 +164,24 @@ class StrategyPlanner:
         briefing = format_strategy_briefing(intel)
         log.debug("[smartextract] %s — strategy briefing: %d chars", site_name, len(briefing))
 
-        prompt = STRATEGY_PROMPT.format(briefing=briefing)
+        # Security: instructions in system message, untrusted page data in user message
+        system_msg = STRATEGY_PROMPT.replace("\n\nINTELLIGENCE BRIEFING:\n{briefing}", "")
         t0 = time.time()
-        raw = self._client.chat([{"role": "user", "content": prompt}], max_output_tokens=4096)
+        raw = self._client.chat(
+            [
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": f"INTELLIGENCE BRIEFING:\n{briefing}"},
+            ],
+            max_output_tokens=4096,
+        )
         elapsed = time.time() - t0
 
         plan = extract_json(raw)
         strategy = plan.get("strategy", "?")
         confidence = plan.get("reasoning", "?")
-        log.debug("[smartextract] %s — LLM strategy: %s, confidence: %s (%.1fs)",
-                  site_name, strategy, confidence, elapsed)
+        log.debug(
+            "[smartextract] %s — LLM strategy: %s, confidence: %s (%.1fs)", site_name, strategy, confidence, elapsed
+        )
         return plan
 
 
@@ -217,17 +231,34 @@ def judge_api_responses(api_responses: list[dict], llm_client: LLMClient) -> lis
         # Strip non-printable / high-codepoint chars that trigger Gemini safety blocks
         sample = "".join(c for c in sample if c.isprintable() and ord(c) < 0x10000)
 
-        prompt = _JUDGE_PROMPT.format(
-            url=resp.get("url", "?")[:200],
-            status=resp.get("status", "?"),
-            size=resp.get("size", "?"),
-            type=resp_type,
-            fields=fields,
-            sample=sample or "n/a",
+        # Security: instructions in system message, untrusted API data in user message
+        system_prompt = (
+            "You are filtering intercepted API responses from a job listings website.\n"
+            "Decide if this API response contains actual job listing data (titles, companies, locations, etc).\n"
+            "Answer in under 10 words. Return ONLY valid JSON:\n"
+            '{"relevant": true, "reason": "job objects with title/company"}\n'
+            "or\n"
+            '{"relevant": false, "reason": "auth endpoint"}\n'
+            "No explanation, no markdown, no thinking."
+        )
+        user_content = (
+            f"API Response Summary:\n"
+            f"  URL: {resp.get('url', '?')[:200]}\n"
+            f"  Status: {resp.get('status', '?')}\n"
+            f"  Size: {resp.get('size', '?')} chars\n"
+            f"  Type: {resp_type}\n"
+            f"  Keys/Fields: {fields}\n"
+            f"  Sample: {sample or 'n/a'}"
         )
 
         try:
-            raw = llm_client.chat([{"role": "user", "content": prompt}], max_output_tokens=1024)
+            raw = llm_client.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                max_output_tokens=1024,
+            )
             verdict = extract_json(raw)
             is_relevant = verdict.get("relevant", False)
             reason = verdict.get("reason", "?")

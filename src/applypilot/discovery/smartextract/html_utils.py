@@ -10,8 +10,18 @@ from bs4 import BeautifulSoup
 
 # Attribute allowlist — keeps only semantically meaningful attrs for LLM
 _ALLOWED_ATTRS = {
-    "id", "href", "data-testid", "data-id", "data-type", "data-slug",
-    "role", "aria-label", "aria-labelledby", "type", "name", "for",
+    "id",
+    "href",
+    "data-testid",
+    "data-id",
+    "data-type",
+    "data-slug",
+    "role",
+    "aria-label",
+    "aria-labelledby",
+    "type",
+    "name",
+    "for",
 }
 _ALLOWED_PREFIXES = ("data-", "aria-")
 
@@ -30,8 +40,13 @@ _UTILITY_CLASS_RE = re.compile(
 
 # CAPTCHA/bot-detection signals — centralized for easy extension
 CAPTCHA_SIGNALS = [
-    "captcha", "are you a human", "verify you", "unusual requests",
-    "access denied", "please verify", "bot detection",
+    "captcha",
+    "are you a human",
+    "verify you",
+    "unusual requests",
+    "access denied",
+    "please verify",
+    "bot detection",
 ]
 
 # Minimum cleaned HTML size before triggering headful retry
@@ -70,8 +85,7 @@ def clean_page_html(html: str, max_chars: int = 150_000) -> str:
         soup = BeautifulSoup(str(main), "html.parser")
 
     # Remove non-content elements
-    for tag in soup.find_all(["script", "style", "svg", "noscript", "iframe",
-                              "link", "meta", "head", "footer", "nav"]):
+    for tag in soup.find_all(["script", "style", "svg", "noscript", "iframe", "link", "meta", "head", "footer", "nav"]):
         tag.decompose()
 
     # Strip noisy attributes

@@ -6,7 +6,6 @@ New extractors (e.g. __NEXT_DATA__) can be added without modifying existing code
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Protocol, runtime_checkable
@@ -22,6 +21,7 @@ log = logging.getLogger(__name__)
 @runtime_checkable
 class Extractor(Protocol):
     """Protocol for job data extractors."""
+
     def extract(self, intel: dict, plan: dict) -> list[dict]: ...
 
 
@@ -44,8 +44,7 @@ class JsonLdExtractor:
             jobs.append(job)
         log.debug("[smartextract] extractor: json_ld, jobs found: %d", len(jobs))
         if jobs:
-            log.debug("[smartextract] sample: %s @ %s",
-                      (jobs[0].get("title") or "?")[:40], jobs[0].get("company", "?"))
+            log.debug("[smartextract] sample: %s @ %s", (jobs[0].get("title") or "?")[:40], jobs[0].get("company", "?"))
         return jobs
 
 
@@ -87,8 +86,7 @@ class ApiResponseExtractor:
 
         log.debug("[smartextract] extractor: api_response, jobs found: %d", len(jobs))
         if jobs:
-            log.debug("[smartextract] sample: %s @ %s",
-                      (jobs[0].get("title") or "?")[:40], jobs[0].get("company", "?"))
+            log.debug("[smartextract] sample: %s @ %s", (jobs[0].get("title") or "?")[:40], jobs[0].get("company", "?"))
         return jobs
 
 
@@ -146,11 +144,18 @@ class CssSelectorExtractor:
         cleaned = clean_page_html(full_html)
         log.info("Page HTML: %s -> %s chars", f"{len(full_html):,}", f"{len(cleaned):,}")
 
-        prompt = _FULL_PAGE_SELECTOR_PROMPT.format(page_html=cleaned)
+        prompt = _FULL_PAGE_SELECTOR_PROMPT.replace("\n\nPAGE HTML:\n{page_html}", "")
 
         try:
             t0 = time.time()
-            raw = self._client.chat([{"role": "user", "content": prompt}], max_output_tokens=4096)
+            # Security: instructions in system message, untrusted HTML in user message
+            raw = self._client.chat(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": cleaned},
+                ],
+                max_output_tokens=4096,
+            )
             elapsed = time.time() - t0
         except Exception as e:
             log.error("LLM_ERROR in Phase 2: %s", e)
@@ -204,6 +209,5 @@ class CssSelectorExtractor:
 
         log.debug("[smartextract] extractor: css_selectors, jobs found: %d", len(jobs))
         if jobs:
-            log.debug("[smartextract] sample: %s @ %s",
-                      (jobs[0].get("title") or "?")[:40], jobs[0].get("company", "?"))
+            log.debug("[smartextract] sample: %s @ %s", (jobs[0].get("title") or "?")[:40], jobs[0].get("company", "?"))
         return jobs

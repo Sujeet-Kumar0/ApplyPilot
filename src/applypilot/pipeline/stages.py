@@ -1,4 +1,9 @@
-"""Concrete pipeline stages — thin wrappers around existing modules."""
+"""Concrete pipeline stages — wired through services via bootstrap.App.
+
+Each stage delegates to the appropriate service method. Legacy modules
+are still called under the hood (services wrap them), but the pipeline
+no longer imports them directly.
+"""
 
 from __future__ import annotations
 
@@ -11,25 +16,47 @@ from applypilot.pipeline.stage import StageResult
 log = logging.getLogger(__name__)
 
 
+def _app():
+    """Lazy import to avoid circular deps at module load time."""
+    from applypilot.bootstrap import get_app
+
+    return get_app()
+
+
+def _emit(stage: str, event_type: str, detail: dict | None = None) -> None:
+    """Emit an analytics event for a pipeline stage transition."""
+    try:
+        import json
+        from applypilot.analytics.events import emit
+
+        app = _app()
+        emit(stage, event_type, json.dumps(detail or {}), app.container.analytics_repo)
+    except Exception:
+        pass  # Analytics never blocks the pipeline
+
+
 class DiscoverStage:
     name = "discover"
     description = "Job discovery (JobSpy + Workday + smart extract + HN)"
 
     def run(self, ctx: PipelineContext) -> StageResult:
-        if ctx.is_single:
+        if ctx.urls:
             return StageResult(stage=self.name, status="skipped")
+        _emit(self.name, "stage_started")
         t0 = time.time()
-        stats: dict = {}
-        for source, runner in _DISCOVERY_RUNNERS.items():
-            try:
-                runner(ctx)
-                stats[source] = "ok"
-            except Exception as e:
-                log.error("%s failed: %s", source, e)
-                stats[source] = f"error: {e}"
-        errors = [k for k, v in stats.items() if isinstance(v, str) and v.startswith("error")]
-        status = "error" if len(errors) == len(stats) else "partial" if errors else "ok"
-        return StageResult(stage=self.name, status=status, elapsed=time.time() - t0, detail=stats)
+        result = _app().job_svc.run_discovery(
+            workers=ctx.workers,
+            sources=ctx.sources,
+            companies=ctx.companies,
+            strict_title=ctx.strict_title,
+        )
+        status = "ok" if result.success else "error"
+        if result.data:
+            errors = [k for k, v in result.data.items() if str(v).startswith("error")]
+            if errors and len(errors) < len(result.data):
+                status = "partial"
+        _emit(self.name, "stage_completed", {"status": status, "elapsed": time.time() - t0})
+        return StageResult(stage=self.name, status=status, elapsed=time.time() - t0, detail=result.data)
 
 
 class EnrichStage:
@@ -37,14 +64,12 @@ class EnrichStage:
     description = "Detail enrichment (full descriptions + apply URLs)"
 
     def run(self, ctx: PipelineContext) -> StageResult:
+        _emit(self.name, "stage_started")
         t0 = time.time()
-        try:
-            from applypilot.enrichment.detail import run_enrichment
-            run_enrichment(workers=ctx.workers, job_url=ctx.job_url)
-            return StageResult(stage=self.name, elapsed=time.time() - t0)
-        except Exception as e:
-            log.error("Enrichment failed: %s", e)
-            return StageResult(stage=self.name, status=f"error: {e}", elapsed=time.time() - t0)
+        result = _app().job_svc.run_enrichment(workers=ctx.workers, job_url=ctx.job_url)
+        status = "ok" if result.success else f"error: {result.error}"
+        _emit(self.name, "stage_completed", {"status": status, "elapsed": time.time() - t0})
+        return StageResult(stage=self.name, status=status, elapsed=time.time() - t0)
 
 
 class ScoreStage:
@@ -52,14 +77,12 @@ class ScoreStage:
     description = "LLM scoring (fit 1-10)"
 
     def run(self, ctx: PipelineContext) -> StageResult:
+        _emit(self.name, "stage_started")
         t0 = time.time()
-        try:
-            from applypilot.scoring.scorer import run_scoring
-            run_scoring(job_url=ctx.job_url)
-            return StageResult(stage=self.name, elapsed=time.time() - t0)
-        except Exception as e:
-            log.exception("Scoring failed: %s", e)
-            return StageResult(stage=self.name, status=f"error: {e}", elapsed=time.time() - t0)
+        result = _app().scoring_svc.score_jobs(job_url=ctx.job_url)
+        status = "ok" if result.success else f"error: {result.error}"
+        _emit(self.name, "stage_completed", {"status": status, "elapsed": time.time() - t0})
+        return StageResult(stage=self.name, status=status, elapsed=time.time() - t0)
 
 
 class TailorStage:
@@ -67,15 +90,18 @@ class TailorStage:
     description = "Resume tailoring (LLM + validation)"
 
     def run(self, ctx: PipelineContext) -> StageResult:
+        _emit(self.name, "stage_started")
         t0 = time.time()
-        try:
-            from applypilot.scoring.tailor import run_tailoring
-            run_tailoring(min_score=ctx.min_score, limit=ctx.limit,
-                          validation_mode=ctx.validation_mode, target_url=ctx.job_url)
-            return StageResult(stage=self.name, elapsed=time.time() - t0)
-        except Exception as e:
-            log.exception("Tailoring failed: %s", e)
-            return StageResult(stage=self.name, status=f"error: {e}", elapsed=time.time() - t0)
+        result = _app().resume_svc.run_tailoring(
+            min_score=ctx.min_score,
+            limit=ctx.limit,
+            validation_mode=ctx.validation_mode,
+            target_url=ctx.job_url,
+            force=ctx.force,
+        )
+        status = "ok" if result.success else f"error: {result.error}"
+        _emit(self.name, "stage_completed", {"status": status, "elapsed": time.time() - t0})
+        return StageResult(stage=self.name, status=status, elapsed=time.time() - t0)
 
 
 class CoverStage:
@@ -83,20 +109,30 @@ class CoverStage:
     description = "Cover letter generation"
 
     def run(self, ctx: PipelineContext) -> StageResult:
-        t0 = time.time()
+        # Respect cover_letter.enabled from profile.json tailoring_config
         try:
-            from applypilot.scoring.cover_letter import run_cover_letters
-            kwargs = {"min_score": ctx.min_score, "limit": ctx.limit,
-                      "validation_mode": ctx.validation_mode}
-            # job_url only supported in single-job mode — upstream hasn't added it yet
-            import inspect
-            if "job_url" in inspect.signature(run_cover_letters).parameters:
-                kwargs["job_url"] = ctx.job_url
-            run_cover_letters(**kwargs)
-            return StageResult(stage=self.name, elapsed=time.time() - t0)
-        except Exception as e:
-            log.exception("Cover letter failed: %s", e)
-            return StageResult(stage=self.name, status=f"error: {e}", elapsed=time.time() - t0)
+            from applypilot.config import load_profile
+
+            profile = load_profile()
+            enabled = profile.get("tailoring_config", {}).get("cover_letter", {}).get("enabled", True)
+            if not enabled:
+                _emit(self.name, "stage_skipped", {"reason": "cover_letter.enabled=false"})
+                log.info("Cover letter stage skipped (cover_letter.enabled=false in profile.json)")
+                return StageResult(stage=self.name, status="skipped")
+        except Exception:
+            pass  # If profile can't be loaded, proceed normally
+
+        _emit(self.name, "stage_started")
+        t0 = time.time()
+        result = _app().resume_svc.run_cover_letters(
+            min_score=ctx.min_score,
+            limit=ctx.limit,
+            validation_mode=ctx.validation_mode,
+            job_url=ctx.job_url,
+        )
+        status = "ok" if result.success else f"error: {result.error}"
+        _emit(self.name, "stage_completed", {"status": status, "elapsed": time.time() - t0})
+        return StageResult(stage=self.name, status=status, elapsed=time.time() - t0)
 
 
 class PdfStage:
@@ -104,14 +140,12 @@ class PdfStage:
     description = "PDF conversion (tailored resumes + cover letters)"
 
     def run(self, ctx: PipelineContext) -> StageResult:
+        _emit(self.name, "stage_started")
         t0 = time.time()
-        try:
-            from applypilot.scoring.pdf import batch_convert
-            batch_convert()
-            return StageResult(stage=self.name, elapsed=time.time() - t0)
-        except Exception as e:
-            log.error("PDF conversion failed: %s", e)
-            return StageResult(stage=self.name, status=f"error: {e}", elapsed=time.time() - t0)
+        result = _app().resume_svc.run_pdf_conversion()
+        status = "ok" if result.success else f"error: {result.error}"
+        _emit(self.name, "stage_completed", {"status": status, "elapsed": time.time() - t0})
+        return StageResult(stage=self.name, status=status, elapsed=time.time() - t0)
 
 
 STAGES: dict[str, object] = {
@@ -121,33 +155,4 @@ STAGES: dict[str, object] = {
     "tailor": TailorStage(),
     "cover": CoverStage(),
     "pdf": PdfStage(),
-}
-
-
-def _run_jobspy(ctx: PipelineContext) -> None:
-    from applypilot.discovery.jobspy import run_discovery
-    run_discovery(sites_override=ctx.sources)
-
-def _run_workday(ctx: PipelineContext) -> None:
-    from applypilot.discovery.workday import run_workday_discovery
-    run_workday_discovery(workers=ctx.workers)
-
-def _run_smartextract(ctx: PipelineContext) -> None:
-    from applypilot.discovery.smartextract import run_smart_extract
-    run_smart_extract(workers=ctx.workers)
-
-def _run_hackernews(ctx: PipelineContext) -> None:
-    from applypilot.discovery.hackernews import run_hn_discovery
-    run_hn_discovery()
-
-def _run_greenhouse(ctx: PipelineContext) -> None:
-    from applypilot.discovery.greenhouse import search_all
-    search_all("", workers=ctx.workers)
-
-_DISCOVERY_RUNNERS: dict[str, object] = {
-    "jobspy": _run_jobspy,
-    "workday": _run_workday,
-    "smartextract": _run_smartextract,
-    "hackernews": _run_hackernews,
-    "greenhouse": _run_greenhouse,
 }

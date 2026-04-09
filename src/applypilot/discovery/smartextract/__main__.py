@@ -9,8 +9,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run SmartExtract discovery")
-    parser.add_argument("--workers", "-w", type=int, default=os.cpu_count(),
-                        help=f"Parallel site workers (default: cpu count = {os.cpu_count()})")
+    parser.add_argument(
+        "--workers",
+        "-w",
+        type=int,
+        default=os.cpu_count(),
+        help=f"Parallel site workers (default: cpu count = {os.cpu_count()})",
+    )
     parser.add_argument("--debug", "-d", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
@@ -18,6 +23,7 @@ def main() -> None:
         logging.getLogger("applypilot").setLevel(logging.DEBUG)
 
     from applypilot.discovery.smartextract import run_smart_extract
+
     result = run_smart_extract(workers=args.workers)
     print(f"\nDone: {result}")
 

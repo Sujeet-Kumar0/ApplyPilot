@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from applypilot.discovery.smartextract import extract_json
-from applypilot.resume_json import validate_resume_json
+from applypilot.resume.validation import validate_resume_json
 
 log = logging.getLogger(__name__)
 
@@ -75,9 +75,14 @@ def merge_resume_jsons(documents: list[dict]) -> dict:
     merged = json.loads(json.dumps(documents[0]))
 
     _ARRAY_DEDUP_KEYS = {
-        "work": "name", "education": "institution", "skills": "name",
-        "projects": "name", "certificates": "name", "publications": "name",
-        "volunteer": "organization", "languages": "language",
+        "work": "name",
+        "education": "institution",
+        "skills": "name",
+        "projects": "name",
+        "certificates": "name",
+        "publications": "name",
+        "volunteer": "organization",
+        "languages": "language",
     }
 
     for doc in documents[1:]:

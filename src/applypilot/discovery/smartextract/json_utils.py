@@ -7,6 +7,7 @@ Extracted from the monolith to avoid circular imports and enable reuse.
 import json
 import re
 
+
 def extract_json(text: str) -> dict:
     """Extract JSON from LLM response, handling think tags and code fences."""
     # Strip <think>...</think> blocks (reasoning models like DeepSeek)

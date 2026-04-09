@@ -18,9 +18,11 @@ def test_run_command_forwards_default_limit(monkeypatch) -> None:
     @classmethod
     def _fake_batch(cls, **kwargs):
         captured.update(kwargs)
+
         class _Fake:
             def execute(self):
                 return {"stages": [], "errors": {}, "elapsed": 0.0}
+
         return _Fake()
 
     monkeypatch.setattr(pipeline_mod.Pipeline, "batch", _fake_batch)
@@ -40,9 +42,11 @@ def test_run_command_forwards_explicit_limit(monkeypatch) -> None:
     @classmethod
     def _fake_batch(cls, **kwargs):
         captured.update(kwargs)
+
         class _Fake:
             def execute(self):
                 return {"stages": [], "errors": {}, "elapsed": 0.0}
+
         return _Fake()
 
     monkeypatch.setattr(pipeline_mod.Pipeline, "batch", _fake_batch)

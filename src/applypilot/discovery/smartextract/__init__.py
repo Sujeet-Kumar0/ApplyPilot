@@ -10,13 +10,13 @@ Public API — maintains backward compatibility with all external callers:
 import logging
 
 from applypilot import config as _app_config
-from applypilot.database import init_db
 from applypilot.llm import get_client
 
 # Re-export shared utilities for backward compat
 from applypilot.discovery.smartextract.json_utils import extract_json, resolve_json_path  # noqa: F401
 from applypilot.discovery.smartextract.config import build_scrape_targets, load_sites  # noqa: F401
 from applypilot.discovery.smartextract.pipeline import run_all
+
 # Re-export internals that tests monkeypatch (backward compat for test_security_logging.py)
 from applypilot.discovery.smartextract.fetcher import PlaywrightFetcher, PageIntelligence  # noqa: F401
 from applypilot.discovery.smartextract.strategy import format_strategy_briefing  # noqa: F401
@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 # These module-level functions mirror the old monolith API so tests that
 # monkeypatch smartextract.collect_page_intelligence etc. still work.
 
+
 def collect_page_intelligence(url: str, headless: bool = True) -> PageIntelligence:
     """Backward-compat wrapper around PlaywrightFetcher.fetch()."""
     return PlaywrightFetcher(headless=headless).fetch(url)
@@ -37,6 +38,7 @@ def collect_page_intelligence(url: str, headless: bool = True) -> PageIntelligen
 def ask_llm(prompt: str) -> tuple[str, float, dict]:
     """Backward-compat wrapper: send prompt to LLM."""
     import time
+
     client = get_client()
     t0 = time.time()
     text = client.chat([{"role": "user", "content": prompt}], max_output_tokens=4096)
@@ -69,8 +71,10 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
 
     log.info(
         "Done | JSON-LD: %d | API: %d | testids: %d | cards: %d",
-        len(intel["json_ld"]), len(intel["api_responses"]),
-        len(intel["data_testids"]), len(intel["card_candidates"]),
+        len(intel["json_ld"]),
+        len(intel["api_responses"]),
+        len(intel["data_testids"]),
+        len(intel["card_candidates"]),
     )
 
     # Headful retry
@@ -91,7 +95,7 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
     log.info("[2] Phase 1: Strategy selection (%s chars briefing)", f"{len(briefing):,}")
 
     try:
-        raw, elapsed, meta = ask_llm(f"strategy prompt placeholder")
+        raw, elapsed, meta = ask_llm("strategy prompt placeholder")
     except Exception as e:
         log.error("LLM_ERROR (%s)", e.__class__.__name__)
         return {"name": name, "status": "LLM_ERROR", "error": str(e)}
@@ -112,9 +116,11 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
             jobs = execute_json_ld(intel, plan)
         elif strategy == "api_response":
             from applypilot.discovery.smartextract.extractors import ApiResponseExtractor
+
             jobs = ApiResponseExtractor().extract(intel, plan)
         elif strategy == "css_selectors":
             from applypilot.discovery.smartextract.extractors import CssSelectorExtractor
+
             jobs = CssSelectorExtractor(get_client()).extract(intel, plan)
         else:
             jobs = []
@@ -127,13 +133,22 @@ def _run_one_site(name: str, url: str, no_headful: bool = False) -> dict:
     status = "PASS" if total > 0 and titles / max(total, 1) >= 0.8 else "FAIL" if total == 0 else "PARTIAL"
     log.info("RESULT: %s — %d jobs, %d titles", status, total, titles)
 
-    return {"name": name, "status": status, "strategy": strategy, "total": total,
-            "titles": titles, "plan": plan, "jobs": jobs, "sample": jobs[:5]}
+    return {
+        "name": name,
+        "status": status,
+        "strategy": strategy,
+        "total": total,
+        "titles": titles,
+        "plan": plan,
+        "jobs": jobs,
+        "sample": jobs[:5],
+    }
 
 
 def run_smart_extract(
     sites: list[dict] | None = None,
     workers: int = 0,
+        employer_keys: list[str] | None = None,
 ) -> dict:
     """Main entry point for AI-powered smart extraction.
 
@@ -150,6 +165,7 @@ def run_smart_extract(
         Dict with stats: total_new, total_existing, passed, total.
     """
     import os
+
     # SmartExtract is safe to parallelize — run_all groups by site, so each
     # thread handles one unique domain sequentially. Use at least CPU count,
     # but respect caller if they explicitly request more.
@@ -157,6 +173,7 @@ def run_smart_extract(
     workers = max(workers, cpu_count)
     search_cfg = _app_config.load_search_config()
     from applypilot.discovery.smartextract.config import load_location_filter
+
     accept_locs, reject_locs = load_location_filter(search_cfg)
 
     targets = build_scrape_targets(sites=sites, search_cfg=search_cfg)
@@ -165,16 +182,26 @@ def run_smart_extract(
         log.warning("No scrape targets configured. Create config/sites.yaml and searches.yaml.")
         return {"total_new": 0, "total_existing": 0, "passed": 0, "total": 0}
 
+    # Filter targets by registry-mapped site names
+    if employer_keys is not None:
+        targets = [t for t in targets if t["name"] in employer_keys]
+        if not targets:
+            log.info("No SmartExtract sites match requested companies")
+            return {"total_new": 0, "total_existing": 0, "passed": 0, "total": 0}
+        log.info("SmartExtract: filtered to %d targets by --company", len(targets))
+
     effective_sites = sites or load_sites()
     search_sites = sum(1 for s in effective_sites if s.get("type") == "search")
     static_sites = sum(1 for s in effective_sites if s.get("type") != "search")
     log.info(
         "Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
-        search_sites, static_sites, len(targets), workers,
+        search_sites,
+        static_sites,
+        len(targets),
+        workers,
     )
 
-    # Inject dependencies: LLM client + DB connection
+    # Inject dependencies: LLM client
     llm_client = get_client()
-    conn = init_db()
 
-    return run_all(targets, accept_locs, reject_locs, llm_client, conn, workers=workers)
+    return run_all(targets, accept_locs, reject_locs, llm_client, workers=workers)

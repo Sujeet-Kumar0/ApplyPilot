@@ -16,13 +16,28 @@ log = logging.getLogger(__name__)
 
 
 def load_sites() -> list[dict]:
-    """Load scraping target sites from config/sites.yaml."""
+    """Load scraping target sites from config/sites.yaml + user overrides."""
+    from applypilot.config.paths import APP_DIR
+
+    sites = []
+    # Package defaults
     path = CONFIG_DIR / "sites.yaml"
-    if not path.exists():
-        log.warning("sites.yaml not found at %s", path)
-        return []
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    return data.get("sites", [])
+    if path.exists():
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        sites.extend(data.get("sites", []))
+    # User overrides (~/.applypilot/sites.yaml)
+    user_path = APP_DIR / "sites.yaml"
+    if user_path.exists():
+        data = yaml.safe_load(user_path.read_text(encoding="utf-8")) or {}
+        user_sites = data.get("sites", [])
+        # Merge — user sites with same name override package ones
+        existing_names = {s.get("name") for s in sites}
+        for s in user_sites:
+            if s.get("name") not in existing_names:
+                sites.append(s)
+    if not sites:
+        log.warning("No sites configured in config/sites.yaml or ~/.applypilot/sites.yaml")
+    return sites
 
 
 def load_location_filter(search_cfg: dict | None = None) -> tuple[list[str], list[str]]:
@@ -101,20 +116,24 @@ def build_scrape_targets(
 
         if site_type == "search" and queries:
             for query in queries:
-                targets.append({
+                targets.append(
+                    {
+                        "name": site_name,
+                        "url": _expand(site_url, query),
+                        "query": query,
+                        "no_headful": no_headful,
+                        "force_headful": force_headful,
+                    }
+                )
+        else:
+            targets.append(
+                {
                     "name": site_name,
-                    "url": _expand(site_url, query),
-                    "query": query,
+                    "url": _expand(site_url),
+                    "query": None,
                     "no_headful": no_headful,
                     "force_headful": force_headful,
-                })
-        else:
-            targets.append({
-                "name": site_name,
-                "url": _expand(site_url),
-                "query": None,
-                "no_headful": no_headful,
-                "force_headful": force_headful,
-            })
+                }
+            )
 
     return targets

@@ -23,9 +23,7 @@ def test_build_artifact_prefix_distinguishes_same_title_site_by_url() -> None:
 
 
 def test_build_artifact_prefix_prefers_query_job_id() -> None:
-    prefix = artifact_naming.build_artifact_prefix(
-        _job("https://www.linkedin.com/jobs/view/4383377387?jk=abc123")
-    )
+    prefix = artifact_naming.build_artifact_prefix(_job("https://www.linkedin.com/jobs/view/4383377387?jk=abc123"))
 
     assert prefix == "LinkedIn_Network_Engineer_V_abc123"
 

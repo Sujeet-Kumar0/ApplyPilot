@@ -67,3 +67,4 @@ CLAUDE.md
 resume.json
 
 .applypilot
+tests/_prompt_comparison*
