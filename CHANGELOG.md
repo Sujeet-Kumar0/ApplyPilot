@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Code-first apply engine** (`apply/code_filler.py`) — HTTP prefetch + programmatic form fill for Greenhouse/Lever/Ashby. 35s/job vs 180s with LLM loop. LLM called only for unknown screening questions (single batch call)
+- **Fair job scheduler** (`apply/scheduler.py`) — CFS-inspired hierarchical min-heap scheduler. Round-robin across boards and companies using virtual runtimes. O(log n) per pick
+- **Board-specific handlers** — Greenhouse/Lever/Ashby → code-first, Workday/LinkedIn → LLM agent, Unknown → code-first with LLM fallback
+- **Relevance gate** (`discovery/relevance_gate.py`) — LLM-generated role keywords + anti-keywords at init time. Filters irrelevant jobs at discovery insert before they enter the DB
+- **Location resolver** (`discovery/location_resolver.py`) — City/state → country resolution via `local-geocode` library. Enables location-based filtering (e.g., exclude US jobs)
+- **Job timeline** (`analytics/timeline.py`, `applypilot timeline <URL>`) — Full lifecycle view per job: discover → enrich → score → tailor → cover → apply with timestamps, errors, artifacts, stats
+- **Dashboard/orchestrator separation** — All Rich/UI code moved from `orchestrator.py` to `dashboard.py`. Orchestrator is now pure business logic with zero UI imports
+- **Dashboard pause/resume** — `dashboard.pause_for_input()` stops Live refresh during interactive prompts, preventing flickering
+- **Interactive needs_human prompt** — Enter=skip, r=retry agent, m=finish manually. Chrome stays open
+- **Pause file mechanism** — `touch ~/.applypilot/.pause` to intervene mid-agent-run
+- **Dry-run Chrome pause** — Chrome stays open for verification on both APPLIED and NEEDS_HUMAN results
+- **HTTP pre-fetch expired detection** — Detects expired jobs in 1-6s via HTTP without launching Chrome
+- **Shared Playwright browser pool** (`pdf_renderer.py`) — One Chromium instance reused across all PDFs in a batch. Eliminates ~2-4s startup per PDF
+- **76 new tests** (941 → 1015) across 4 new test files: code_filler, scheduler, location_resolver, relevance_gate
+
+### Fixed
+
+- **False expired detection** — `_CHECK_PAGE_JS` regex matched its own source code in tool output. Fixed with exact token matching
+- **False auth detection** — Removed hardcoded auth page text matching that triggered on nav bar "Sign in" links. LLM handles auth detection via prompt rules
+- **Auto cookie dismiss false clicks** — Removed mechanical cookie dismiss that clicked wrong elements on sites without banners. LLM handles via prompt rules
+- **Infinite retry on LLM errors** — `llm_error`, `job_expired`, `login_required`, `no_form_found` added to permanent failures
+- **Stale in_progress locks** — Jobs locked by interrupted runs now properly released
+- **Invalid CSS selector** — `button:has-text()` (Playwright syntax) replaced with safe text content check in `querySelector`
+- **JSON parse in DOM discovery** — Bracket depth matching instead of `rindex` which matched wrong bracket
+- **Ambiguous SQL column** — Round-robin query aliased subquery `site` as `_rsite`
+- **macOS display detection** — macOS always returns headful (doesn't use DISPLAY env var)
+- **Native agent used cheap model** — Changed default from `tier="cheap"` to `tier="premium"` for form filling
+
+### Changed
+
+- **Apply job acquisition** — Replaced `ORDER BY fit_score DESC` with CFS round-robin: `ROW_NUMBER() OVER (PARTITION BY site)` + virtual runtime ordering
+- **Max agent iterations** — 35 → 60 for forms with many screening questions
+- **Snapshot truncation** — 8K → 16K for large Greenhouse pages
+- **System prompt** — Added R11 (N/A for irrelevant location questions), R12 (neutral answers for unknown fields)
+- **`pyproject.toml`** — Added `local-geocode>=0.0.2` dependency
+- **`wizard.py`** — Generates relevance filter during init (Step 4b)
+
 - **v2 Architecture Implementation** — Full implementation of all v2 planning doc requirements. See
   `docs/IMPLEMENTATION_ADDENDUM-2026-04-03.md` for details.
 - **`applypilot recover`** — Reset stale in-progress jobs and clean partial artifacts (APPLY-22)

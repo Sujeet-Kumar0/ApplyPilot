@@ -69,7 +69,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
 | **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates. A statistical deviation guard (binomial proportion test) compares token retention between original and tailored resume — if the AI fabricated content, retention drops below threshold and the result is rejected |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | A browser agent CLI (Codex by default, Claude optional) navigates application forms, fills fields, uploads documents, answers questions, and submits |
+| **6. Auto-Apply** | Code-first form filler for Greenhouse/Lever/Ashby (35s/job, $0.02). LLM agent fallback for Workday/LinkedIn. Fair scheduler spreads applications across boards and companies |
 
 Each stage is independent. Run them all or pick what you need.
 
@@ -105,6 +105,7 @@ Each stage is independent. Run them all or pick what you need.
 | Component | What It Does |
 |-----------|-------------|
 | CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
+| local-geocode | Offline city/state → country resolution for location filtering. Installed automatically with `pip install applypilot` |
 
 ### Gemini Smoke Check (optional)
 
@@ -162,6 +163,77 @@ The tailoring engine rewrites your resume per job, but it must never fabricate. 
 5. If retention drops below the statistical threshold → the AI fabricated → result is rejected and retried
 
 Baseline: 40% token overlap expected (p₀ = 0.40), 99% confidence level (α = 0.01).
+
+---
+
+## Code-First Apply Engine
+
+The auto-apply stage uses a two-phase approach that's 10x faster than a pure LLM agent:
+
+**Phase 1 — HTTP Pre-fetch (~1s, no Chrome):**
+- GET the job page directly
+- Check if job is live, expired, or requires login
+- Extract form fields from server-rendered HTML
+- Map fields to your profile data programmatically
+
+**Phase 2 — Chrome Fill (~10-30s):**
+- Navigate to the page in Chrome
+- Fill all matched fields using React-compatible event dispatch
+- Upload resume and cover letter PDFs
+- Call LLM only for unknown screening questions (single batch call)
+- Submit (or pause for dry-run verification)
+
+| Board | Handler | Speed | LLM Calls |
+|-------|---------|-------|-----------|
+| Greenhouse (direct + embedded) | Code-first | ~35s | 0-1 |
+| Lever | Code-first | ~35s | 0-1 |
+| Ashby | Code-first | ~35s | 0-1 |
+| Workday | LLM agent | ~180s | 30-60 |
+| LinkedIn | LLM agent | ~180s | 30-60 |
+| Unknown | Code-first → LLM fallback | ~35-180s | Varies |
+
+Expired jobs are detected in 1-6 seconds via HTTP without launching Chrome.
+
+---
+
+## Fair Job Scheduler
+
+Applications are spread across boards and companies using a CFS-inspired (Completely Fair Scheduler) algorithm:
+
+1. Jobs are organized in a tree: Root → Boards → Companies → Jobs
+2. Each node tracks a virtual runtime (how much "service" it's received)
+3. The least-served company gets picked next
+4. Higher-score jobs get more bandwidth (lower virtual runtime cost)
+
+This prevents spamming one employer and ensures all companies get fair coverage. Example order:
+```
+Stripe(GH) → Motorola(WD) → Infystrat(HN) → Affirm(GH) → Netflix(WD) → ...
+```
+
+---
+
+## Relevance Gate
+
+During `applypilot init`, an LLM analyzes your profile and generates two keyword lists:
+- **Role keywords**: words that should appear in relevant job titles (e.g., "engineer", "developer", "sde")
+- **Anti-keywords**: words that definitely mean irrelevant (e.g., "sales", "recruiter", "nurse")
+
+These are saved to `resume.json` and checked at discovery insert time — before jobs enter the database. Combined with the location resolver (city/state → country via [local-geocode](https://pypi.org/project/local-geocode/)), this filters out:
+- Jobs in excluded countries (e.g., US)
+- Non-matching role categories (e.g., sales roles for an engineer)
+- Jobs requiring significantly more experience than your profile
+
+---
+
+## Job Timeline
+
+View the complete lifecycle of any job with a single command:
+
+```bash
+applypilot timeline "https://example.com/jobs/123"
+```
+
+Shows every stage transition with timestamps: discovered → enriched → scored → tailored → cover letter → apply attempts → result. Includes artifact paths, LLM costs, and total lifecycle duration.
 
 ---
 
@@ -263,7 +335,18 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-ApplyPilot launches a Chrome instance, then hands control to a browser agent CLI. By default that is Codex CLI; Claude Code CLI and OpenCode CLI are also supported. The agent navigates each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
+ApplyPilot launches a Chrome instance, then uses a two-phase approach:
+
+**Phase 1 (HTTP, ~1s):** Pre-fetch the job page, check if live/expired/login, extract form fields from HTML.
+
+**Phase 2 (Chrome, ~10-30s):** Navigate, fill fields programmatically, upload resume, call LLM only for unknown screening questions, submit.
+
+Board-specific handlers route to the right strategy:
+- Greenhouse/Lever/Ashby → code-first (35s/job, $0.02)
+- Workday/LinkedIn → LLM agent fallback (180s/job)
+- Unknown → code-first with LLM fallback
+
+A CFS fair scheduler spreads applications across boards and companies using virtual runtimes. Expired jobs detected in 1-6s via HTTP without Chrome.
 
 The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
 
@@ -322,9 +405,9 @@ applypilot run --strict-title           # Require ALL query terms in job title
 applypilot run --force                  # Re-tailor already-tailored jobs
 applypilot company add NAME URL         # Add a company's career site to the registry
 applypilot company list                 # List all companies in the registry
-applypilot apply                        # Launch auto-apply
+applypilot apply                        # Launch auto-apply (fair scheduler)
 applypilot apply --workers 3            # Parallel browser workers
-applypilot apply --dry-run              # Fill forms without submitting
+applypilot apply --dry-run              # Fill forms without submitting (pauses Chrome)
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
@@ -332,6 +415,8 @@ applypilot apply --gen --url URL        # Generate prompt file for manual debugg
 applypilot apply --mark-applied URL     # Manually mark a job as applied
 applypilot apply --mark-failed URL      # Manually mark a job as failed
 applypilot apply --reset-failed         # Reset all failed jobs for retry
+applypilot timeline URL                 # Full lifecycle timeline for a job
+applypilot timeline URL --json          # Machine-readable timeline
 applypilot analyze --url URL            # Parse a job description and optional resume match
 applypilot analyze --text-file job.txt --resume-file resume.json
 applypilot greenhouse validate          # Validate configured Greenhouse employers
