@@ -110,7 +110,7 @@ def build_tailor_prompt(profile: dict, resume_text: str | None = None) -> str:
         rc = resolve_config(job={"title": target_role})
         if rc.max_pages != "auto":
             preset_instruction += f"\nTarget page count: {rc.max_pages}"
-        default_order = ["summary", "skills", "experience", "projects", "education", "certificates"]
+        default_order = ["summary", "experience", "skills", "projects", "education", "certificates"]
         if rc.section_order != default_order:
             preset_instruction += f"\nSection order: {', '.join(rc.section_order)}"
     except Exception:

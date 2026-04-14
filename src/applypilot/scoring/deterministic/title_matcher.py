@@ -104,8 +104,7 @@ SENIORITY_PATTERNS: list[tuple[int, tuple[str, ...]]] = [
 
 def tokenize(text: str) -> list[str]:
     """Tokenize text on non-alphanumeric boundaries, lowercased."""
-
-    return re.findall(r"[a-zA-Z0-9]+", text.lower())
+    return re.findall(r"[a-zA-Z0-9]+", (text or "").lower())
 
 
 def tokenize_set(text: str) -> set[str]:

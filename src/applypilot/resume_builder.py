@@ -99,19 +99,7 @@ def from_json_resume(data: dict) -> ResumeBuilder:
     # Summary
     b.add_section("SUMMARY", _coerce_str(basics.get("summary")))
 
-    # Skills
-    skills = data.get("skills", []) if isinstance(data.get("skills"), list) else []
-    skill_lines = []
-    for entry in skills:
-        if not isinstance(entry, dict):
-            continue
-        cat = _coerce_str(entry.get("name")) or "Skills"
-        kws = ", ".join(_coerce_list(entry.get("keywords", [])))
-        if kws:
-            skill_lines.append(f"{cat}: {kws}")
-    b.add_section("TECHNICAL SKILLS", "\n".join(skill_lines))
-
-    # Experience
+    # Experience (before skills — HR reads bullets first)
     work = data.get("work", []) if isinstance(data.get("work"), list) else []
     exp_lines = []
     for entry in _sort_work_entries(work):
@@ -129,6 +117,18 @@ def from_json_resume(data: dict) -> ResumeBuilder:
             exp_lines.append(f"- {h}")
         exp_lines.append("")
     b.add_section("EXPERIENCE", "\n".join(exp_lines))
+
+    # Skills (after experience — ATS keyword scan, not primary reading)
+    skills = data.get("skills", []) if isinstance(data.get("skills"), list) else []
+    skill_lines = []
+    for entry in skills:
+        if not isinstance(entry, dict):
+            continue
+        cat = _coerce_str(entry.get("name")) or "Skills"
+        kws = ", ".join(_coerce_list(entry.get("keywords", [])))
+        if kws:
+            skill_lines.append(f"{cat}: {kws}")
+    b.add_section("TECHNICAL SKILLS", "\n".join(skill_lines))
 
     # Projects
     projects = data.get("projects", []) if isinstance(data.get("projects"), list) else []
@@ -244,16 +244,7 @@ def from_tailored_output(data: dict, profile: dict) -> ResumeBuilder:
     # Summary
     b.add_section("SUMMARY", sanitize_text(data.get("summary", "")))
 
-    # Skills
-    skill_lines = []
-    if isinstance(data.get("skills"), dict):
-        for cat, val in data["skills"].items():
-            cleaned = sanitize_text(str(val))
-            if cleaned:
-                skill_lines.append(f"{cat}: {cleaned}")
-    b.add_section("TECHNICAL SKILLS", "\n".join(skill_lines))
-
-    # Experience
+    # Experience (before skills — HR reads bullets first)
     exp_lines = []
     for entry in data.get("experience", []):
         exp_lines.append(sanitize_text(entry.get("header", "")))
@@ -265,6 +256,15 @@ def from_tailored_output(data: dict, profile: dict) -> ResumeBuilder:
                 exp_lines.append(f"- {sanitize_text(text)}")
         exp_lines.append("")
     b.add_section("EXPERIENCE", "\n".join(exp_lines))
+
+    # Skills (after experience — ATS keyword scan)
+    skill_lines = []
+    if isinstance(data.get("skills"), dict):
+        for cat, val in data["skills"].items():
+            cleaned = sanitize_text(str(val))
+            if cleaned:
+                skill_lines.append(f"{cat}: {cleaned}")
+    b.add_section("TECHNICAL SKILLS", "\n".join(skill_lines))
 
     # Projects
     proj_lines = []
@@ -287,10 +287,10 @@ def from_tailored_output(data: dict, profile: dict) -> ResumeBuilder:
 
 
 def from_pieces(
-        piece_repo,
-        overlay_repo=None,
-        track_id: str | None = None,
-        job_url: str | None = None,
+    piece_repo,
+    overlay_repo=None,
+    track_id: str | None = None,
+    job_url: str | None = None,
 ) -> ResumeBuilder:
     """Build resume from DB pieces + optional overlays.
 

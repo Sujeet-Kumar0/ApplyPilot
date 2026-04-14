@@ -18,8 +18,8 @@ class ResumeConfig:
     section_order: list[str] = field(
         default_factory=lambda: [
             "summary",
-            "skills",
             "experience",
+            "skills",
             "projects",
             "education",
             "certificates",

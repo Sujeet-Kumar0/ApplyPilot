@@ -53,11 +53,11 @@ def _get_ats_hint(url: str) -> str:
 
 
 def build_native_prompt(
-        job: dict,
-        resume_text: str,
-        resume_pdf_path: str,
-        cover_letter_pdf_path: str | None = None,
-        dry_run: bool = False,
+    job: dict,
+    resume_text: str,
+    resume_pdf_path: str,
+    cover_letter_pdf_path: str | None = None,
+    dry_run: bool = False,
 ) -> str:
     """Build a data-only prompt for the native agent.
 
@@ -72,6 +72,12 @@ def build_native_prompt(
     exp = profile.get("experience", {})
 
     job_url = job.get("application_url") or job["url"]
+    # Resolve relative application URLs against the job page domain
+    if job_url.startswith("/"):
+        from urllib.parse import urlparse
+
+        parsed = urlparse(job["url"])
+        job_url = f"{parsed.scheme}://{parsed.netloc}{job_url}"
     ats_hint = _get_ats_hint(job_url)
 
     # Structured profile — LLM maps these directly to form fields.

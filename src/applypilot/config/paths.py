@@ -23,6 +23,9 @@ COVER_LETTER_DIR = APP_DIR / "cover_letters"
 TRACKING_DIR = APP_DIR / "tracking"
 LOG_DIR = APP_DIR / "logs"
 
+# Organized output — human-friendly company/role folder structure
+ORGANIZED_DIR = Path(os.environ.get("APPLYPILOT_OUTPUT_DIR", Path.home() / "Documents" / "ApplyPilot_Applications"))
+
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
 APPLY_WORKER_DIR = APP_DIR / "apply-workers"
@@ -52,3 +55,19 @@ def ensure_dirs():
         FILES_DIR,
     ]:
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _sanitize_path_segment(name: str, max_len: int = 60) -> str:
+    """Sanitize a string for use as a folder name (cross-platform)."""
+    import re
+
+    cleaned = re.sub(r'[<>:"|?*/\\]', "", (name or "Unknown").strip())
+    cleaned = re.sub(r"[^\w\s-]", "", cleaned)
+    return cleaned[:max_len].strip() or "Unknown"
+
+
+def organized_job_dir(parent: Path, company: str, role: str) -> Path:
+    """Return parent/company/role/ — creates if needed."""
+    d = parent / _sanitize_path_segment(company, 40) / _sanitize_path_segment(role)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
