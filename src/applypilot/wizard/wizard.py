@@ -287,6 +287,25 @@ def run_wizard(resume_json: Path | None = None, resume_pdfs: list[Path] | None =
         console.print("[green]AI provider already configured.[/green]")
     console.print()
 
+    # Step 4b: Generate relevance filter for discovery (needs LLM)
+    load_env()
+    if detect_llm_provider() is not None and canonical_resume:
+        try:
+            from applypilot.discovery.relevance_gate import generate_relevance_filter
+
+            console.print("[dim]Generating job relevance filter from your profile...[/dim]")
+            rf = generate_relevance_filter(canonical_resume)
+            if rf and rf.get("role_keywords"):
+                canonical_resume.setdefault("meta", {}).setdefault("applypilot", {})["relevance_filter"] = rf
+                _write_resume_json(canonical_resume)
+                console.print(
+                    f"[green]Relevance filter saved:[/green] {len(rf['role_keywords'])} role keywords, "
+                    f"{len(rf.get('anti_keywords', []))} anti-keywords"
+                )
+        except Exception as e:
+            console.print(f"[yellow]Relevance filter generation skipped: {e}[/yellow]")
+    console.print()
+
     # Step 5: Auto-apply agent
     _setup_auto_apply()
     console.print()

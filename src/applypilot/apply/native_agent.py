@@ -24,6 +24,7 @@ import re as _re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from applypilot.apply.backends import (
@@ -36,7 +37,7 @@ from applypilot.apply.backends import (
 
 log = logging.getLogger(__name__)
 
-_MAX_ITERATIONS = 35
+_MAX_ITERATIONS = 60
 _MAX_CONSECUTIVE_ERRORS = 3
 _MAX_REPEATED_CALLS = 2
 
@@ -73,23 +74,120 @@ def _is_evaluate_write(fn_body: str) -> bool:
 # call browser_evaluate to discover fields — the #1 source of wrong-ref bugs.
 _FIELD_RE = _re.compile(r'(textbox|combobox|listbox|checkbox|radio|button|link)\s+"([^"]+)"\s+\[ref=(e\d+)\]')
 
+# JS function to discover form fields from the DOM when the a11y snapshot
+# renders them as `generic` (Greenhouse, some React apps).
+_DOM_FIELD_DISCOVERY_JS = """() => {
+    const results = [];
+    for (const el of document.querySelectorAll('input, textarea, select')) {
+        if (el.offsetParent === null || el.type === 'hidden') continue;
+        let label = '';
+        if (el.getAttribute('aria-label')) label = el.getAttribute('aria-label');
+        else if (el.id) {
+            const lbl = document.querySelector('label[for="' + el.id + '"]');
+            if (lbl) label = lbl.textContent.trim();
+        }
+        if (!label) { const lbl = el.closest('label'); if (lbl) label = lbl.textContent.trim(); }
+        if (!label && el.placeholder) label = el.placeholder;
+        if (!label && el.name) label = el.name.replace(/[_-]/g, ' ');
+        const selector = el.id ? '#' + el.id
+            : el.name ? el.tagName.toLowerCase() + '[name="' + el.name + '"]'
+            : null;
+        results.push({
+            label: label.replace(/\\n/g, ' ').trim().substring(0, 80),
+            id: el.id || '', name: el.name || '',
+            type: el.type || el.tagName.toLowerCase(),
+            tag: el.tagName.toLowerCase(), selector: selector
+        });
+    }
+    return JSON.stringify(results);
+}"""
 
-def _extract_field_map(snapshot_text: str) -> str:
-    """Parse snapshot and return a structured field→ref mapping."""
+
+def _extract_field_map(snapshot_text: str) -> tuple[str, bool]:
+    """Parse snapshot and return (field_map_text, has_input_fields).
+
+    has_input_fields is True only if textbox/combobox/listbox/checkbox/radio
+    were found — not just buttons/links.  This drives the DOM fallback decision.
+    """
     fields = []
+    apply_buttons = []
+    has_inputs = False
     for m in _FIELD_RE.finditer(snapshot_text):
         role, label, ref = m.groups()
         hint = ""
         if role == "combobox":
             hint = " (custom dropdown: click→type value→snapshot→click option)"
+            has_inputs = True
         elif role == "listbox":
             hint = " (real dropdown: use browser_select_option)"
+            has_inputs = True
         elif role in ("checkbox", "radio"):
             hint = " (use browser_click)"
+            has_inputs = True
+        elif role == "textbox":
+            has_inputs = True
         fields.append(f"  {label} | ref={ref} | {role}{hint}")
+        if role in ("link", "button") and "apply" in label.lower():
+            apply_buttons.append(f"  ★ {label} | ref={ref} | {role} ← USE THIS TO APPLY")
     if not fields:
+        return "", False
+    result = "\n\nFIELD MAP (use these refs with browser_type or browser_click):\n"
+    if apply_buttons:
+        result += "\nAPPLY BUTTON (click this first):\n" + "\n".join(apply_buttons) + "\n\nALL FIELDS:\n"
+    return result + "\n".join(fields), has_inputs
+
+
+async def _discover_fields_via_dom(session: Any, log_lines: list[str]) -> str:
+    """Fallback field discovery when a11y snapshot shows only generic elements.
+
+    Greenhouse/React apps render <input> without ARIA roles. This reads the DOM
+    to find all visible inputs and returns a map the agent can use.
+    """
+    try:
+        result = await session.call_tool("browser_evaluate", {"function": _DOM_FIELD_DISCOVERY_JS})
+        raw = ""
+        for c in result.content:
+            if hasattr(c, "text"):
+                raw += c.text
+        json_start = raw.find("[")
+        json_end = raw.rfind("]") + 1
+        if json_start < 0:
+            return ""
+        fields_data = json.loads(raw[json_start:json_end])
+        if not fields_data:
+            return ""
+
+        lines = []
+        for f in fields_data:
+            label = f.get("label", "") or f.get("name", "") or f.get("id", "")
+            if not label:
+                continue
+            selector = f.get("selector", "")
+            ftype = f.get("type", "")
+            tag = f.get("tag", "input")
+            hint = ""
+            if tag == "select":
+                hint = " (use browser_select_option)"
+            elif ftype in ("checkbox", "radio"):
+                hint = " (use browser_click)"
+            elif ftype == "file":
+                hint = " (click first, then browser_file_upload)"
+            sel_hint = f' | selector="{selector}"' if selector else ""
+            lines.append(f"  {label} | type={ftype}{sel_hint}{hint}")
+
+        if not lines:
+            return ""
+        log_lines.append(f"[DOM-DISCOVERY] Found {len(lines)} form fields via DOM fallback")
+        return (
+            "\n\nDOM FIELD MAP (a11y snapshot missed these — use element label with browser_type):\n"
+            "For these fields, call browser_type with the element label, e.g.:\n"
+            '  {"tool": "browser_type", "args": {"element": "First Name", "ref": "e80", "text": "John"}}\n'
+            "If ref fails, try clicking the field-wrapper ref first, then type.\n\n"
+            + "\n".join(lines)
+        )
+    except Exception as e:
+        log_lines.append(f"[DOM-DISCOVERY] Failed: {e}")
         return ""
-    return "\n\nFIELD MAP (use these refs with browser_type or browser_click):\n" + "\n".join(fields)
 
 
 # ── System prompt ────────────────────────────────────────────────────────
@@ -113,6 +211,12 @@ No other text. No explanation. No planning. Just the tool call or the result.
 Refs come from browser_snapshot. They look like: e42, e88, e120.
 Refs are NOT HTML ids. "first_name" is an HTML id — WRONG. "e88" is a ref — CORRECT.
 If a ref fails → you will receive a fresh snapshot with correct refs automatically.
+
+Sometimes the snapshot shows only "generic" elements for form fields (React apps like Greenhouse).
+When this happens, a DOM FIELD MAP will appear with field labels and types.
+Use the label in browser_type's "element" param — Playwright resolves it internally.
+Example: {"tool":"browser_type","args":{"element":"First Name","ref":"e80","text":"John"}}
+If the ref is wrong, try nearby refs (e81, e82, e83) — the input is near the wrapper.
 
 ## TOOL PATTERNS
 
@@ -169,6 +273,10 @@ R5. If stuck after 3 attempts → RESULT:NEEDS_HUMAN:<reason>.
 R6. Login wall or CAPTCHA → RESULT:NEEDS_HUMAN:<reason>.
 R7. Job closed or page broken → RESULT:FAILED:<reason>.
 R8. After filling 3-5 fields → browser_snapshot to refresh refs.
+R9. NEVER click "generic" refs. Only click elements with labels: link, button, textbox, combobox, checkbox.
+R10. To find Apply: look for link or button containing "Apply" in the FIELD MAP. Ignore generic refs.
+R11. For location-specific questions that don't apply (e.g. "province in Canada" when applicant is in India): select "N/A", "Other", "Not applicable", or leave blank if optional. Don't guess.
+R12. For questions you can't answer from the APPLICANT PROFILE: pick the most neutral/safe option or "Decline to self-identify". Never leave required fields empty.
 """
 
 
@@ -193,15 +301,15 @@ class NativePlaywrightBackend(AutoApplyBackend):
         return ["native-playwright-agent"]
 
     def run(
-            self,
-            *,
-            job: dict,
-            port: int,
-            worker_id: int,
-            prompt: str,
-            model: str | None,
-            register_process: ProcessRegistrar,
-            unregister_process: ProcessUnregister,
+        self,
+        *,
+        job: dict,
+        port: int,
+        worker_id: int,
+        prompt: str,
+        model: str | None,
+        register_process: ProcessRegistrar,
+        unregister_process: ProcessUnregister,
     ) -> BackendExecution:
         t0 = time.time()
         log.info("[native] Starting: %s @ %s", job.get("title", "?")[:50], job.get("site", "?"))
@@ -212,7 +320,8 @@ class NativePlaywrightBackend(AutoApplyBackend):
         log_lines: list[str] = [log_header(job, self.label)]
 
         try:
-            output = asyncio.run(_run_agent(prompt, port, model, log_lines))
+            _is_dry = "DRY RUN" in prompt
+            output = asyncio.run(_run_code_first(job, port, log_lines, dry_run=_is_dry))
         except Exception as e:
             log.error("[native] Agent error: %s", e)
             output = f"RESULT:FAILED:{str(e)[:80]}"
@@ -227,7 +336,7 @@ class NativePlaywrightBackend(AutoApplyBackend):
         redacted = re.sub(r'"text"\s*:\s*"[^"]*"(?=.*[Pp]assword)', '"text": "<redacted>"', redacted)
         # Also redact password values in tool calls (Password field fills)
         redacted = re.sub(r'(Password[^"]*"[^"]*"text"\s*:\s*)"[^"]*"', r'\1"<redacted>"', redacted)
-        redacted = re.sub(r'\.fill\([\'"][^\'"]*[\'"]\)', '.fill(\'<redacted>\')', redacted)
+        redacted = re.sub(r'\.fill\([\'"][^\'"]*[\'"]\)', ".fill('<redacted>')", redacted)
         redacted = redact_pii(redacted)
         job_log.write_text(redacted, encoding="utf-8")
         log.debug("[native] Log: %s", job_log)
@@ -242,9 +351,7 @@ class NativePlaywrightBackend(AutoApplyBackend):
             # Login required: pause with Chrome open so user can sign in
             if "login" in result_code.lower():
                 try:
-                    console_msg = (
-                        f"\n⏸️  Chrome is open on port {port}. Sign in manually, then press Enter to resume..."
-                    )
+                    console_msg = f"\n⏸️  Chrome is open on port {port}. Sign in manually, then press Enter to resume..."
                     sys.stderr.write(console_msg + "\n")
                     sys.stderr.flush()
                     input()  # Block until user presses Enter
@@ -286,7 +393,105 @@ def _alert_human(job: dict, reason: str) -> None:
         sys.stderr.flush()
 
 
-async def _run_agent(prompt: str, port: int, model: str | None, log_lines: list[str]) -> str:
+def _detect_board(job: dict) -> str:
+    """Detect ATS board type from job URL."""
+    url = (job.get("application_url") or job.get("url") or "").lower()
+    strategy = (job.get("strategy") or "").lower()
+
+    if "greenhouse" in url or "gh_jid" in url or strategy == "greenhouse":
+        return "greenhouse"
+    if "workday" in url or "myworkday" in url or strategy.startswith("workday"):
+        return "workday"
+    if "lever.co" in url or strategy == "lever":
+        return "lever"
+    if "ashby" in url or strategy == "ashby":
+        return "ashby"
+    if "linkedin.com" in url:
+        return "linkedin"
+    if "amazon.jobs" in url:
+        return "amazon"
+    return "unknown"
+
+
+async def _run_code_first(job: dict, port: int, log_lines: list[str], dry_run: bool = False) -> str:
+    """Route to the right handler based on board type."""
+    board = _detect_board(job)
+    log_lines.append(f"Board: {board}\n")
+
+    if board in ("greenhouse", "lever", "ashby"):
+        # Code-first: HTTP prefetch + programmatic fill
+        return await _run_greenhouse(job, port, log_lines, dry_run)
+    elif board == "workday":
+        # Workday: multi-page wizard, needs LLM agent
+        return await _run_with_llm_agent(job, port, log_lines, dry_run)
+    elif board == "linkedin":
+        # LinkedIn: Easy Apply modal, needs LLM agent
+        return await _run_with_llm_agent(job, port, log_lines, dry_run)
+    else:
+        # Unknown: try code-first, fall back to LLM
+        result = await _run_greenhouse(job, port, log_lines, dry_run)
+        if "no_form_found" in result:
+            log_lines.append("[fallback] Code-first failed, trying LLM agent")
+            return await _run_with_llm_agent(job, port, log_lines, dry_run)
+        return result
+
+
+async def _run_greenhouse(job: dict, port: int, log_lines: list[str], dry_run: bool = False) -> str:
+    """Code-first handler for Greenhouse/Lever/Ashby forms."""
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    from applypilot.apply.code_filler import fill_form, build_profile_data
+
+    server = StdioServerParameters(
+        command="npx",
+        args=[
+            "@playwright/mcp@latest",
+            f"--cdp-endpoint=http://localhost:{port}",
+            "--viewport-size=1280x900",
+            "--allow-unrestricted-file-access",
+        ],
+    )
+
+    profile_data = build_profile_data(job)
+    resume_pdf = job.get("tailored_resume_path", "")
+    if resume_pdf:
+        resume_pdf = str(Path(resume_pdf).with_suffix(".pdf"))
+    cover_pdf = job.get("cover_letter_path", "")
+    if cover_pdf:
+        cover_pdf = str(Path(cover_pdf).with_suffix(".pdf"))
+
+    async with stdio_client(server) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return await fill_form(
+                session=session, job=job, resume_pdf=resume_pdf,
+                cover_letter_pdf=cover_pdf or None, profile_data=profile_data,
+                dry_run=dry_run, log_lines=log_lines,
+            )
+
+
+async def _run_with_llm_agent(job: dict, port: int, log_lines: list[str], dry_run: bool = False) -> str:
+    """LLM agent handler for Workday/LinkedIn/complex forms."""
+    from applypilot.apply.native_prompt import build_native_prompt
+
+    resume_text = ""
+    txt_path = job.get("tailored_resume_path", "")
+    if txt_path:
+        p = Path(txt_path).with_suffix(".txt")
+        if p.exists():
+            resume_text = p.read_text(encoding="utf-8")
+
+    resume_pdf = str(Path(txt_path).with_suffix(".pdf")) if txt_path else ""
+
+    prompt = build_native_prompt(
+        job=job, resume_text=resume_text,
+        resume_pdf_path=resume_pdf, dry_run=dry_run,
+    )
+    log_lines.append("[handler] Using LLM agent for this board type")
+    return await _run_agent(prompt, port, None, log_lines, dry_run=dry_run)
+
+
+async def _run_agent(prompt: str, port: int, model: str | None, log_lines: list[str], dry_run: bool = False) -> str:
     """Run the agent loop inside an MCP session with Playwright tools."""
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -313,16 +518,68 @@ async def _run_agent(prompt: str, port: int, model: str | None, log_lines: list[
             tools_result = await session.list_tools()
             tool_map = {t.name: t for t in tools_result.tools}
             log_lines.append(f"MCP: {len(tools_result.tools)} tools available\n")
+            log.info("[native] Tip: run 'touch ~/.applypilot/.pause' to pause and take over")
 
-            return await _agent_loop(session, tool_map, prompt, model, log_lines)
+            return await _agent_loop(session, tool_map, prompt, model, log_lines, dry_run=dry_run)
+
+
+async def _dismiss_cookie_banner(session: Any, log_lines: list[str]) -> None:
+    """Programmatically dismiss cookie/GDPR banners before the LLM takes over.
+
+    Uses browser_evaluate (read + click) — this is the one legitimate use of
+    evaluate for clicking, because cookie banners have inconsistent ARIA labels
+    that confuse the LLM (Apple's "Accept All" resolved to an AirPods link).
+    """
+    try:
+        result = await session.call_tool(
+            "browser_evaluate",
+            {
+                "function": """() => {
+            const selectors = [
+                'button[id*="cookie" i]', 'button[class*="cookie" i]',
+                'button[id*="consent" i]', 'button[class*="consent" i]',
+                'button[id*="accept" i]', 'button[class*="accept" i]',
+                '[data-testid*="cookie" i]', '[data-testid*="accept" i]',
+                '#onetrust-accept-btn-handler', '.cc-accept', '.cc-allow',
+                '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+            ];
+            for (const sel of selectors) {
+                const btn = document.querySelector(sel);
+                if (btn && btn.offsetParent !== null) {
+                    btn.click();
+                    return 'dismissed: ' + sel;
+                }
+            }
+            // Fallback: find any visible button with accept/agree text
+            for (const btn of document.querySelectorAll('button, a[role="button"]')) {
+                const text = btn.textContent.trim().toLowerCase();
+                if ((text.includes('accept') || text.includes('agree') || text === 'ok')
+                    && text.length < 30 && btn.offsetParent !== null) {
+                    btn.click();
+                    return 'dismissed: ' + text;
+                }
+            }
+            return 'none';
+        }"""
+            },
+        )
+        output = ""
+        for c in result.content:
+            if hasattr(c, "text"):
+                output += c.text
+        if "dismissed" in output:
+            log_lines.append(f"[cookie] {output.strip()}")
+    except Exception:
+        pass
 
 
 async def _agent_loop(
-        session: Any,
-        tool_map: dict,
-        prompt: str,
-        model: str | None,
-        log_lines: list[str],
+    session: Any,
+    tool_map: dict,
+    prompt: str,
+    model: str | None,
+    log_lines: list[str],
+    dry_run: bool = False,
 ) -> str:
     """Core loop with mechanical enforcement.
 
@@ -341,7 +598,7 @@ async def _agent_loop(
     if model:
         client = LLMClient(_dc_replace(resolve_llm_config(), model=model))
     else:
-        client = get_client(tier="cheap")
+        client = get_client(tier="premium")
 
     messages: list[dict[str, str]] = [
         {"role": "user", "content": prompt},
@@ -352,7 +609,35 @@ async def _agent_loop(
     last_call_key: str = ""
     repeat_count: int = 0
 
+    _PAUSE_FILE = Path.home() / ".applypilot" / ".pause"
+
     for iteration in range(_MAX_ITERATIONS):
+        # ── Pause check: touch ~/.applypilot/.pause to intervene ──
+        if _PAUSE_FILE.exists():
+            _PAUSE_FILE.unlink(missing_ok=True)
+            log_lines.append(f"\n[PAUSED] User requested pause at iteration {iteration + 1}")
+            log.info("[native] PAUSED — user intervention requested")
+            sys.stderr.write(
+                f"\n⏸️  PAUSED at iteration {iteration + 1}/{_MAX_ITERATIONS}. Chrome is open.\n"
+                "    [Enter=resume agent | m=I'll finish manually | s=stop]: "
+            )
+            sys.stderr.flush()
+            try:
+                choice = input().strip().lower()
+            except EOFError:
+                choice = ""
+            if choice == "m":
+                sys.stderr.write("🖐  Finish in Chrome, then press Enter to mark as applied: ")
+                sys.stderr.flush()
+                try:
+                    input()
+                except EOFError:
+                    pass
+                return "RESULT:APPLIED"
+            elif choice == "s":
+                return "RESULT:NEEDS_HUMAN:user_stopped"
+            # else: resume
+
         t0 = _time.time()
         log.debug("[native] Iteration %d/%d", iteration + 1, _MAX_ITERATIONS)
 
@@ -407,6 +692,26 @@ async def _agent_loop(
                 log_lines.append(f"[iter {iteration + 1}] BLOCKED evaluate write")
                 continue
 
+        # ── ENFORCEMENT: Dry-run Submit block ─────────────────────────
+        # In dry-run mode, intercept any click on a Submit/Apply button
+        # after form fields have been filled. Pause for user verification.
+        if dry_run and tool_name == "browser_click":
+            label = (tool_args.get("element", "") or "").lower()
+            _submit_words = ("submit", "apply now", "send application", "confirm", "complete")
+            if any(w in label for w in _submit_words):
+                log_lines.append(f"\n[DRY-RUN] Blocked Submit click: {tool_args.get('element', '')}")
+                log.info("[dry-run] All fields filled. Pausing for verification.")
+                sys.stderr.write(
+                    "\n✅  DRY RUN COMPLETE — All fields filled. Chrome is open for verification.\n"
+                    "    Press Enter to finish (the form will NOT be submitted).\n"
+                )
+                sys.stderr.flush()
+                try:
+                    input()
+                except EOFError:
+                    pass
+                return "RESULT:APPLIED (dry_run)"
+
         # ── ENFORCEMENT 2: Stuck detection ────────────────────────────
         # Same tool+args repeated = agent is stuck (e.g. browser_tabs with
         # wrong param 10x in a row on the Affirm run).
@@ -451,7 +756,7 @@ async def _agent_loop(
             for content in result.content:
                 if hasattr(content, "text"):
                     tool_output += content.text
-            tool_output = tool_output[:8000]
+            tool_output = tool_output[:16000] if tool_name == "browser_snapshot" else tool_output[:8000]
             log.debug("[native] Tool result (%0.1fs): %s", tool_elapsed, tool_output[:200])
             log_lines.append(
                 f"[iter {iteration + 1}] TOOL {tool_name}({json.dumps(tool_args)[:80]}) "
@@ -462,12 +767,21 @@ async def _agent_loop(
             log.warning("[native] Tool %s failed: %s", tool_name, e)
             log_lines.append(f"[iter {iteration + 1}] TOOL {tool_name} ERROR: {e}")
 
-        # ── ENFORCEMENT 3: Auto-snapshot on ref-not-found ─────────────
-        # When browser_type(ref="first_name") fails because the agent used
-        # an HTML id instead of a snapshot ref, automatically take a fresh
-        # snapshot and inject it with the field map. The model never sees
-        # the error — it sees correct refs and can retry immediately.
-        if "not found" in tool_output.lower() and "ref" in tool_output.lower():
+        # ── Cookie dismiss: let the LLM handle it via system prompt ──
+        # (Previously used browser_evaluate to auto-click cookie banners,
+        # but it caused false clicks on sites without banners like Stripe.
+        # The system prompt step 3 instructs the agent to dismiss banners.)
+
+        # ── ENFORCEMENT 3: Auto-recovery on failed refs ─────────────
+        # Two failure modes:
+        # a) "Ref not found" — agent used HTML id instead of snapshot ref
+        # b) "Element is not an <input>" — ref points to wrapper div (Greenhouse)
+        # In both cases: auto-snapshot + DOM discovery fallback.
+        _needs_recovery = (
+            ("not found" in tool_output.lower() and "ref" in tool_output.lower())
+            or "Element is not an <input>" in tool_output
+        )
+        if _needs_recovery:
             log_lines.append(f"[iter {iteration + 1}] AUTO-RECOVERY: ref not found → auto-snapshot")
             try:
                 snap_result = await session.call_tool("browser_snapshot", {})
@@ -475,14 +789,16 @@ async def _agent_loop(
                 for c in snap_result.content:
                     if hasattr(c, "text"):
                         snap_text += c.text
-                snap_text = snap_text[:8000]
-                field_map = _extract_field_map(snap_text)
+                snap_text = snap_text[:16000]
+                field_map, has_inputs = _extract_field_map(snap_text)
+                if not has_inputs:
+                    field_map += await _discover_fields_via_dom(session, log_lines)
                 tool_output = (
                     f"Ref not found. Here is a fresh snapshot with correct refs:\n"
                     f"{snap_text}{field_map}\n"
                     f"Use refs from THIS snapshot (e.g. e88). Never use HTML ids."
                 )
-                log_lines.append(f"[iter {iteration + 1}] AUTO-SNAPSHOT injected with {field_map.count('ref=')} fields")
+                log_lines.append(f"[iter {iteration + 1}] AUTO-SNAPSHOT injected")
             except Exception as e:
                 log_lines.append(f"[iter {iteration + 1}] AUTO-SNAPSHOT failed: {e}")
 
@@ -490,20 +806,16 @@ async def _agent_loop(
         # Gives the LLM a clean label→ref lookup table so it doesn't need
         # to call browser_evaluate to discover fields.
         elif tool_name == "browser_snapshot":
-            field_map = _extract_field_map(tool_output)
+            field_map, has_inputs = _extract_field_map(tool_output)
             if field_map:
                 tool_output += field_map
+            if not has_inputs:
+                dom_map = await _discover_fields_via_dom(session, log_lines)
+                if dom_map:
+                    tool_output += dom_map
 
         messages.append({"role": "user", "content": f"Tool result:\n{tool_output}"})
         full_output.append(f"[{tool_name}] {tool_output[:300]}")
-
-        # ── ENFORCEMENT: Detect login/signup pages programmatically ──
-        _AUTH_PAGES = ("sign up", "sign in", "login", "log in", "create account", "register", "cold-join", "signup")
-        output_lower = tool_output.lower()
-        if any(p in output_lower for p in _AUTH_PAGES):
-            log.info("[native] Auth page detected — stopping")
-            log_lines.append("\n[ENFORCEMENT] Auth page detected in tool output — stopping")
-            return "RESULT:NEEDS_HUMAN:login_required"
 
     log_lines.append(f"\n[RESULT] max_iterations ({_MAX_ITERATIONS})")
     return "RESULT:NEEDS_HUMAN:max_iterations_reached"
@@ -525,7 +837,7 @@ def _parse_tool_call(response: str) -> dict | None:
             elif response[i] == "}":
                 if depth == 0:
                     try:
-                        obj = json.loads(match.group(0) + response[start: i + 1])
+                        obj = json.loads(match.group(0) + response[start : i + 1])
                         return obj
                     except json.JSONDecodeError:
                         break
@@ -538,7 +850,7 @@ def _parse_tool_call(response: str) -> dict | None:
             start = response.rfind("{", 0, match.start() + 1)
             end = response.find("}", match.end())
             if end > 0:
-                obj = json.loads(response[start: end + 1])
+                obj = json.loads(response[start : end + 1])
                 return {"tool": obj.get("name"), "args": obj.get("arguments", obj.get("args", {}))}
         except (json.JSONDecodeError, ValueError):
             return {"tool": match.group(1), "args": {}}

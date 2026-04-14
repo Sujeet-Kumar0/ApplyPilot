@@ -9,8 +9,11 @@ from applypilot.db.dto import ApplyResultDTO
 
 PERMANENT_FAILURES: set[str] = {
     "expired",
+    "job_expired",
     "captcha",
     "login_issue",
+    "login_required",
+    "llm_error",
     "not_eligible_location",
     "not_eligible_salary",
     "already_applied",
@@ -22,6 +25,7 @@ PERMANENT_FAILURES: set[str] = {
     "site_blocked",
     "cloudflare_blocked",
     "blocked_by_cloudflare",
+    "no_form_found",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")

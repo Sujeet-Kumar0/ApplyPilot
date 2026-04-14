@@ -22,9 +22,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from rich.console import Console
-from rich.live import Live
-
 from applypilot import config
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.backends import (
@@ -43,8 +40,13 @@ from applypilot.apply.dashboard import (
     init_worker,
     update_state,
     add_event,
-    render_full,
     get_totals,
+    log_info as _ui_print,
+    log_warning as _ui_warn,
+    show_summary as _ui_summary,
+    pause_for_input as _pause_chrome,
+    start as _dash_start,
+    stop as _dash_stop,
 )
 
 from applypilot.apply.launcher.job_acquirer import acquire_job, _target_unavailable_reason
@@ -554,13 +556,31 @@ def worker_loop(
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
 
+    # Build fair scheduler queue (unless targeting a specific URL)
+    _scheduler = None
+    if not target_url:
+        from applypilot.apply.scheduler import JobScheduler
+        _scheduler = JobScheduler()
+        _scheduler.load_from_db(min_score=min_score)
+
     while not _stop_event.is_set():
         if not continuous and limit is not None and jobs_done >= limit:
             break
 
         update_state(worker_id, status="idle", job_title="", company="", last_action="waiting for job", actions=0)
 
-        job = acquire_job(target_url=target_url, min_score=min_score, worker_id=worker_id)
+        if target_url:
+            job = acquire_job(target_url=target_url, min_score=min_score, worker_id=worker_id)
+        elif _scheduler:
+            next_job = _scheduler.next()
+            if next_job:
+                # Lock the job in DB
+                job = acquire_job(target_url=next_job.url, min_score=0, worker_id=worker_id)
+            else:
+                job = None
+        else:
+            job = None
+
         if not job:
             if not continuous:
                 if target_url:
@@ -604,39 +624,68 @@ def worker_loop(
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
-            elif result == "applied":
+
+            # ── Interactive pause: uses dashboard.pause_for_input ─────
+
+            if result == "applied":
+                if dry_run:
+                    add_event(f"[W{worker_id}] DRY RUN — pausing for verification")
+                    _pause_chrome("✅  DRY RUN COMPLETE — Chrome is open. Verify the filled form.")
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied, jobs_done=applied + failed)
                 try:
                     from applypilot.analytics.helpers import emit_job_applied
-
                     emit_job_applied(job["url"], job.get("site", ""), agent or "native", duration_ms)
                 except Exception:
                     pass
-            elif result.startswith("needs_human"):
-                # Agent signalled it's stuck and needs operator intervention
-                # (login wall, CAPTCHA, unexpected page). Park the job so
-                # `applypilot human-review` can present it for manual action.
-                reason = result.split(":", 1)[-1] if ":" in result else "agent_stuck"
-                from applypilot.bootstrap import get_app
 
+            elif result.startswith("needs_human"):
+                reason = result.split(":", 1)[-1] if ":" in result else "agent_stuck"
+                add_event(f"[W{worker_id}] NEEDS_HUMAN: {reason[:30]}")
+                choice = _pause_chrome(
+                    f"⚠️  NEEDS HUMAN: {reason}\n"
+                    f"    Chrome is open on port {port}.",
+                    "Enter=skip | r=retry agent | m=I'll finish manually",
+                )
+
+                if choice == "r":
+                    # Retry: re-run agent on the same Chrome session
+                    add_event(f"[W{worker_id}] Retrying agent...")
+                    retry_result, retry_ms = run_job(
+                        job, port=port, worker_id=worker_id, agent=agent,
+                        model=model, opencode_agent=opencode_agent, dry_run=dry_run,
+                    )
+                    if retry_result == "applied":
+                        mark_result(job["url"], "applied", duration_ms=retry_ms)
+                        applied += 1
+                        update_state(worker_id, jobs_applied=applied, jobs_done=applied + failed)
+                        continue
+                    # Still failed after retry — fall through to park
+                    reason = retry_result
+
+                elif choice == "m":
+                    # Manual: user finishes in Chrome, then confirms
+                    _pause_chrome("🖐  Finish the application in Chrome, then press Enter to mark as applied.")
+                    mark_result(job["url"], "applied", duration_ms=duration_ms)
+                    applied += 1
+                    update_state(worker_id, jobs_applied=applied, jobs_done=applied + failed)
+                    continue
+
+                # Default (Enter) or failed retry: park for later
+                from applypilot.bootstrap import get_app
                 _repo = get_app().container.job_repo
                 from applypilot.db.dto import ApplyResultDTO
-
                 _repo.update_apply_status(
                     ApplyResultDTO(
-                        url=job["url"],
-                        apply_status="needs_human",
-                        apply_error=reason,
-                        apply_duration_ms=duration_ms,
+                        url=job["url"], apply_status="needs_human",
+                        apply_error=reason, apply_duration_ms=duration_ms,
                     )
                 )
                 failed += 1
                 update_state(worker_id, jobs_failed=failed, jobs_done=applied + failed)
                 try:
                     from applypilot.analytics.helpers import emit_apply_needs_human
-
                     emit_apply_needs_human(job["url"], job.get("site", ""), agent or "native", reason)
                 except Exception:
                     pass
@@ -715,7 +764,6 @@ def main(
     _stop_event.clear()
 
     config.ensure_dirs()
-    console = Console()
 
     if continuous:
         effective_limit = None
@@ -732,15 +780,15 @@ def main(
         init_worker(i)
 
     worker_label = f"{workers} worker{'s' if workers > 1 else ''}"
-    console.print(
+    _ui_print(
         f"Launching apply pipeline ({mode_label}, {worker_label}, agent={agent}, poll every {POLL_INTERVAL}s)..."
     )
-    console.print(
+    _ui_print(
         f"[dim]Agent: {agent} | Model: {model or '(default)'}"
         + (f" | OpenCode sub-agent: {opencode_agent}" if opencode_agent else "")
         + "[/dim]"
     )
-    console.print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
+    _ui_print("[dim]Ctrl+C = skip current job(s) | Ctrl+C x2 = stop[/dim]")
 
     # Double Ctrl+C handler
     _ctrl_c_count = 0
@@ -749,10 +797,10 @@ def main(
         nonlocal _ctrl_c_count
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
-            console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
+            _ui_warn("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
             _kill_active_agent_processes()
         else:
-            console.print("\n[red bold]STOPPING[/red bold]")
+            _ui_warn("\n[red bold]STOPPING[/red bold]")
             _stop_event.set()
             _kill_active_agent_processes()
             kill_all_chrome()
@@ -761,80 +809,67 @@ def main(
     signal.signal(signal.SIGINT, _sigint_handler)
 
     try:
-        with Live(render_full(), console=console, refresh_per_second=2) as live:
-            # Daemon thread for display refresh only (no business logic)
-            _dashboard_running = True
+        _dash_start()
 
-            def _refresh():
-                while _dashboard_running:
-                    live.update(render_full())
-                    time.sleep(0.5)
-
-            refresh_thread = threading.Thread(target=_refresh, daemon=True)
-            refresh_thread.start()
-
-            if workers == 1:
-                # Single worker — run directly in main thread
-                total_applied, total_failed = worker_loop(
-                    worker_id=0,
-                    limit=effective_limit,
-                    target_url=target_url,
-                    min_score=min_score,
-                    headless=headless,
-                    agent=agent,
-                    model=model,
-                    opencode_agent=opencode_agent,
-                    dry_run=dry_run,
-                    continuous=continuous,
-                )
+        if workers == 1:
+            # Single worker — run directly in main thread
+            total_applied, total_failed = worker_loop(
+                worker_id=0,
+                limit=effective_limit,
+                target_url=target_url,
+                min_score=min_score,
+                headless=headless,
+                agent=agent,
+                model=model,
+                opencode_agent=opencode_agent,
+                dry_run=dry_run,
+                continuous=continuous,
+            )
+        else:
+            # Multi-worker — distribute explicit caps across workers.
+            if effective_limit is None:
+                limits = [None] * workers
+            elif effective_limit > 0:
+                base = effective_limit // workers
+                extra = effective_limit % workers
+                limits = [base + (1 if i < extra else 0) for i in range(workers)]
             else:
-                # Multi-worker — distribute explicit caps across workers.
-                if effective_limit is None:
-                    limits = [None] * workers
-                elif effective_limit > 0:
-                    base = effective_limit // workers
-                    extra = effective_limit % workers
-                    limits = [base + (1 if i < extra else 0) for i in range(workers)]
-                else:
-                    limits = [0] * workers
+                limits = [0] * workers
 
-                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="apply-worker") as executor:
-                    futures = {
-                        executor.submit(
-                            worker_loop,
-                            worker_id=i,
-                            limit=limits[i],
-                            target_url=target_url,
-                            min_score=min_score,
-                            headless=headless,
-                            agent=agent,
-                            model=model,
-                            opencode_agent=opencode_agent,
-                            dry_run=dry_run,
-                            continuous=continuous,
-                        ): i
-                        for i in range(workers)
-                    }
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="apply-worker") as executor:
+                futures = {
+                    executor.submit(
+                        worker_loop,
+                        worker_id=i,
+                        limit=limits[i],
+                        target_url=target_url,
+                        min_score=min_score,
+                        headless=headless,
+                        agent=agent,
+                        model=model,
+                        opencode_agent=opencode_agent,
+                        dry_run=dry_run,
+                        continuous=continuous,
+                    ): i
+                    for i in range(workers)
+                }
 
-                    results: list[tuple[int, int]] = []
-                    for future in as_completed(futures):
-                        wid = futures[future]
-                        try:
-                            results.append(future.result())
-                        except Exception:
-                            logger.exception("Worker %d crashed", wid)
-                            results.append((0, 0))
+                results: list[tuple[int, int]] = []
+                for future in as_completed(futures):
+                    wid = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception:
+                        logger.exception("Worker %d crashed", wid)
+                        results.append((0, 0))
 
-                total_applied = sum(r[0] for r in results)
-                total_failed = sum(r[1] for r in results)
+            total_applied = sum(r[0] for r in results)
+            total_failed = sum(r[1] for r in results)
 
-            _dashboard_running = False
-            refresh_thread.join(timeout=2)
-            live.update(render_full())
+        _dash_stop()
 
         totals = get_totals()
-        console.print(f"\n[bold]Done: {total_applied} applied, {total_failed} failed (${totals['cost']:.3f})[/bold]")
-        console.print(f"Logs: {config.LOG_DIR}")
+        _ui_summary(total_applied, total_failed, totals["cost"], str(config.LOG_DIR))
 
     except KeyboardInterrupt:
         pass

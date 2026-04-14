@@ -117,16 +117,15 @@ _build_judge_prompt = build_judge_prompt
 _normalize_bullet = normalize_bullet
 _strip_disallowed_watchlist_skills = strip_disallowed_watchlist_skills
 
-from applypilot.scoring.tailor.tailor_job import tailor_resume, judge_tailored_resume, \
-    _build_tailored_prefix  # noqa: F401
+from applypilot.scoring.tailor.tailor_job import tailor_resume, judge_tailored_resume, _build_tailored_prefix  # noqa: F401
 
 
 def run_tailoring(
-        min_score: int = 7,
-        limit: int = 0,
-        validation_mode: str = "normal",
-        target_url: str | None = None,
-        force: bool = False,
+    min_score: int = 7,
+    limit: int = 0,
+    validation_mode: str = "normal",
+    target_url: str | None = None,
+    force: bool = False,
 ) -> dict:
     """Generate tailored resumes for high-scoring jobs."""
     profile = load_profile()
@@ -327,6 +326,24 @@ def run_tailoring(
                 "status": status,
                 "attempts": report["attempts"],
             }
+
+            # Copy to organized folder: ~/Documents/ApplyPilot_Applications/Company/Role/
+            try:
+                from applypilot.config.paths import organized_job_dir, ORGANIZED_DIR
+
+                org_dir = organized_job_dir(
+                    ORGANIZED_DIR,
+                    job.get("site", ""),
+                    job.get("title", ""),
+                )
+                import shutil
+
+                for src in [txt_path, Path(pdf_path) if pdf_path else None]:
+                    if src and src.exists():
+                        shutil.copy2(src, org_dir / f"resume{src.suffix}")
+                (org_dir / "job_info.txt").write_text(job_desc, encoding="utf-8")
+            except Exception:
+                pass  # non-critical
             if status in ("approved", "approved_with_judge_warning"):
                 log.info("Saved tailored artifacts: txt=%s | pdf=%s", txt_path.resolve(), Path(pdf_path).resolve())
             else:
@@ -397,6 +414,13 @@ def run_tailoring(
             pass  # TL0 — already handled above
         else:
             _job_repo.increment_attempts(r["url"], "tailor_attempts")
+
+    # Release shared Playwright browser
+    try:
+        from applypilot.scoring.pdf.pdf_renderer import close_shared_browser
+        close_shared_browser()
+    except Exception:
+        pass
 
     elapsed = time.time() - t0
     log.info(

@@ -22,6 +22,10 @@ def detect_mode() -> ExecutionMode:
         return ExecutionMode.HEADLESS
     # No display = headless
     if not os.environ.get("DISPLAY") and os.name != "nt" and not os.environ.get("TERM_PROGRAM"):
+        # macOS doesn't use DISPLAY — check for WindowServer instead
+        import sys
+        if sys.platform == "darwin":
+            return ExecutionMode.HEADFUL
         return ExecutionMode.HEADLESS
     return ExecutionMode.HEADFUL
 

@@ -24,7 +24,7 @@ _build_cover_letter_prompt = build_cover_letter_prompt
 
 
 def run_cover_letters(
-        min_score: int = 7, limit: int = 0, validation_mode: str = "normal", job_url: str | None = None
+    min_score: int = 7, limit: int = 0, validation_mode: str = "normal", job_url: str | None = None
 ) -> dict:
     """Generate cover letters for high-scoring jobs that have tailored resumes."""
     profile = load_profile()
@@ -97,6 +97,22 @@ def run_cover_letters(
                 }
             )
 
+            # Copy to organized folder
+            try:
+                from applypilot.config.paths import organized_job_dir, ORGANIZED_DIR
+                import shutil
+
+                org_dir = organized_job_dir(
+                    ORGANIZED_DIR,
+                    job.get("site", ""),
+                    job.get("title", ""),
+                )
+                for src in [cl_path, Path(pdf_path) if pdf_path else None]:
+                    if src and src.exists():
+                        shutil.copy2(src, org_dir / f"cover_letter{src.suffix}")
+            except Exception:
+                pass
+
             elapsed = time.time() - t0
             rate = completed / elapsed if elapsed > 0 else 0
             log.info("%d/%d [OK] | %.1f jobs/min | %s", completed, len(jobs), rate * 60, job["title"][:40])
@@ -129,6 +145,13 @@ def run_cover_letters(
             )
             saved += 1
         _job_repo.increment_attempts(r["url"], "cover_attempts")
+
+    # Release shared Playwright browser
+    try:
+        from applypilot.scoring.pdf.pdf_renderer import close_shared_browser
+        close_shared_browser()
+    except Exception:
+        pass
 
     elapsed = time.time() - t0
     log.info("Cover letters done in %.1fs: %d generated, %d errors", elapsed, saved, error_count)

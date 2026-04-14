@@ -16,11 +16,13 @@ GREENHOUSE_API_BASE = "https://boards-api.greenhouse.io/v1/boards"
 def _store_jobs(jobs: list[dict]) -> tuple[int, int]:
     """Store discovered jobs in the database. Returns (new, existing)."""
     from applypilot.bootstrap import get_app
+    from applypilot.discovery.relevance_gate import is_relevant
 
     job_repo = get_app().container.job_repo
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
+    skipped = 0
 
     for job in jobs:
         url = job.get("url", "")
@@ -28,6 +30,9 @@ def _store_jobs(jobs: list[dict]) -> tuple[int, int]:
             continue
         if job_repo.get_by_url(url):
             existing += 1
+            continue
+        if not is_relevant(job.get("title", ""), job.get("location", ""), job.get("description", "")):
+            skipped += 1
             continue
         job_repo.upsert(
             JobDTO(
@@ -51,4 +56,6 @@ def _store_jobs(jobs: list[dict]) -> tuple[int, int]:
         except Exception:
             pass
 
+    if skipped:
+        log.info("[greenhouse] Skipped %d irrelevant jobs (relevance gate)", skipped)
     return new, existing

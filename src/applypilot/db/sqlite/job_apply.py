@@ -32,15 +32,33 @@ class JobApplyMixin:
 
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            # Round-robin: rotate across boards (strategy) and companies (site).
+            # Pick the job from the least-recently-applied board+company combo.
+            # This prevents spamming one employer and spreads across ATS types.
+            # Round-robin: one job per company, rotate across all companies.
+            # ROW_NUMBER partitions by company — pick row 1 from each company first,
+            # then row 2, etc. Within each round, least-recently-applied company goes first.
             row = self._conn.execute(
                 f"""
-                SELECT * FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
-                  {site_clause} {url_clauses}
-                ORDER BY fit_score DESC, url LIMIT 1
+                WITH ranked AS (
+                    SELECT j.*,
+                        ROW_NUMBER() OVER (PARTITION BY j.site ORDER BY j.fit_score DESC) as rn,
+                        recent.last_apply as _last_apply
+                    FROM jobs j
+                    LEFT JOIN (
+                        SELECT site as _rsite, MAX(last_attempted_at) as last_apply
+                        FROM jobs WHERE apply_status IN ('applied', 'in_progress', 'needs_human')
+                        GROUP BY site
+                    ) recent ON j.site = recent._rsite
+                    WHERE j.tailored_resume_path IS NOT NULL
+                      AND (j.apply_status IS NULL OR j.apply_status = 'failed')
+                      AND (j.apply_attempts IS NULL OR j.apply_attempts < ?)
+                      AND j.fit_score >= ?
+                      {site_clause} {url_clauses}
+                )
+                SELECT * FROM ranked
+                ORDER BY rn, _last_apply ASC NULLS FIRST, fit_score DESC
+                LIMIT 1
             """,
                 params,
             ).fetchone()

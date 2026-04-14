@@ -229,6 +229,7 @@ from applypilot.cli.commands.apply_cmd import apply as _apply
 from applypilot.cli.commands.single_cmd import single as _single
 from applypilot.cli.commands.analyze_cmd import analyze as _analyze
 from applypilot.cli.commands.status_cmd import status as _status
+from applypilot.cli.commands.timeline_cmd import timeline as _timeline
 from applypilot.cli.commands.doctor_cmd import doctor as _doctor
 from applypilot.cli.commands.resume_cmd import (
     render_resume as _render_resume,
@@ -263,6 +264,7 @@ config_app.command("show")(_config_show)
 config_app.command("init")(_config_init)
 config_app.command("set")(_config_set)
 app.command()(_status)
+app.command()(_timeline)
 app.command(name="human-review")(_human_review)
 app.command()(_dashboard)
 app.command()(_doctor)

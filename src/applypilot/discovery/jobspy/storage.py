@@ -40,6 +40,7 @@ def store_jobspy_results(
     existing = 0
     skipped_title = 0
     skipped_company = 0
+    skipped_relevance = 0
 
     for _, row in df.iterrows():
         url = str(row.get("job_url", ""))
@@ -55,6 +56,15 @@ def store_jobspy_results(
         # Title relevance filter — skip jobs that don't match the search query
         if title and source_label and not _title_matches_query(title, source_label, strict=strict_title):
             skipped_title += 1
+            continue
+
+        # Profile-driven relevance gate
+        from applypilot.discovery.relevance_gate import is_relevant
+
+        location_str = _clean(row.get("location"))
+        description = _clean(row.get("description"))
+        if not is_relevant(title or "", location_str or "", description or ""):
+            skipped_relevance += 1
             continue
 
         # Company post-filter — match scraped company name against registry aliases
